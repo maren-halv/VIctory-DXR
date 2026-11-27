@@ -163,6 +163,8 @@ enum Op {
     Phi(Vec<(V, usize)>),
     /// `getelementptr` over the pointee type, from a pointer.
     Gep(Ty, V, Vec<V>),
+    /// Stack allocation `(allocated_ty, count)` in address space 0.
+    Alloca(Ty, V),
     Load(V),
     /// Pointer, value.
     Store(V, V),
@@ -496,6 +498,11 @@ impl Module {
         let ty = self.ptr_in(elem, space);
         let zero = self.i32(0);
         self.push(block, ty, Op::Gep(arr, ptr, vec![zero, index]))
+    }
+    pub fn alloca(&mut self, block: usize, elem: Ty) -> V {
+        let ptr = self.ptr(elem);
+        let one = self.i32(1);
+        self.push(block, ptr, Op::Alloca(elem, one))
     }
     pub fn load(&mut self, block: usize, ptr: V) -> V {
         let TypeDef::Ptr(ty, _) = self.types[self.type_of(ptr).0 as usize] else {
@@ -896,6 +903,19 @@ impl Module {
                         r.extend(idx.iter().map(|&i| rel(i)));
                         w.record(43, &r);
                     }
+                    // Alignment 4 (log2 + 1 = 3) with explicit-type flag (1 << 6).
+                    Op::Alloca(elem, count) => {
+                        let count_ty = self.type_of(*count);
+                        w.record(
+                            19,
+                            &[
+                                u64::from(elem.0),
+                                u64::from(count_ty.0),
+                                u64::from(abs(*count)),
+                                3 | (1 << 6),
+                            ],
+                        );
+                    }
                     // Alignment 4 (log2 + 1), not volatile.
                     Op::Load(p) => w.record(20, &[rel(*p), u64::from(inst.ty.0), 3, 0]),
                     Op::Store(p, v) => w.record(44, &[rel(*p), rel(*v), 3, 0]),
@@ -943,7 +963,7 @@ fn for_each_operand(op: &Op, mut f: impl FnMut(V)) {
             f(*a);
             f(*b);
         }
-        Op::Cast(_, v) | Op::Extract(v, _) | Op::Load(v) => f(*v),
+        Op::Cast(_, v) | Op::Extract(v, _) | Op::Alloca(_, v) | Op::Load(v) => f(*v),
         Op::Select(a, b, c) | Op::CmpXchg(a, b, c) => {
             f(*a);
             f(*b);

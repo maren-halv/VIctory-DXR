@@ -126,9 +126,14 @@ pub use sampler::StaticSampler;
 pub use lower::{host_settings, lds_init_hoist_on, set_host_max_wave, set_host_rdna};
 pub use rect::rect_list_gs;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, SLOT_TABLE_STRIDES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_SPREAD, USER_DISPATCH_THREADS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
-    constants_raw, raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
+    DXR_NORMALS_DATA_BASE, DXR_NORMALS_FALLBACK, DXR_NORMALS_GEOM_BASE, DXR_NORMALS_MAX_TLAS,
+    DXR_NORMALS_TLAS_STRIDE, DXR_NORMALS_WORDS, MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY,
+    ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_DXR_NORMALS, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
+    SLOT_STRIDES_COUNT, SLOT_TABLE_STRIDES, USER_DATA_SPACE, USER_DISPATCH_SPREAD,
+    USER_DISPATCH_THREADS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS,
+    USER_VIEW_ADDRESS, USER_VIEW_BIAS, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS,
+    constants_raw, pack_oct_normal_u32, raw_views, set_raw_views, set_view_heap_limit,
+    view_heap_limit,
 };
 
 /// The loop limit without an override: 2^20.
@@ -391,6 +396,63 @@ pub fn native_rt_two_pass() -> bool {
     })
 }
 
+/// Whether two-pass `tMax` pre-shrink (`CULL_NON_OPAQUE` Pass 1 -> `CULL_OPAQUE` Pass 2)
+/// also enables for closest-hit `AnyHit` loops that carry `state_vars`
+/// (`VICTORY_NATIVE_RT_TWOPASS_STATE=0` disables; on by default). Part of the
+/// translation: the shader cache keys on it.
+pub fn native_rt_twopass_state() -> bool {
+    #[cfg(test)]
+    if let Some(on) = lower::test_native_rt_twopass_state() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_NATIVE_RT_TWOPASS_STATE").is_none_or(|v| v != "0")
+    })
+}
+
+/// How `RAY_FLAG_FORCE_NON_OPAQUE` `AnyHit` loops are lowered under `VICTORY_NATIVE_RT=1`
+/// (`VICTORY_NATIVE_RT_FNO_MODE`):
+/// - `0`: do not lift `FORCE_NON_OPAQUE` closest-hit `AnyHit` loops (SW-BVH baseline A/B).
+/// - `1`: lift directly as a `FORCE_NON_OPAQUE` `Proceed()` loop.
+/// - `2` (default): lift with a speculative opaque Pass 1 (`FORCE_OPAQUE`), one-shot `AnyHit`
+///   check, and exact `FORCE_NON_OPAQUE` fallback on reject (stateless pure loops).
+///
+/// Part of the translation: the shader cache keys on it.
+pub fn native_rt_fno_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = lower::test_native_rt_fno_mode() {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        match std::env::var("VICTORY_NATIVE_RT_FNO_MODE")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+        {
+            Some("0") => 0,
+            Some("1") => 1,
+            _ => 2,
+        }
+    })
+}
+
+/// Whether descriptor handle hoisting (`hoist_loaded_block` / `hoist_fetched_block`) is
+/// suppressed inside lifted `AnyHit` bodies to avoid carrying extra VGPR handles across
+/// `RayQuery::Proceed()` (`VICTORY_NATIVE_RT_NO_HOIST_ANYHIT=0` re-enables hoisting; on
+/// by default). Part of the translation: the shader cache keys on it.
+pub fn native_rt_no_hoist_anyhit() -> bool {
+    #[cfg(test)]
+    if let Some(on) = lower::test_native_rt_no_hoist_anyhit() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_NATIVE_RT_NO_HOIST_ANYHIT").is_none_or(|v| v != "0")
+    })
+}
+
 /// Whether `FrontBackTrack` loops opt into two pure-opaque zero-exit traces
 /// (`CULL_BACK` + `CULL_FRONT`) instead of the exact single-pass `FORCE_NON_OPAQUE`
 /// `Proceed()` loop (`VICTORY_NATIVE_RT_FBT_TWOPASS=1`; off by default because
@@ -405,6 +467,41 @@ pub fn native_rt_fbt_two_pass() -> bool {
             .map(str::trim)
             == Some("1")
     })
+}
+
+/// Optional `InstanceInclusionMask` bitmask tagging `TRIANGLE_CULL_DISABLE` instances for
+/// exact 3-pass mask-split `FrontBackTrack` (`VICTORY_NATIVE_RT_FBT_SPLIT_MASK`, accepts
+/// hex like `0x02`, decimal, `1` -> `0x80`, or `0` to disable; default `0x02` pairing with
+/// `VICTORY_NATIVE_RT_CULL_MASK=tag:0x02`). Part of the translation: the shader cache keys on it.
+pub fn native_rt_fbt_split_mask() -> u8 {
+    #[cfg(test)]
+    if let Some(m) = lower::test_native_rt_fbt_split_mask() {
+        return m;
+    }
+    static MASK: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MASK.get_or_init(|| {
+        parse_fbt_split_mask(
+            std::env::var("VICTORY_NATIVE_RT_FBT_SPLIT_MASK")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+fn parse_fbt_split_mask(raw: Option<&str>) -> u8 {
+    let Some(v) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return 0x02;
+    };
+    let parsed = if let Some(hex) = v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
+        u32::from_str_radix(hex, 16).ok()
+    } else {
+        v.parse::<u32>().ok()
+    };
+    match parsed {
+        Some(0) | None => 0,
+        Some(1) => 0x80,
+        Some(n) => (n & 0xFF) as u8,
+    }
 }
 
 /// Whether a shader identified by `hash_hex` is selected by
@@ -618,6 +715,10 @@ pub fn translation_fingerprint() -> Vec<u8> {
     out.push(u8::from(legacy_mul_plain_on()));
     out.push(u8::from(rdna_valu_opt_on()));
     out.push(u8::from(rdna_fp16_opt_on()));
+    out.push(u8::from(native_rt_twopass_state()));
+    out.push(native_rt_fno_mode());
+    out.push(u8::from(native_rt_no_hoist_anyhit()));
+    out.push(native_rt_fbt_split_mask());
     out
 }
 

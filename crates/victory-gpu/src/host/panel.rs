@@ -759,6 +759,12 @@ fn active_fsr() -> (&'static str, Color) {
         if std::env::var_os("VICTORY_FSR").is_some() {
             return Some(crate::switch::on("VICTORY_FSR"));
         }
+        if std::env::var_os("VICTORY_FSR_1440P").is_some() {
+            return Some(crate::switch::on("VICTORY_FSR_1440P"));
+        }
+        if std::env::var_os("VICTORY_FSR_4K").is_some() {
+            return Some(crate::switch::on("VICTORY_FSR_4K"));
+        }
         None
     });
     let on = forced.unwrap_or_else(|| crate::console::current() == crate::console::Console::SeriesS);

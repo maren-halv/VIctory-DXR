@@ -69,6 +69,59 @@ pub const MEMORY_PAGES: u32 = 1 << 21;
 pub const MEMORY_READ_ONLY: u32 = 1 << 31;
 /// Dwords of the [`SLOT_FAULTS`] buffer.
 pub const MEMORY_FAULTS: u32 = 4096;
+
+/// Root SRV `t<SLOT_DXR_NORMALS>` in [`ROOT_CBV_SPACE`]: flat `u32` GPU normal
+/// table for lifted `RayQuery` shaders that fetch hit-triangle geometric normals
+/// (Xbox `CommittedTriangleVertexPositions`).
+///
+/// Word layout (`u32` indices):
+/// - `0`: [`DXR_NORMALS_FALLBACK`] (`0x8000_8000`, unpacks to `(0, 0, 1)`).
+/// - `1 .. DXR_NORMALS_GEOM_BASE`: per-TLAS instance map
+///   (`tlas_inst_base + instance_index` -> `geom_table_word_off`, or `0`).
+/// - `DXR_NORMALS_GEOM_BASE .. DXR_NORMALS_DATA_BASE`: per-BLAS geometry table
+///   (`geom_table_word_off + geom_index` -> `prim_data_word_off`, or `0`).
+/// - `DXR_NORMALS_DATA_BASE .. DXR_NORMALS_WORDS`: octahedral-packed `u32` unit
+///   object-space geometric normals (`prim_data_word_off + prim_index`).
+pub const SLOT_DXR_NORMALS: u8 = 251;
+/// Fallback packed octahedral normal word at index `0` of [`SLOT_DXR_NORMALS`]: `(0, 0, 1)`.
+pub const DXR_NORMALS_FALLBACK: u32 = 0x8000_8000;
+/// Instance-map words reserved per active TLAS slot in [`SLOT_DXR_NORMALS`].
+pub const DXR_NORMALS_TLAS_STRIDE: u32 = 16_384;
+/// Maximum concurrent active TLAS instance-map slots in [`SLOT_DXR_NORMALS`].
+pub const DXR_NORMALS_MAX_TLAS: u32 = 8;
+/// First word of Region 1 (per-BLAS geometry offset table) in [`SLOT_DXR_NORMALS`].
+pub const DXR_NORMALS_GEOM_BASE: u32 = 1 + DXR_NORMALS_MAX_TLAS * DXR_NORMALS_TLAS_STRIDE;
+/// First word of Region 2 (packed octahedral triangle normals) in [`SLOT_DXR_NORMALS`].
+pub const DXR_NORMALS_DATA_BASE: u32 = 524_288;
+/// Total `u32` words in [`SLOT_DXR_NORMALS`] (64 MiB).
+pub const DXR_NORMALS_WORDS: u32 = 16_777_216;
+
+/// Packs an object-space triangle geometric normal `(nx, ny, nz)` into a 32-bit
+/// octahedral word matching `SLOT_DXR_NORMALS` (`0x8000_8000` -> `(0, 0, 1)`).
+#[inline]
+pub fn pack_oct_normal_u32(nx: f32, ny: f32, nz: f32) -> u32 {
+    let len2 = nx * nx + ny * ny + nz * nz;
+    if !(len2 > 1e-20) || !len2.is_finite() {
+        return DXR_NORMALS_FALLBACK;
+    }
+    let inv_len = len2.sqrt().recip();
+    let (x, y, z) = (nx * inv_len, ny * inv_len, nz * inv_len);
+    let inv_l1 = (x.abs() + y.abs() + z.abs()).recip();
+    let (px, py) = (x * inv_l1, y * inv_l1);
+    let (ox, oy) = if z < 0.0 {
+        (
+            (1.0 - py.abs()) * if px >= 0.0 { 1.0 } else { -1.0 },
+            (1.0 - px.abs()) * if py >= 0.0 { 1.0 } else { -1.0 },
+        )
+    } else {
+        (px, py)
+    };
+    let qx = (ox.clamp(-1.0, 1.0) * 32767.0).round() + 32768.0;
+    let qy = (oy.clamp(-1.0, 1.0) * 32767.0).round() + 32768.0;
+    let ux = (qx.clamp(0.0, 65535.0) as u32) & 0xFFFF;
+    let uy = (qy.clamp(0.0, 65535.0) as u32) & 0xFFFF;
+    ux | (uy << 16)
+}
 /// `RootType::Other` code of a user-data dword the host computes: the view
 /// heap slot of the memory copies' views ([`SLOT_MEMORY`]).
 pub const USER_MEMORY_BASE: u32 = 0x100;

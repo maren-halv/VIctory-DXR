@@ -1559,6 +1559,13 @@ pub(crate) static OBJECT_TEXTURE_SLOTS: std::sync::atomic::AtomicU64 = std::sync
 /// in a single pass over the view descriptor; `(None, 0)` if not a buffer view.
 fn view_stride_and_kind(view: &View) -> (Option<u32>, u32) {
     use victory_shader::emit::{VIEW_INTEGER, VIEW_SIGNED};
+    if let View::Shader(0, Some(d)) = view
+        && d[1] == D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE.0 as u32
+        && crate::dxr::enabled()
+    {
+        let guest_tlas_va = u64::from(d[4]) | (u64::from(d[5]) << 32);
+        return (None, crate::dxr::tlas_meta_base(guest_tlas_va));
+    }
     let Some((stride, raw, format)) = view_elements(view) else {
         return (None, 0);
     };

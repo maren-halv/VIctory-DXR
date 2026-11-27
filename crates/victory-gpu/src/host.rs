@@ -1374,7 +1374,7 @@ pub(crate) fn process_private_bytes() -> u64 {
 /// Periodic RAM, DXGI local/shared VRAM, allocator pool, and OS page-fault
 /// summary emitted in both release and diagnostics builds.
 #[cfg(feature = "diagnostics")]
-static PREP_PHASE_NS: [std::sync::atomic::AtomicU64; 11] = [const { std::sync::atomic::AtomicU64::new(0) }; 11];
+static PREP_PHASE_NS: [std::sync::atomic::AtomicU64; 12] = [const { std::sync::atomic::AtomicU64::new(0) }; 12];
 #[cfg(feature = "diagnostics")]
 static PREP_PHASE_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -1424,8 +1424,8 @@ fn memory_summary_line(frames: f64) {
         if p.iter().sum::<f64>() > 0.1 {
             tracing::info!(
                 "prep phases/f: pre {:.1}, watch {:.1}, stale {:.1}, front {:.1}, deferred {:.1}, \
-                 prel_wait {:.1}, flush {:.1}, snap_card {:.1}, wait_heaps {:.1}, exec {:.1}, post {:.1}, present {:.1} (sum {:.1} ms)",
-                p[9], p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[10], present_ms, p.iter().sum::<f64>()
+                 prel_wait {:.1}, flush {:.1}, snap_card {:.1}, wait_heaps {:.1}, dxr {:.1}, exec {:.1}, post {:.1}, present {:.1} (sum {:.1} ms)",
+                p[9], p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[11], p[8], p[10], present_ms, p.iter().sum::<f64>()
             );
         }
     }
@@ -2932,7 +2932,7 @@ fn card_budget() -> bool {
 /// ones logged with their commands (`VICTORY_GPU_TIMING`, diagnostics
 /// builds; the commands are noted with `VICTORY_D3D12_DRED` on).
 #[cfg(feature = "diagnostics")]
-fn timing() -> bool {
+pub(crate) fn timing() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| crate::switch::on("VICTORY_GPU_TIMING"))
 }
@@ -7874,11 +7874,15 @@ impl Host {
         // Replay queued native DXR AS builds/copies/extractions (and initialize
         // any newly allocated empty TLAS slots from `heaps_synced`/`make_waiting`)
         // right after `card_before` uploads dirty buffers and before `ExecuteCommandLists`.
+        #[cfg(feature = "diagnostics")]
+        let p_dxr = std::time::Instant::now();
         let dxr = if needs_heaps {
             crate::dxr::record_submission(self, runs, &mut lists, &mut firsts)
         } else {
             None
         };
+        #[cfg(feature = "diagnostics")]
+        PREP_PHASE_NS[11].fetch_add(p_dxr.elapsed().as_nanos() as u64, Ordering::Relaxed);
         // Prepend `card_before`'s `sync` AFTER `dxr::record_submission` so `runs`
         // and `firsts` stay aligned during DXR splicing, while `sync` executes
         // FIRST ahead of `ahead_lists`, DXR ops, and title lists in one
@@ -12728,6 +12732,8 @@ struct Presenter {
 /// every few seconds.
 struct Meter {
     since: std::time::Instant,
+    last_frame: std::time::Instant,
+    frame_ms: Vec<f32>,
     frames: u32,
     #[cfg(feature = "diagnostics")]
     copy_stats_frames: u64,
@@ -12742,6 +12748,8 @@ impl Meter {
         let now = std::time::Instant::now();
         Meter {
             since: now,
+            last_frame: now,
+            frame_ms: Vec::with_capacity(640),
             frames: 0,
             #[cfg(feature = "diagnostics")]
             copy_stats_frames: 0,
@@ -12758,6 +12766,12 @@ impl Meter {
 
     /// Counts a presented frame.
     fn frame(&mut self, hwnd: HWND) {
+        let now = std::time::Instant::now();
+        let dt_ms = now.duration_since(self.last_frame).as_secs_f32() * 1000.0;
+        self.last_frame = now;
+        if self.frame_ms.len() < 4096 {
+            self.frame_ms.push(dt_ms);
+        }
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         #[cfg(feature = "diagnostics")]
@@ -13010,6 +13024,27 @@ impl Meter {
                 objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed)
             );
             memory_summary_line(frames);
+            if !self.frame_ms.is_empty() {
+                let n = self.frame_ms.len();
+                self.frame_ms.sort_unstable_by(f32::total_cmp);
+                let sum: f64 = self.frame_ms.iter().map(|&v| f64::from(v)).sum();
+                let avg_ms = sum / n as f64;
+                let avg_fps = if avg_ms > 0.0 { 1000.0 / avg_ms } else { 0.0 };
+                let p99_idx = ((n * 99) / 100).min(n - 1);
+                let p95_idx = ((n * 95) / 100).min(n - 1);
+                let p99_ms = f64::from(self.frame_ms[p99_idx]);
+                let p95_ms = f64::from(self.frame_ms[p95_idx]);
+                let max_ms = f64::from(self.frame_ms[n - 1]);
+                // 1% low FPS: harmonic mean of the slowest 1% of frames (at least 1 frame).
+                let slow_1 = (n / 100).max(1);
+                let slow_1_avg = self.frame_ms[n - slow_1..].iter().map(|&v| f64::from(v)).sum::<f64>() / slow_1 as f64;
+                let p1_fps = if slow_1_avg > 0.0 { 1000.0 / slow_1_avg } else { 0.0 };
+                let p5_fps = if p95_ms > 0.0 { 1000.0 / p95_ms } else { 0.0 };
+                tracing::info!(
+                    "frame pacing: avg {avg_ms:.1} ms ({avg_fps:.1} fps), p1 {p1_fps:.1} fps (p99 {p99_ms:.1} ms), p5 {p5_fps:.1} fps, max {max_ms:.1} ms over {n} frames"
+                );
+                self.frame_ms.clear();
+            }
             #[cfg(feature = "diagnostics")]
             {
                 let put = [0, 1, 2, 3].map(|i| crate::shadow::PUT[i].swap(0, Ordering::Relaxed) as f64 / frames);
@@ -13181,17 +13216,20 @@ impl Host {
             // read back at once (a saved or listed frame): then a list of
             // its own, one whose last flight has finished or a new one.
             let take_shot = crate::present::screenshot_pending();
+            let want_shot = crate::capture::take_want();
             #[cfg(feature = "diagnostics")]
-            let read_now = take_shot || crate::capture::wanted(frame) || crate::capture::listed(frame);
+            let read_now =
+                take_shot || want_shot || crate::capture::wanted(frame) || crate::capture::listed(frame);
             #[cfg(not(feature = "diagnostics"))]
-            let read_now = take_shot;
-            // In release builds without a pending screenshot or visible overlay,
-            // nothing copies from/onto `back` after two-plane compositing, so
-            // transition `RENDER_TARGET -> PRESENT` directly.
+            let read_now = take_shot || want_shot;
+            // In release builds without a pending screenshot, nothing copies
+            // from/onto `back` after two-plane compositing, so transition
+            // `RENDER_TARGET -> PRESENT` directly. In diagnostics builds,
+            // `Panel::draw` can be toggled at runtime and expects `COPY_DEST`.
             #[cfg(feature = "diagnostics")]
             let needs_back_copy = true;
             #[cfg(not(feature = "diagnostics"))]
-            let needs_back_copy = take_shot || p.panel.visible();
+            let needs_back_copy = take_shot || want_shot || p.panel.visible();
             let slot = if late_free_present() && !read_now {
                 let finished = FINISHED.load(Ordering::Acquire);
                 p.ahead.iter().position(|(_, flown)| *flown <= finished).or_else(|| {
@@ -13289,7 +13327,10 @@ impl Host {
                 .then(|| crate::present::record_screenshot_readback(&self.device, list, &back))
                 .flatten();
             #[cfg(feature = "diagnostics")]
-            let capture = crate::capture::wanted(frame)
+            let do_capture = want_shot || crate::capture::wanted(frame);
+            #[cfg(not(feature = "diagnostics"))]
+            let do_capture = want_shot;
+            let capture = do_capture
                 .then(|| {
                     if composed {
                         list.ResourceBarrier(&[transition(
@@ -13365,7 +13406,6 @@ impl Host {
             }
             #[cfg(not(feature = "diagnostics"))]
             let _ = flown;
-            #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }

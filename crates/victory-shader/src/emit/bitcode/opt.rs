@@ -178,7 +178,7 @@ fn map_operands(op: &mut Op, mut f: impl FnMut(V) -> V) {
             *a = f(*a);
             *b = f(*b);
         }
-        Op::Cast(_, v) | Op::Extract(v, _) | Op::Load(v) => *v = f(*v),
+        Op::Cast(_, v) | Op::Extract(v, _) | Op::Alloca(_, v) | Op::Load(v) => *v = f(*v),
         Op::Select(a, b, c) | Op::CmpXchg(a, b, c) => {
             *a = f(*a);
             *b = f(*b);
@@ -1130,7 +1130,7 @@ impl Module {
                 }
             }
             Op::Store(..) | Op::AtomicRmw(..) | Op::CmpXchg(..) => Effect::Writes,
-            Op::Phi(_) => Effect::Lanes,
+            Op::Phi(_) | Op::Alloca(..) => Effect::Lanes,
             Op::Call(f, _) => effects[*f as usize],
         }
     }

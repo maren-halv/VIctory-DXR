@@ -153,7 +153,7 @@ impl Module {
                     Op::Select(..) => k("select"),
                     Op::Extract(..) => k("extract"),
                     Op::Phi(_) => k("phi"),
-                    Op::Gep(..) => k("gep"),
+                    Op::Gep(..) | Op::Alloca(..) => k("gep"),
                     Op::Load(_) => k("lds_load"),
                     Op::Store(..) => k("lds_store"),
                     Op::AtomicRmw(..) | Op::CmpXchg(..) => k("atomic"),

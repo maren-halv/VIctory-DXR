@@ -55,8 +55,11 @@ use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value, idoms, operand_reads, rev
 use crate::resource::{Address, BvhNodes, CODE, MEMORY, Resources, Site, Source, inline};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
-use super::bitcode::{Bin, Cast, Term, V, pred};
-use super::shader::{Shader, rq_op};
+use super::bitcode::{Attr, Bin, Cast, Tag, Term, V, pred};
+use super::shader::{
+    DXR_NORMALS_DATA_BASE, DXR_NORMALS_GEOM_BASE, DXR_NORMALS_TLAS_STRIDE, DXR_NORMALS_WORDS,
+    SLOT_DXR_NORMALS, Shader, rq_op,
+};
 
 /// DXR `D3D12_RAY_FLAGS` constants.
 #[allow(dead_code)]
@@ -96,7 +99,7 @@ pub(crate) enum RayInput {
 }
 
 /// A BVH node metadata `global_load_*` replaced by an SM 6.6 `RayQuery` state query.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum RayMetaKind {
     /// `inst_addr + 48` (bits `23:0` = `InstanceID`).
     InstanceId,
@@ -112,6 +115,13 @@ pub(crate) enum RayMetaKind {
     GeometryIndexShl8,
     /// `tri_addr + 52/56` (`PrimitiveIndex`).
     PrimitiveIndex,
+    /// `CommittedTriangleVertexPositions()` vertex `v0`: unit tangent `T ⊥ N`
+    /// derived from `SLOT_DXR_NORMALS` so `cross(v0 - v2, v1 - v2) == +N`.
+    TriFetchBasisT,
+    /// `CommittedTriangleVertexPositions()` vertex `v1`: unit bitangent `B = cross(N, T)`.
+    TriFetchBasisB,
+    /// `CommittedTriangleVertexPositions()` vertex `v2`: `(0, 0, 0)`.
+    TriFetchZero3,
 }
 
 /// Replacement metadata load bound to a specific lifted [`RayLoop`].
@@ -176,7 +186,7 @@ pub(crate) struct AnyHitInfo {
 }
 
 /// DXR `RayQuery` state field represented by a live-out IR `Value`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[allow(dead_code)]
 pub(crate) enum RayOutput {
     /// Committed triangle or instance node pointer: `0` on miss, `1` on triangle hit.
@@ -276,6 +286,140 @@ pub(crate) struct RayLoop {
     pub committed_meta_loads: Vec<(Site, RayMetaKind)>,
 }
 
+/// Maximum unique scalar dwords extracted from Pass 1 (`q1`) before Pass 2 starts so
+/// `q1`'s `RayQuery` state can be released before Pass 2 `Proceed()` begins.
+pub(crate) const EARLY_Q1_MAX_DWORDS: usize = 8;
+
+/// A single committed hit scalar dword extracted from Pass 1 (`q1`) right after Pass 1
+/// finishes (before Pass 2 starts) so `q1` does not remain live across Pass 2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum EarlyQ1Field {
+    Bary(u8),
+    FrontFace,
+    InstanceIndex,
+    InstanceId,
+    InstanceContribution,
+    GeometryIndex,
+    PrimitiveIndex,
+    ObjectToWorld(u32, u8),
+    WorldToObject(u32, u8),
+}
+
+/// Post-loop two-pass hit predicates and optional early-extracted Pass 1 fields.
+#[derive(Debug, Clone)]
+pub(crate) struct TwoPassPost {
+    /// `CommittedStatus(rq) == 1` (Pass 2 hit), dominating `exit_dxil`.
+    pub q2_hit: V,
+    /// `CommittedStatus(q1) == 1` (Pass 1 hit), dominating `exit_dxil`.
+    pub q1_hit: V,
+    /// When `Some`, Pass 1 metadata was extracted before Pass 2 started (holding `0` on Pass 1
+    /// miss), so `q1` is dead and post-loop `committed_meta_loads` need no `q1` query.
+    pub q1_fields: Option<HashMap<EarlyQ1Field, V>>,
+}
+
+/// Collects the deduplicated set of scalar fields needed from Pass 1 (`q1`) for both
+/// `rl.outputs` and `rl.committed_meta_loads` (excluding `CommittedStatus` and
+/// `CommittedRayT`, which are always extracted once for `t_clamp`).
+pub(crate) fn collect_early_q1_fields(
+    rl: &RayLoop,
+    meta_dwords: &[(RayMetaKind, usize)],
+) -> Vec<EarlyQ1Field> {
+    let mut seen: HashSet<EarlyQ1Field> = HashSet::new();
+    let mut out = Vec::new();
+    let mut push = |f: EarlyQ1Field| {
+        if seen.insert(f) {
+            out.push(f);
+        }
+    };
+    for b in &rl.outputs {
+        match b.output {
+            RayOutput::CommittedBary(c) => push(EarlyQ1Field::Bary(c)),
+            RayOutput::CommittedFrontFace => push(EarlyQ1Field::FrontFace),
+            RayOutput::CommittedInstanceIndex => push(EarlyQ1Field::InstanceIndex),
+            RayOutput::CommittedInstanceId => push(EarlyQ1Field::InstanceId),
+            RayOutput::CommittedInstanceContribution => push(EarlyQ1Field::InstanceContribution),
+            RayOutput::CommittedGeometryIndex => push(EarlyQ1Field::GeometryIndex),
+            RayOutput::CommittedPrimitiveIndex => push(EarlyQ1Field::PrimitiveIndex),
+            RayOutput::CommittedObjectToWorld(r, c) => push(EarlyQ1Field::ObjectToWorld(r, c)),
+            RayOutput::CommittedWorldToObject(r, c) => push(EarlyQ1Field::WorldToObject(r, c)),
+            _ => {}
+        }
+    }
+    for &(kind, n) in meta_dwords {
+        match kind {
+            RayMetaKind::BlasBaseZero | RayMetaKind::TriFetchZero3 => {}
+            RayMetaKind::InstanceId => push(EarlyQ1Field::InstanceId),
+            RayMetaKind::InstanceContribution => push(EarlyQ1Field::InstanceContribution),
+            RayMetaKind::InstanceIndex => push(EarlyQ1Field::InstanceIndex),
+            RayMetaKind::GeometryIndexShl8 => push(EarlyQ1Field::GeometryIndex),
+            RayMetaKind::PrimitiveIndex => push(EarlyQ1Field::PrimitiveIndex),
+            RayMetaKind::ObjectToWorld(base_off) => {
+                for k in 0..n {
+                    let off = base_off + (k as u32) * 4;
+                    push(EarlyQ1Field::ObjectToWorld(off / 16, ((off % 16) / 4) as u8));
+                }
+            }
+            RayMetaKind::TriFetchBasisT | RayMetaKind::TriFetchBasisB => {
+                push(EarlyQ1Field::InstanceIndex);
+                push(EarlyQ1Field::GeometryIndex);
+                push(EarlyQ1Field::PrimitiveIndex);
+            }
+        }
+    }
+    out
+}
+
+/// Resolves a post-loop `RayMetaKind` from early-extracted Pass 1 `q1_fields` (0 on miss).
+pub(crate) fn resolve_early_q1_meta(
+    s: &mut Shader,
+    block: usize,
+    fields: &HashMap<EarlyQ1Field, V>,
+    kind: RayMetaKind,
+    num_dwords: usize,
+    tlas_meta_base: Option<V>,
+) -> Option<Vec<V>> {
+    match kind {
+        RayMetaKind::BlasBaseZero | RayMetaKind::TriFetchZero3 => {
+            Some(vec![s.m.i32(0); num_dwords])
+        }
+        RayMetaKind::InstanceId => fields.get(&EarlyQ1Field::InstanceId).map(|&v| vec![v]),
+        RayMetaKind::InstanceContribution => {
+            fields.get(&EarlyQ1Field::InstanceContribution).map(|&v| vec![v])
+        }
+        RayMetaKind::InstanceIndex => fields.get(&EarlyQ1Field::InstanceIndex).map(|&v| vec![v]),
+        RayMetaKind::GeometryIndexShl8 => fields.get(&EarlyQ1Field::GeometryIndex).map(|&g| {
+            let c8 = s.m.i32(8);
+            vec![s.m.bin(block, Bin::Shl, g, c8)]
+        }),
+        RayMetaKind::PrimitiveIndex => fields.get(&EarlyQ1Field::PrimitiveIndex).map(|&v| vec![v]),
+        RayMetaKind::ObjectToWorld(base_off) => {
+            let mut vals = Vec::with_capacity(num_dwords);
+            for k in 0..num_dwords {
+                let off = base_off + (k as u32) * 4;
+                let f = EarlyQ1Field::ObjectToWorld(off / 16, ((off % 16) / 4) as u8);
+                vals.push(*fields.get(&f)?);
+            }
+            Some(vals)
+        }
+        RayMetaKind::TriFetchBasisT | RayMetaKind::TriFetchBasisB => {
+            let inst_idx = *fields.get(&EarlyQ1Field::InstanceIndex)?;
+            let geom_idx = *fields.get(&EarlyQ1Field::GeometryIndex)?;
+            let prim_idx = *fields.get(&EarlyQ1Field::PrimitiveIndex)?;
+            let base = tlas_meta_base.unwrap_or_else(|| s.m.i32(0));
+            Some(emit_tri_fetch_basis(
+                s,
+                block,
+                base,
+                inst_idx,
+                geom_idx,
+                prim_idx,
+                matches!(kind, RayMetaKind::TriFetchBasisB),
+                num_dwords,
+            ))
+        }
+    }
+}
+
 /// Resolved DXIL `V` operands passed from `Lower` into [`emit_ray_loop`].
 pub(crate) struct ResolvedRayInputs {
     /// Pre-allocated `RayQuery` handle (allocated in function entry block for dominance).
@@ -283,6 +427,10 @@ pub(crate) struct ResolvedRayInputs {
     /// Optional Pass 1 opaque-only (`CULL_NON_OPAQUE`) `RayQuery` handle for two-pass
     /// `tMax` pre-shrink on eligible closest-hit `AnyHit` loops.
     pub rq_opaque: Option<V>,
+    /// When `Some`, two-pass `tMax` pre-shrink extracts these Pass 1 fields immediately
+    /// after Pass 1 (before Pass 2 starts) so Pass 1's `RayQuery` state is dead during Pass 2
+    /// (and reuses `rq` directly when `rq_opaque` is `None`).
+    pub two_pass_early_fields: Option<Vec<EarlyQ1Field>>,
     /// Bound `RaytracingAccelerationStructure` SRV handle (`Lower::handle(..., (16, 0))`).
     pub tlas: V,
     /// Per-lane ray-active `i1` predicate when `active_ray_mask` is non-trivial.
@@ -303,6 +451,8 @@ pub(crate) struct ResolvedRayInputs {
     pub group_const_flags: u32,
     /// Constant `constRayFlags` baked into `AllocateRayQuery` for `rq_opaque` (when two-pass).
     pub group_opaque_const_flags: u32,
+    /// Non-zero `InstanceInclusionMask` bitmask for exact 3-pass mask-split `FrontBackTrack`.
+    pub fbt_split_mask: u8,
     /// Initial `minFrontFaceT` `i32` (`f32` bits) for [`RayLoopKind::FrontBackTrack`].
     pub init_min_front_t: Option<V>,
     /// Initial loop-carried user state values for [`RayLoopKind::AnyHit`].
@@ -311,6 +461,26 @@ pub(crate) struct ResolvedRayInputs {
     pub anyhit_entry_dxil: Option<usize>,
     /// Pre-loop fallback `i32` values keyed by IR `Value`.
     pub fallbacks: HashMap<Value, V>,
+}
+
+/// Extra blocks and `i1` PHI for a speculative opaque Pass 1 -> one-shot `AnyHit` check ->
+/// exact `FORCE_NON_OPAQUE` Pass 2 fallback loop.
+#[derive(Debug, Clone)]
+pub(crate) struct SpeculativeAnyHit {
+    /// `true` when checking Pass 1's opaque hit, `false` during Pass 2's `Proceed()` loop.
+    pub spec_phi: V,
+    pub spec_decide_blk: usize,
+    pub non_spec_decide_blk: usize,
+    pub p1_check_blk: usize,
+    /// Present for dynamic `ray_flags`: `start_blk` bypasses Pass 1 directly into `phase_hdr`.
+    pub dyn_bypass_blk: Option<usize>,
+    pub proceed_blk: usize,
+    pub after_blk: usize,
+    /// Back-edge target when Pass 1's opaque hit is rejected by `AnyHit` (`phase_hdr`).
+    pub p2_trace_blk: usize,
+    /// `after_blk` PHIs merging `(init, p1_check_blk)`, `(next, spec_decide_blk)`, and
+    /// `(p2_state, proceed_blk)` for each `AnyHitStateVar`.
+    pub final_state_phis: Vec<V>,
 }
 
 /// Pending `Proceed()` loop blocks/PHIs completed when `Lower` reaches [`AnyHitInfo::tail_block`].
@@ -324,16 +494,23 @@ pub(crate) struct PendingAnyHit {
     pub state_phis: Vec<V>,
     pub latch_phis: Vec<V>,
     pub init_vals: Vec<V>,
+    /// Populated when this `FORCE_NON_OPAQUE` `AnyHit` loop uses the speculative opaque fast-path.
+    pub spec: Option<SpeculativeAnyHit>,
 }
 
 /// Returns `true` when `rl` is eligible for two-pass `tMax` pre-shrink:
-/// a closest-hit `AnyHit` loop with no loop-carried state variables and constant
-/// `ray_flags` that do not force or cull opaque/non-opaque geometry.
+/// a closest-hit `AnyHit` loop (optionally with `state_vars` when
+/// `VICTORY_NATIVE_RT_TWOPASS_STATE` is enabled, since opaque triangles bypass `AnyHit`
+/// and never touch `state_vars`) and constant `ray_flags` that do not force or cull
+/// opaque/non-opaque geometry.
 pub(crate) fn is_two_pass_eligible(rl: &RayLoop) -> bool {
     let RayLoopKind::AnyHit(ah) = &rl.kind else {
         return false;
     };
-    if ah.accept_first_hit || !ah.state_vars.is_empty() {
+    if ah.accept_first_hit {
+        return false;
+    }
+    if !ah.state_vars.is_empty() && !super::native_rt_twopass_state() {
         return false;
     }
     matches!(
@@ -369,19 +546,70 @@ pub(crate) fn is_front_back_two_pass_shape(rl: &RayLoop) -> bool {
         )
 }
 
+/// Returns `true` when a `FrontBackTrack` loop should be lowered as exact 3-pass
+/// mask-split (`VICTORY_NATIVE_RT_FBT_SPLIT_MASK != 0`): Pass A (`CULL_BACK`) + Pass B
+/// (`CULL_FRONT`) pure-opaque on `mask & !cull_bit`, followed by `tMax`-clamped
+/// `FORCE_NON_OPAQUE` Pass C on `mask & cull_bit`.
+pub(crate) fn is_front_back_mask_split_eligible(rl: &RayLoop) -> bool {
+    super::native_rt_fbt_split_mask() != 0 && is_front_back_two_pass_shape(rl)
+}
+
 /// Returns `true` when a `FrontBackTrack` loop should be lowered as two pure-opaque
-/// zero-exit traces (opt-in via `VICTORY_NATIVE_RT_FBT_TWOPASS=1`).
+/// zero-exit traces (opt-in via `VICTORY_NATIVE_RT_FBT_TWOPASS=1`, superseded when
+/// `VICTORY_NATIVE_RT_FBT_SPLIT_MASK != 0`).
 pub(crate) fn is_front_back_two_pass_eligible(rl: &RayLoop) -> bool {
-    super::native_rt_fbt_two_pass() && is_front_back_two_pass_shape(rl)
+    super::native_rt_fbt_split_mask() == 0
+        && super::native_rt_fbt_two_pass()
+        && is_front_back_two_pass_shape(rl)
+}
+
+/// Returns `true` when `rl` is a `FORCE_NON_OPAQUE` (or dynamic-flag) `AnyHit` loop
+/// structurally compatible with speculative opaque Pass 1 (`FORCE_OPAQUE`) -> one-shot
+/// `AnyHit` check -> exact `FORCE_NON_OPAQUE` fallback (purity is already enforced by
+/// `has_no_forbidden_side_effects`). When `state_vars` is non-empty, `ACCEPT_FIRST_HIT`
+/// is excluded so Pass 1 always returns the globally closest triangle `T_0`.
+pub(crate) fn is_fno_speculative_shape(rl: &RayLoop) -> bool {
+    let RayLoopKind::AnyHit(ah) = &rl.kind else {
+        return false;
+    };
+    let has_state = !ah.state_vars.is_empty();
+    if has_state && ah.accept_first_hit {
+        return false;
+    }
+    let bad_mask = ray_flag::FORCE_OPAQUE
+        | ray_flag::CULL_OPAQUE
+        | ray_flag::CULL_NON_OPAQUE
+        | ray_flag::SKIP_TRIANGLES
+        | if has_state {
+            ray_flag::ACCEPT_FIRST_HIT_AND_END_SEARCH
+        } else {
+            0
+        };
+    match rl.ray_flags {
+        RayInput::Const(f) => (f & ray_flag::FORCE_NON_OPAQUE) != 0 && (f & bad_mask) == 0,
+        RayInput::Val(_) | RayInput::ShiftedMask(_) => true,
+    }
+}
+
+/// Returns `true` when `rl` should use the speculative opaque fast-path
+/// (`VICTORY_NATIVE_RT_FNO_MODE=2`, default).
+pub(crate) fn is_fno_speculative_eligible(rl: &RayLoop) -> bool {
+    super::native_rt_fno_mode() >= 2 && is_fno_speculative_shape(rl)
 }
 
 /// Constant `constRayFlags` mask for `AllocateRayQuery`. For two-pass pure-opaque
 /// `FrontBackTrack`, replaces `FORCE_NON_OPAQUE` with `FORCE_OPAQUE` so hardware
-/// traversal runs without `Proceed()` exits.
+/// traversal runs without `Proceed()` exits. For speculative `FORCE_NON_OPAQUE` `AnyHit`,
+/// clears `FORCE_NON_OPAQUE` so Pass 1 can pass `FORCE_OPAQUE` and Pass 2 `FORCE_NON_OPAQUE`
+/// on the same `RayQuery` handle.
 pub(crate) fn effective_const_ray_flags(rl: &RayLoop) -> Option<u32> {
     match rl.ray_flags {
-        RayInput::Const(f) => Some(if is_front_back_two_pass_eligible(rl) {
+        RayInput::Const(f) => Some(if is_front_back_mask_split_eligible(rl) {
+            f & !ray_flag::FORCE_NON_OPAQUE
+        } else if is_front_back_two_pass_eligible(rl) {
             (f & !ray_flag::FORCE_NON_OPAQUE) | ray_flag::FORCE_OPAQUE
+        } else if is_fno_speculative_eligible(rl) {
+            f & !ray_flag::FORCE_NON_OPAQUE
         } else {
             f
         }),
@@ -394,6 +622,7 @@ pub(crate) struct RayLoopEmission {
     pub tail: usize,
     pub outs: Vec<(Value, V)>,
     pub pending_anyhit: Option<PendingAnyHit>,
+    pub two_pass_post: Option<TwoPassPost>,
 }
 
 // ---------------------------------------------------------------------------
@@ -790,6 +1019,7 @@ impl<'a> Analyzer<'a> {
             id: usize,
             const_flags: Option<u32>,
             two_pass: bool,
+            fbt_mask_split: bool,
             defs: HashSet<usize>,
             live: HashSet<usize>,
         }
@@ -798,12 +1028,14 @@ impl<'a> Analyzer<'a> {
             let mut const_flags: Option<u32> = None;
             let mut mixed_flags = false;
             let mut two_pass = true;
+            let mut fbt_mask_split = true;
             let mut defs: HashSet<usize> = HashSet::new();
             let mut live: HashSet<usize> = HashSet::new();
             let mut work: Vec<usize> = Vec::new();
             for &idx in &group_loops[&gid] {
                 let rl = &lifted[idx];
                 two_pass &= is_two_pass_eligible(rl);
+                fbt_mask_split &= is_front_back_mask_split_eligible(rl);
                 match effective_const_ray_flags(rl) {
                     Some(f) => match const_flags {
                         Some(prev) if prev != f => mixed_flags = true,
@@ -851,20 +1083,24 @@ impl<'a> Analyzer<'a> {
                 id: gid,
                 const_flags: if mixed_flags { None } else { const_flags },
                 two_pass,
+                fbt_mask_split,
                 defs,
                 live,
             });
         }
 
         // Greedy interference-free merging of groups sharing the exact same constant `ray_flags`
-        // and two-pass eligibility.
+        // and two-pass / mask-split eligibility.
         let mut merged: Vec<GroupInfo> = Vec::new();
         let mut remap: HashMap<usize, usize> = HashMap::new();
         for g in infos {
             let mut target_idx: Option<usize> = None;
             if let Some(cf) = g.const_flags {
                 for (mi, m) in merged.iter().enumerate() {
-                    if m.const_flags != Some(cf) || m.two_pass != g.two_pass {
+                    if m.const_flags != Some(cf)
+                        || m.two_pass != g.two_pass
+                        || m.fbt_mask_split != g.fbt_mask_split
+                    {
                         continue;
                     }
                     let clash = g.defs.iter().any(|b| m.live.contains(b))
@@ -941,16 +1177,17 @@ impl<'a> Analyzer<'a> {
         let ray_flags = self.extract_ray_flags(nodes, &tri_hit)?;
         let instance_mask = self.extract_instance_mask(template, nodes, entry_block)?;
 
-        // Closest-hit `AnyHit` loops with `FORCE_NON_OPAQUE` (or dynamic flags) exit hardware
-        // traversal on every opaque triangle (`020`/`018`/`024` L0..2), which trails the inline
-        // BVH loop on RDNA 4; non-`FORCE_NON_OPAQUE` closest-hit `AnyHit` loops (`003`, `015`,
-        // `062`, `024` L3) beat SW-RT by 2.8x-5.5x on native DXR and are lifted by default.
-        let is_force_non_opaque = !matches!(
+        // Closest-hit `AnyHit` loops with constant `FORCE_NON_OPAQUE` or dynamic `ray_flags`
+        // are controlled by `VICTORY_NATIVE_RT_FNO_MODE` (default 2: speculative opaque fast-path
+        // + exact fallback; 1: direct `Proceed()`; 0: disabled unless `VICTORY_NATIVE_RT_ANYHIT=1`).
+        let is_const_fno = matches!(
             ray_flags,
-            RayInput::Const(f) if (f & ray_flag::FORCE_NON_OPAQUE) == 0
+            RayInput::Const(f) if (f & ray_flag::FORCE_NON_OPAQUE) != 0
         );
+        let is_dynamic_flags = !matches!(ray_flags, RayInput::Const(_));
         if matches!(&tri_hit.mode, HitMode::AnyHit(ah) if !ah.accept_first_hit)
-            && is_force_non_opaque
+            && (is_const_fno || is_dynamic_flags)
+            && super::native_rt_fno_mode() == 0
             && !super::native_rt_anyhit()
         {
             return None;
@@ -2017,8 +2254,14 @@ impl<'a> Analyzer<'a> {
             .position(|i| matches!(i.name(), "s_and_saveexec_b32" | "s_and_saveexec_b64"))?;
 
         // Extract `committed_t_old` and `t_min` from `t_hit` range compares before `saveexec_idx`.
-        let (committed_t_old, t_min) =
-            self.extract_range_bounds_in_hit_block(hit_block, saveexec_idx, t_hit, t_max, nodes, entry_block)?;
+        let (committed_t_old, t_min) = self.extract_range_bounds_in_hit_block(
+            hit_block,
+            saveexec_idx,
+            t_hit,
+            t_max,
+            nodes,
+            entry_block,
+        )?;
         let committed_t_reg = self.value_reg(committed_t_old)?;
 
         // Check whether `hit_block` has straight-line commit after `saveexec_idx` (Layout B)
@@ -5660,7 +5903,21 @@ impl<'a> Analyzer<'a> {
                         }
                     }
                     BvhTag::BlasBaseLo => {
-                        if matches!(
+                        if matches!(n, "v_or_b32" | "s_or_b32" | "v_add_co_u32" | "v_add_nc_u32")
+                            && other_const_arg(inst, v) == Some(60)
+                        {
+                            let lo = inst.writes.first()?.1;
+                            if !set_tag(&mut tags, &mut tag_facts, &mut work, lo, BvhTag::BlasBaseHdrLo(60), v_facts.clone()) {
+                                meta_fail!("BlasBaseHdrLo clash at B{b}:{i}");
+                            }
+                            for &(wr, wv) in inst.writes.iter().skip(1) {
+                                if matches!(wr, Reg::S(_) | Reg::Scc)
+                                    && !set_tag(&mut tags, &mut tag_facts, &mut work, wv, BvhTag::AddrCarry, v_facts.clone())
+                                {
+                                    meta_fail!("BlasBaseHdrLo carry clash at B{b}:{i}");
+                                }
+                            }
+                        } else if matches!(
                             n,
                             "v_add_co_u32" | "v_add_nc_u32" | "s_add_u32" | "v_or_b32"
                         ) {
@@ -5688,6 +5945,21 @@ impl<'a> Analyzer<'a> {
                             }
                         } else {
                             meta_fail!("BlasBaseLo used by {n} at B{b}:{i}@{:#x}", self.p.blocks[b].insts[i].machine.offset);
+                        }
+                    }
+                    BvhTag::BlasBaseHdrLo(off) => {
+                        if let Some((1, imm_off)) = flat_or_smem_load_info(inst, v)
+                            && off.checked_add(imm_off) == Some(60)
+                        {
+                            let kind = RayMetaKind::BlasBaseZero;
+                            if let Some(&prev) = loads.get(&(b, i))
+                                && prev != kind
+                            {
+                                meta_fail!("BlasBaseHdrLo load clash at B{b}:{i}");
+                            }
+                            loads.insert((b, i), kind);
+                        } else {
+                            meta_fail!("BlasBaseHdrLo({off}) used by {n} at B{b}:{i}@{:#x}", self.p.blocks[b].insts[i].machine.offset);
                         }
                     }
                     BvhTag::TriNode => {
@@ -5756,6 +6028,13 @@ impl<'a> Analyzer<'a> {
                             if !set_tag(&mut tags, &mut tag_facts, &mut work, w, BvhTag::TriSlotShl2, v_facts.clone()) {
                                 meta_fail!("TriSlotShl2 clash at B{b}:{i}");
                             }
+                        } else if matches!(n, "v_lshlrev_b32" | "s_lshl_b32")
+                            && other_const_arg(inst, v) == Some(3)
+                        {
+                            let w = inst.writes.first()?.1;
+                            if !set_tag(&mut tags, &mut tag_facts, &mut work, w, BvhTag::TriFetchScratch, v_facts.clone()) {
+                                meta_fail!("TriFetchScratch clash at B{b}:{i}");
+                            }
                         } else if matches!(n, "v_min_u32" | "v_min_i32") {
                             let w = inst.writes.first()?.1;
                             if !set_tag(&mut tags, &mut tag_facts, &mut work, w, BvhTag::TriSlot, v_facts.clone()) {
@@ -5769,6 +6048,15 @@ impl<'a> Analyzer<'a> {
                             if !set_tag(&mut tags, &mut tag_facts, &mut work, w, BvhTag::TriSlotCmp, v_facts.clone()) {
                                 meta_fail!("TriSlotCmp clash at B{b}:{i}");
                             }
+                        } else if (n == "v_cmpx_gt_u32"
+                            && two_src_operands(inst)
+                                .is_some_and(|(a, b)| const_operand(a) == Some(4) && operand_val(inst, b) == Some(v)))
+                            || (n == "v_cmpx_lt_u32"
+                                && two_src_operands(inst)
+                                    .is_some_and(|(a, b)| operand_val(inst, a) == Some(v) && const_operand(b) == Some(4)))
+                        {
+                            // `TriSlot < 4` (triangle node vs procedural/box): always true on
+                            // `CommittedStatusTriNode == 1` (`1 & 7 == 1 < 4`) and writes only EXEC.
                         } else {
                             meta_fail!("TriSlot used by {n} at B{b}:{i}@{:#x}", self.p.blocks[b].insts[i].machine.offset);
                         }
@@ -5780,6 +6068,23 @@ impl<'a> Analyzer<'a> {
                             let w = inst.writes.first()?.1;
                             if !set_tag(&mut tags, &mut tag_facts, &mut work, w, BvhTag::TriPrimOff, v_facts.clone()) {
                                 meta_fail!("TriPrimOff2 clash at B{b}:{i}");
+                            }
+                        } else if (matches!(n, "v_add_nc_u32" | "v_add_co_u32" | "v_or_b32")
+                            && other_const_arg(inst, v) == Some(16))
+                            || (n == "v_lshrrev_b32" && other_const_arg(inst, v) == Some(1058))
+                            || (n == "v_bfe_u32"
+                                && matches!(
+                                    &inst.fields,
+                                    Fields::Valu(f)
+                                        if f.src.len() >= 3
+                                            && const_operand(&f.src[0]) == Some(1_127_293_456)
+                                            && operand_val(inst, &f.src[1]) == Some(v)
+                                            && const_operand(&f.src[2]) == Some(3)
+                                ))
+                        {
+                            let w = inst.writes.first()?.1;
+                            if !set_tag(&mut tags, &mut tag_facts, &mut work, w, BvhTag::TriFetchScratch, v_facts.clone()) {
+                                meta_fail!("TriSlotShl2 fetch scratch clash at B{b}:{i}");
                             }
                         } else {
                             meta_fail!("TriSlotShl2 used by {n} at B{b}:{i}@{:#x}", self.p.blocks[b].insts[i].machine.offset);
@@ -5897,12 +6202,32 @@ impl<'a> Analyzer<'a> {
                                 meta_fail!("TriAddrLo addk clash at B{b}:{i}");
                             }
                         } else if matches!(n, "v_add_co_u32" | "v_add_nc_u32")
-                            && other_val_arg(inst, v)
-                                .is_some_and(|ov| tags.get(&ov) == Some(&BvhTag::TriPrimOff))
+                            && let Some(ov) = other_val_arg(inst, v)
                         {
+                            let out_tag = match (off, tags.get(&ov).copied()) {
+                                (_, Some(BvhTag::TriPrimOff)) => BvhTag::TriAddrPrimLo,
+                                (0, Some(BvhTag::TriFetchVertOff(slot))) => {
+                                    BvhTag::TriFetchVertAddrLo(slot)
+                                }
+                                (_, None) if round < 5 => {
+                                    deferred.push((v, b, i));
+                                    continue;
+                                }
+                                (_, _other) => meta_fail!(
+                                    "TriAddrLo({off}) add bad other={_other:?} at B{b}:{i}@{:#x}",
+                                    self.p.blocks[b].insts[i].machine.offset
+                                ),
+                            };
                             let w = inst.writes.first()?.1;
-                            if !set_tag(&mut tags, &mut tag_facts, &mut work, w, BvhTag::TriAddrPrimLo, v_facts.clone()) {
-                                meta_fail!("TriAddrLo+Prim clash at B{b}:{i}");
+                            if !set_tag(&mut tags, &mut tag_facts, &mut work, w, out_tag, v_facts.clone()) {
+                                meta_fail!("TriAddrLo add clash at B{b}:{i}");
+                            }
+                            for &(wr, wv) in inst.writes.iter().skip(1) {
+                                if matches!(wr, Reg::S(_) | Reg::Scc)
+                                    && !set_tag(&mut tags, &mut tag_facts, &mut work, wv, BvhTag::AddrCarry, v_facts.clone())
+                                {
+                                    meta_fail!("TriAddrLo carry clash at B{b}:{i}");
+                                }
                             }
                         } else if let Some((ndw, imm_off)) = flat_or_smem_load_info(inst, v) {
                             let total = off.checked_add(imm_off)?;
@@ -5915,6 +6240,13 @@ impl<'a> Analyzer<'a> {
                                     RayMetaKind::GeometryIndexShl8
                                 }
                                 (1, 52) | (1, 56) => RayMetaKind::PrimitiveIndex,
+                                (1, 60) => {
+                                    let dst = inst.writes.first()?.1;
+                                    if !set_tag(&mut tags, &mut tag_facts, &mut work, dst, BvhTag::TriFetchTriId, v_facts.clone()) {
+                                        meta_fail!("TriFetchTriId clash at B{b}:{i}");
+                                    }
+                                    RayMetaKind::BlasBaseZero
+                                }
                                 _ => meta_fail!("TriAddrLo({total}, ndw={ndw}) unsupported load at B{b}:{i}@{:#x}", self.p.blocks[b].insts[i].machine.offset),
                             };
                             if let Some(&prev) = loads.get(&(b, i))
@@ -5938,6 +6270,231 @@ impl<'a> Analyzer<'a> {
                             loads.insert((b, i), kind);
                         } else {
                             meta_fail!("TriAddrPrimLo used by {n} at B{b}:{i}@{:#x}", self.p.blocks[b].insts[i].machine.offset);
+                        }
+                    }
+                    BvhTag::TriFetchScratch => {
+                        if matches!(n, "v_and_b32" | "s_and_b32" | "v_lshlrev_b32" | "s_lshl_b32")
+                            && other_const_arg(inst, v).is_some()
+                        {
+                            let w = inst.writes.first()?.1;
+                            if !set_tag(&mut tags, &mut tag_facts, &mut work, w, BvhTag::TriFetchScratch, v_facts.clone()) {
+                                meta_fail!("TriFetchScratch mask/shl clash at B{b}:{i}");
+                            }
+                        } else if n == "v_lshrrev_b32"
+                            && let Some((s0, s1)) = two_src_operands(inst)
+                            && operand_val(inst, s0) == Some(v)
+                        {
+                            let s1_const = const_operand(s1)
+                                .or_else(|| operand_val(inst, s1).and_then(|x| self.eval_const(x, 0)));
+                            if s1_const == Some(1_127_293_456) {
+                                let w = inst.writes.first()?.1;
+                                if !set_tag(&mut tags, &mut tag_facts, &mut work, w, BvhTag::TriFetchScratch, v_facts.clone()) {
+                                    meta_fail!("TriFetchScratch lut clash at B{b}:{i}");
+                                }
+                            } else if let Some(ov) = operand_val(inst, s1) {
+                                match tags.get(&ov).copied() {
+                                    Some(BvhTag::TriFetchTriId) => {
+                                        let w = inst.writes.first()?.1;
+                                        if !set_tag(&mut tags, &mut tag_facts, &mut work, w, BvhTag::TriFetchTriId, v_facts.clone()) {
+                                            meta_fail!("TriFetchScratch->TriId clash at B{b}:{i}");
+                                        }
+                                    }
+                                    None if round < 5 => {
+                                        deferred.push((v, b, i));
+                                        continue;
+                                    }
+                                    _other => meta_fail!("TriFetchScratch lshr bad other={_other:?} at B{b}:{i}"),
+                                }
+                            } else {
+                                meta_fail!("TriFetchScratch lshr bad s1 at B{b}:{i}");
+                            }
+                        } else if matches!(n, "v_or3_b32" | "v_or_b32")
+                            && let Fields::Valu(f) = &inst.fields
+                        {
+                            let mut any_none = false;
+                            let mut all_ok = true;
+                            for op in &f.src {
+                                if let Some(ov) = operand_val(inst, op) {
+                                    match tags.get(&ov).copied() {
+                                        Some(BvhTag::TriFetchScratch) => {}
+                                        None => any_none = true,
+                                        _ => all_ok = false,
+                                    }
+                                } else if const_operand(op).is_none() {
+                                    all_ok = false;
+                                }
+                            }
+                            if !all_ok {
+                                meta_fail!("TriFetchScratch {n} bad arg at B{b}:{i}");
+                            }
+                            if any_none {
+                                if round < 5 {
+                                    deferred.push((v, b, i));
+                                    continue;
+                                }
+                                meta_fail!("TriFetchScratch {n} unresolved arg at B{b}:{i}");
+                            }
+                            let w = inst.writes.first()?.1;
+                            if !set_tag(&mut tags, &mut tag_facts, &mut work, w, BvhTag::TriFetchScratch, v_facts.clone()) {
+                                meta_fail!("TriFetchScratch {n} clash at B{b}:{i}");
+                            }
+                        } else if n == "v_bfe_u32"
+                            && let Fields::Valu(f) = &inst.fields
+                            && f.src.len() >= 3
+                            && operand_val(inst, &f.src[0]) == Some(v)
+                            && const_operand(&f.src[2]) == Some(3)
+                        {
+                            let Some(sh_v) = operand_val(inst, &f.src[1]) else {
+                                meta_fail!("TriFetchScratch bfe missing sh_v at B{b}:{i}");
+                            };
+                            match tags.get(&sh_v).copied() {
+                                Some(BvhTag::TriFetchVertShift(slot)) => {
+                                    let w = inst.writes.first()?.1;
+                                    if !set_tag(&mut tags, &mut tag_facts, &mut work, w, BvhTag::TriFetchVertOff(slot), v_facts.clone()) {
+                                        meta_fail!("TriFetchVertOff clash at B{b}:{i}");
+                                    }
+                                }
+                                None if round < 5 => {
+                                    deferred.push((v, b, i));
+                                    continue;
+                                }
+                                _other => meta_fail!("TriFetchScratch bfe bad shift={_other:?} at B{b}:{i}"),
+                            }
+                        } else {
+                            meta_fail!("TriFetchScratch used by {n} at B{b}:{i}@{:#x}", self.p.blocks[b].insts[i].machine.offset);
+                        }
+                    }
+                    BvhTag::TriFetchTriId => {
+                        if n == "v_lshrrev_b32"
+                            && let Some((s0, s1)) = two_src_operands(inst)
+                            && operand_val(inst, s1) == Some(v)
+                            && let Some(sh_v) = operand_val(inst, s0)
+                        {
+                            match tags.get(&sh_v).copied() {
+                                Some(BvhTag::TriFetchScratch) => {
+                                    let w = inst.writes.first()?.1;
+                                    if !set_tag(&mut tags, &mut tag_facts, &mut work, w, BvhTag::TriFetchTriId, v_facts.clone()) {
+                                        meta_fail!("TriFetchTriId shift clash at B{b}:{i}");
+                                    }
+                                }
+                                None if round < 5 => {
+                                    deferred.push((v, b, i));
+                                    continue;
+                                }
+                                _other => meta_fail!("TriFetchTriId shift bad other={_other:?} at B{b}:{i}"),
+                            }
+                        } else if matches!(n, "v_and_b32" | "s_and_b32")
+                            && other_const_arg(inst, v) == Some(12)
+                        {
+                            let w = inst.writes.first()?.1;
+                            if !set_tag(&mut tags, &mut tag_facts, &mut work, w, BvhTag::TriFetchVertShift(0), v_facts.clone()) {
+                                meta_fail!("TriFetchVertShift(0) clash at B{b}:{i}");
+                            }
+                        } else if matches!(n, "v_lshlrev_b32" | "s_lshl_b32")
+                            && let Some(sh) = other_const_arg(inst, v)
+                            && matches!(sh, 1 | 2)
+                        {
+                            let slot = if sh == 2 { 1 } else { 2 };
+                            let w = inst.writes.first()?.1;
+                            if !set_tag(&mut tags, &mut tag_facts, &mut work, w, BvhTag::TriFetchVertShift(slot), v_facts.clone()) {
+                                meta_fail!("TriFetchVertShift({slot}) clash at B{b}:{i}");
+                            }
+                        } else {
+                            meta_fail!("TriFetchTriId used by {n} at B{b}:{i}@{:#x}", self.p.blocks[b].insts[i].machine.offset);
+                        }
+                    }
+                    BvhTag::TriFetchVertShift(slot) => {
+                        if (matches!(n, "v_and_b32" | "s_and_b32")
+                            && matches!(other_const_arg(inst, v), Some(12 | 30)))
+                            || (matches!(n, "v_lshlrev_b32" | "s_lshl_b32")
+                                && other_const_arg(inst, v) == Some(2))
+                            || (n == "v_lshrrev_b32"
+                                && two_src_operands(inst).is_some_and(|(s0, s1)| {
+                                    operand_val(inst, s0) == Some(v)
+                                        && const_operand(s1) == Some(66_072)
+                                }))
+                        {
+                            let w = inst.writes.first()?.1;
+                            if !set_tag(&mut tags, &mut tag_facts, &mut work, w, BvhTag::TriFetchVertShift(slot), v_facts.clone()) {
+                                meta_fail!("TriFetchVertShift({slot}) step clash at B{b}:{i}");
+                            }
+                        } else if n == "v_bfe_u32"
+                            && let Fields::Valu(f) = &inst.fields
+                            && f.src.len() >= 3
+                            && operand_val(inst, &f.src[1]) == Some(v)
+                            && const_operand(&f.src[2]) == Some(3)
+                        {
+                            let Some(src0) = operand_val(inst, &f.src[0]) else {
+                                meta_fail!("TriFetchVertShift bfe missing src0 at B{b}:{i}");
+                            };
+                            match tags.get(&src0).copied() {
+                                Some(BvhTag::TriFetchScratch) => {
+                                    let w = inst.writes.first()?.1;
+                                    if !set_tag(&mut tags, &mut tag_facts, &mut work, w, BvhTag::TriFetchVertOff(slot), v_facts.clone()) {
+                                        meta_fail!("TriFetchVertOff({slot}) clash at B{b}:{i}");
+                                    }
+                                }
+                                None if round < 5 => {
+                                    deferred.push((v, b, i));
+                                    continue;
+                                }
+                                _other => meta_fail!("TriFetchVertShift bfe bad src0={_other:?} at B{b}:{i}"),
+                            }
+                        } else {
+                            meta_fail!("TriFetchVertShift({slot}) used by {n} at B{b}:{i}@{:#x}", self.p.blocks[b].insts[i].machine.offset);
+                        }
+                    }
+                    BvhTag::TriFetchVertOff(slot) => {
+                        if matches!(n, "v_mul_u32_u24" | "v_mul_lo_u32")
+                            && other_const_arg(inst, v) == Some(12)
+                        {
+                            let w = inst.writes.first()?.1;
+                            if !set_tag(&mut tags, &mut tag_facts, &mut work, w, BvhTag::TriFetchVertOff(slot), v_facts.clone()) {
+                                meta_fail!("TriFetchVertOff({slot}) mul12 clash at B{b}:{i}");
+                            }
+                        } else if matches!(n, "v_add_co_u32" | "v_add_nc_u32")
+                            && let Some(ov) = other_val_arg(inst, v)
+                        {
+                            match tags.get(&ov).copied() {
+                                Some(BvhTag::TriAddrLo(0)) => {
+                                    let w = inst.writes.first()?.1;
+                                    if !set_tag(&mut tags, &mut tag_facts, &mut work, w, BvhTag::TriFetchVertAddrLo(slot), v_facts.clone()) {
+                                        meta_fail!("TriFetchVertAddrLo({slot}) clash at B{b}:{i}");
+                                    }
+                                    for &(wr, wv) in inst.writes.iter().skip(1) {
+                                        if matches!(wr, Reg::S(_) | Reg::Scc)
+                                            && !set_tag(&mut tags, &mut tag_facts, &mut work, wv, BvhTag::AddrCarry, v_facts.clone())
+                                        {
+                                            meta_fail!("TriFetchVertAddrLo carry clash at B{b}:{i}");
+                                        }
+                                    }
+                                }
+                                None if round < 5 => {
+                                    deferred.push((v, b, i));
+                                    continue;
+                                }
+                                _other => meta_fail!("TriFetchVertOff({slot}) add bad other={_other:?} at B{b}:{i}"),
+                            }
+                        } else {
+                            meta_fail!("TriFetchVertOff({slot}) used by {n} at B{b}:{i}@{:#x}", self.p.blocks[b].insts[i].machine.offset);
+                        }
+                    }
+                    BvhTag::TriFetchVertAddrLo(slot) => {
+                        if let Some((3, 0)) = flat_or_smem_load_info(inst, v) {
+                            let kind = match slot {
+                                0 => RayMetaKind::TriFetchBasisB,
+                                1 => RayMetaKind::TriFetchBasisT,
+                                2 => RayMetaKind::TriFetchZero3,
+                                _ => meta_fail!("TriFetchVertAddrLo bad slot={slot}"),
+                            };
+                            if let Some(&prev) = loads.get(&(b, i))
+                                && prev != kind
+                            {
+                                meta_fail!("TriFetchVertAddrLo load clash at B{b}:{i}");
+                            }
+                            loads.insert((b, i), kind);
+                        } else {
+                            meta_fail!("TriFetchVertAddrLo({slot}) used by {n} at B{b}:{i}@{:#x}", self.p.blocks[b].insts[i].machine.offset);
                         }
                     }
                 }
@@ -6415,15 +6972,15 @@ impl<'a> Analyzer<'a> {
         } else {
             vec![(def_reach, true)]
         };
-        let mut seen: HashSet<(Value, Vec<(Bool, bool)>)> = HashSet::new();
-        let mut work: Vec<(Value, Vec<(Bool, bool)>)> = vec![(root, init_facts)];
+        let mut seen: HashSet<(Value, Vec<(Bool, bool)>, u32)> = HashSet::new();
+        let mut work: Vec<(Value, Vec<(Bool, bool)>, u32)> = vec![(root, init_facts, 24)];
         let mut steps = 0usize;
-        while let Some((v, facts)) = work.pop() {
+        while let Some((v, facts, max_bits)) = work.pop() {
             steps += 1;
             if steps > 256 {
                 return false;
             }
-            if !seen.insert((v, facts.clone())) {
+            if !seen.insert((v, facts.clone(), max_bits)) {
                 continue;
             }
             for &(b, idx_opt) in &self.uses[v.0 as usize] {
@@ -6441,7 +6998,7 @@ impl<'a> Analyzer<'a> {
                             }
                             let nf = self.edge_facts(pred, b, &facts);
                             if self.bools_meet(&nf) {
-                                work.push((phi.value, nf));
+                                work.push((phi.value, nf, max_bits));
                             }
                         }
                     }
@@ -6465,7 +7022,7 @@ impl<'a> Analyzer<'a> {
                                 if rv == v
                                     && let Some(w) = inst.write(r)
                                 {
-                                    work.push((w, nf.clone()));
+                                    work.push((w, nf.clone(), max_bits));
                                 }
                             }
                         }
@@ -6498,9 +7055,28 @@ impl<'a> Analyzer<'a> {
                     | "v_xor_b32"
                     | "s_xor_b32" => {
                         // Modular add/sub/bitwise ops depend only on bits <= k for output bits <= k,
-                        // so check that all downstream uses mask to <= 24 bits!
+                        // so check that all downstream uses mask to <= `max_bits` bits!
                         if let Some(&(_, w)) = inst.writes.first() {
-                            work.push((w, facts.clone()));
+                            work.push((w, facts.clone(), max_bits));
+                        }
+                    }
+                    "v_lshrrev_b32" | "s_lshr_b32" => {
+                        let Some((s0, s1)) = two_src_operands(inst) else {
+                            return false;
+                        };
+                        let (shift_op, val_op) = if inst.name() == "v_lshrrev_b32" {
+                            (s0, s1)
+                        } else {
+                            (s1, s0)
+                        };
+                        let Some(sh) = const_operand(shift_op) else {
+                            return false;
+                        };
+                        if operand_val(inst, val_op) != Some(v) || sh >= max_bits {
+                            return false;
+                        }
+                        if let Some(&(_, w)) = inst.writes.first() {
+                            work.push((w, facts.clone(), max_bits - sh));
                         }
                     }
                     "v_and_b32" | "s_and_b32" => {
@@ -6510,7 +7086,8 @@ impl<'a> Analyzer<'a> {
                         let Some(k) = k else {
                             return false;
                         };
-                        if k > 0x00FF_FFFF {
+                        let allowed_mask = (1u32 << max_bits) - 1;
+                        if k > allowed_mask {
                             return false;
                         }
                     }
@@ -6525,7 +7102,7 @@ impl<'a> Analyzer<'a> {
                         else {
                             return false;
                         };
-                        if sh + w > 24 {
+                        if sh + w > max_bits {
                             return false;
                         }
                     }
@@ -6838,6 +7415,7 @@ enum BvhTag {
     AddrCarry,
     BlasBaseShr8,
     BlasBaseLo,
+    BlasBaseHdrLo(u32),
     TriNode,
     TriNodeShr3,
     TriByteOff(u32),
@@ -6848,6 +7426,11 @@ enum BvhTag {
     TriByteOffPrim,
     TriAddrLo(u32),
     TriAddrPrimLo,
+    TriFetchScratch,
+    TriFetchTriId,
+    TriFetchVertShift(u8),
+    TriFetchVertOff(u8),
+    TriFetchVertAddrLo(u8),
     StatusBits,
 }
 
@@ -6882,6 +7465,168 @@ struct TriangleHitInfo {
 // DXIL RayQuery emission pass
 // ---------------------------------------------------------------------------
 
+/// Reads a bounds-clamped `u32` word from the `SLOT_DXR_NORMALS` root SRV.
+fn raw_load_normals_u32(s: &mut Shader, block: usize, srv: V, word_idx: V, max_word: u32) -> V {
+    let i32t = s.t.i32;
+    let last = s.m.i32(max_word);
+    let clamped = s.op(block, "binary.i32", Attr::ReadNone, i32t, 40, &[word_idx, last]);
+    s.m.tag(clamped, Tag::Clamp);
+    let two = s.m.i32(2);
+    let byte = s.m.bin(block, Bin::Shl, clamped, two);
+    let iu = s.m.undef(i32t);
+    let mask = s.m.i8(1);
+    let align = s.m.i32(4);
+    let r = s.op(
+        block,
+        "rawBufferLoad.f32",
+        Attr::ReadOnly,
+        s.t.res_ret,
+        139,
+        &[srv, byte, iu, mask, align],
+    );
+    let f = s.m.extract(block, r, 0);
+    s.m.cast(block, Cast::Bitcast, f, i32t)
+}
+
+/// Fetches the octahedral-packed object-space geometric normal `N` from
+/// `SLOT_DXR_NORMALS` for `(tlas_meta_base, inst_idx, geom_idx, prim_idx)` and
+/// returns unit tangent `T` (`want_b == false`) or unit bitangent
+/// `B = cross(N, T)` (`want_b == true`) as `num_dwords` (`3`) `i32` bit patterns,
+/// so `cross(T - 0, B - 0) == +N`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_tri_fetch_basis(
+    s: &mut Shader,
+    block: usize,
+    tlas_meta_base: V,
+    inst_idx: V,
+    geom_idx: V,
+    prim_idx: V,
+    want_b: bool,
+    num_dwords: usize,
+) -> Vec<V> {
+    let i32t = s.t.i32;
+    let f32t = s.t.f32;
+    let srv = s.root_srv_handle(SLOT_DXR_NORMALS);
+    let zero_i = s.m.i32(0);
+
+    // Level 1: `tlas_meta_base + min(inst_idx, STRIDE - 1)` -> `geom_table_off` (or 0).
+    let inst_max = s.m.i32(DXR_NORMALS_TLAS_STRIDE - 1);
+    let inst_clamped = s.op(block, "binary.i32", Attr::ReadNone, i32t, 40, &[inst_idx, inst_max]);
+    let inst_word = s.m.bin(block, Bin::Add, tlas_meta_base, inst_clamped);
+    let has_tlas = s.m.cmp(block, pred::NE, tlas_meta_base, zero_i);
+    let geom_base_raw = raw_load_normals_u32(s, block, srv, inst_word, DXR_NORMALS_GEOM_BASE - 1);
+    let geom_base = s.m.select(block, has_tlas, geom_base_raw, zero_i);
+
+    // Level 2: `geom_base + geom_idx` -> `prim_data_off` (valid iff `geom_base >= GEOM_BASE`).
+    let geom_floor = s.m.i32(DXR_NORMALS_GEOM_BASE);
+    let has_geom = s.m.cmp(block, pred::IUGE, geom_base, geom_floor);
+    let geom_lim = s.m.i32(DXR_NORMALS_DATA_BASE - 1);
+    let geom_clamped = s.op(block, "binary.i32", Attr::ReadNone, i32t, 40, &[geom_idx, geom_lim]);
+    let geom_word = s.m.bin(block, Bin::Add, geom_base, geom_clamped);
+    let prim_base_raw = raw_load_normals_u32(s, block, srv, geom_word, DXR_NORMALS_DATA_BASE - 1);
+    let prim_base = s.m.select(block, has_geom, prim_base_raw, zero_i);
+
+    // Level 3: `prim_base + prim_idx` -> packed octahedral u32 (or word 0 fallback `(0,0,1)`).
+    let data_floor = s.m.i32(DXR_NORMALS_DATA_BASE);
+    let has_prim = s.m.cmp(block, pred::IUGE, prim_base, data_floor);
+    let words_lim = s.m.i32(DXR_NORMALS_WORDS - 1);
+    let prim_clamped = s.op(block, "binary.i32", Attr::ReadNone, i32t, 40, &[prim_idx, words_lim]);
+    let norm_word_raw = s.m.bin(block, Bin::Add, prim_base, prim_clamped);
+    let norm_word = s.m.select(block, has_prim, norm_word_raw, zero_i);
+    let packed = raw_load_normals_u32(s, block, srv, norm_word, DXR_NORMALS_WORDS - 1);
+
+    // Unpack octahedral `u32` (`qx | (qy << 16)`, 0x8000 = 0.0) -> unit normal `(nx, ny, nz)`.
+    let mask16 = s.m.i32(0xFFFF);
+    let c16 = s.m.i32(16);
+    let qx_i = s.m.bin(block, Bin::And, packed, mask16);
+    let qy_i = s.m.bin(block, Bin::LShr, packed, c16);
+    let qx_f = s.m.cast(block, Cast::UiToFp, qx_i, f32t);
+    let qy_f = s.m.cast(block, Cast::UiToFp, qy_i, f32t);
+
+    let f32768 = s.m.f32(32768.0f32.to_bits());
+    let f_inv32767 = s.m.f32((1.0f32 / 32767.0f32).to_bits());
+    let f_neg1 = s.m.f32((-1.0f32).to_bits());
+    let f_zero = s.m.f32(0.0f32.to_bits());
+    let f_one = s.m.f32(1.0f32.to_bits());
+
+    let ox_sub = s.m.bin(block, Bin::Sub, qx_f, f32768);
+    let ox_raw = s.m.bin(block, Bin::Mul, ox_sub, f_inv32767);
+    let oy_sub = s.m.bin(block, Bin::Sub, qy_f, f32768);
+    let oy_raw = s.m.bin(block, Bin::Mul, oy_sub, f_inv32767);
+    let ox_hi = s.op(block, "binary.f32", Attr::ReadNone, f32t, 36, &[ox_raw, f_one]);
+    let ox = s.op(block, "binary.f32", Attr::ReadNone, f32t, 35, &[ox_hi, f_neg1]);
+    let oy_hi = s.op(block, "binary.f32", Attr::ReadNone, f32t, 36, &[oy_raw, f_one]);
+    let oy = s.op(block, "binary.f32", Attr::ReadNone, f32t, 35, &[oy_hi, f_neg1]);
+
+    let abs_ox = s.op(block, "unary.f32", Attr::ReadNone, f32t, 6, &[ox]);
+    let abs_oy = s.op(block, "unary.f32", Attr::ReadNone, f32t, 6, &[oy]);
+    let nz_sub1 = s.m.bin(block, Bin::Sub, f_one, abs_ox);
+    let nz_u = s.m.bin(block, Bin::Sub, nz_sub1, abs_oy);
+    let neg_nz = s.m.bin(block, Bin::Sub, f_zero, nz_u);
+    let t_fold = s.op(block, "binary.f32", Attr::ReadNone, f32t, 35, &[neg_nz, f_zero]);
+    let neg_t = s.m.bin(block, Bin::Sub, f_zero, t_fold);
+    let ox_ge0 = s.m.cmp(block, pred::OGE, ox, f_zero);
+    let oy_ge0 = s.m.cmp(block, pred::OGE, oy, f_zero);
+    let dx = s.m.select(block, ox_ge0, neg_t, t_fold);
+    let dy = s.m.select(block, oy_ge0, neg_t, t_fold);
+    let nx_u = s.m.bin(block, Bin::Add, ox, dx);
+    let ny_u = s.m.bin(block, Bin::Add, oy, dy);
+
+    let nx2 = s.m.bin(block, Bin::Mul, nx_u, nx_u);
+    let ny2 = s.m.bin(block, Bin::Mul, ny_u, ny_u);
+    let nz2 = s.m.bin(block, Bin::Mul, nz_u, nz_u);
+    let nxy2 = s.m.bin(block, Bin::Add, nx2, ny2);
+    let n_len2 = s.m.bin(block, Bin::Add, nxy2, nz2);
+    let inv_n = s.op(block, "unary.f32", Attr::ReadNone, f32t, 25, &[n_len2]);
+    let nx = s.m.bin(block, Bin::Mul, nx_u, inv_n);
+    let ny = s.m.bin(block, Bin::Mul, ny_u, inv_n);
+    let nz = s.m.bin(block, Bin::Mul, nz_u, inv_n);
+
+    // Orthonormal tangent `T = normalize(cross(up, N))` with branchless `up` pick.
+    let abs_nz = s.op(block, "unary.f32", Attr::ReadNone, f32t, 6, &[nz]);
+    let thresh = s.m.f32(0.999f32.to_bits());
+    let use_z = s.m.cmp(block, pred::OLT, abs_nz, thresh);
+    let neg_ny = s.m.bin(block, Bin::Sub, f_zero, ny);
+    let neg_nz_n = s.m.bin(block, Bin::Sub, f_zero, nz);
+    let tx_u = s.m.select(block, use_z, neg_ny, f_zero);
+    let ty_u = s.m.select(block, use_z, nx, neg_nz_n);
+    let tz_u = s.m.select(block, use_z, f_zero, ny);
+    let tx2 = s.m.bin(block, Bin::Mul, tx_u, tx_u);
+    let ty2 = s.m.bin(block, Bin::Mul, ty_u, ty_u);
+    let tz2 = s.m.bin(block, Bin::Mul, tz_u, tz_u);
+    let txy2 = s.m.bin(block, Bin::Add, tx2, ty2);
+    let t_len2 = s.m.bin(block, Bin::Add, txy2, tz2);
+    let inv_t = s.op(block, "unary.f32", Attr::ReadNone, f32t, 25, &[t_len2]);
+    let tx = s.m.bin(block, Bin::Mul, tx_u, inv_t);
+    let ty = s.m.bin(block, Bin::Mul, ty_u, inv_t);
+    let tz = s.m.bin(block, Bin::Mul, tz_u, inv_t);
+
+    let vec3 = if want_b {
+        // `B = cross(N, T)` -> `cross(T, B) == +N`.
+        let bx0 = s.m.bin(block, Bin::Mul, ny, tz);
+        let bx1 = s.m.bin(block, Bin::Mul, nz, ty);
+        let bx = s.m.bin(block, Bin::Sub, bx0, bx1);
+        let by0 = s.m.bin(block, Bin::Mul, nz, tx);
+        let by1 = s.m.bin(block, Bin::Mul, nx, tz);
+        let by = s.m.bin(block, Bin::Sub, by0, by1);
+        let bz0 = s.m.bin(block, Bin::Mul, nx, ty);
+        let bz1 = s.m.bin(block, Bin::Mul, ny, tx);
+        let bz = s.m.bin(block, Bin::Sub, bz0, bz1);
+        [bx, by, bz]
+    } else {
+        [tx, ty, tz]
+    };
+    (0..num_dwords)
+        .map(|k| {
+            if k < 3 {
+                s.m.cast(block, Cast::Bitcast, vec3[k], i32t)
+            } else {
+                zero_i
+            }
+        })
+        .collect()
+}
+
 /// Emits a single replaced BVH metadata load (`global_load_*` / `s_load_*`) as SM 6.6
 /// `dx.op.rayQuery_State*` dwords in `block`. Returns one `V` (`i32`) per written dword.
 pub(crate) fn emit_ray_meta_load(
@@ -6891,10 +7636,11 @@ pub(crate) fn emit_ray_meta_load(
     candidate: bool,
     kind: RayMetaKind,
     num_dwords: usize,
+    tlas_meta_base: Option<V>,
 ) -> Vec<V> {
     let i32t = s.t.i32;
     match kind {
-        RayMetaKind::BlasBaseZero => vec![s.m.i32(0); num_dwords],
+        RayMetaKind::BlasBaseZero | RayMetaKind::TriFetchZero3 => vec![s.m.i32(0); num_dwords],
         RayMetaKind::InstanceId => {
             let op = if candidate {
                 rq_op::CANDIDATE_INSTANCE_ID
@@ -6953,6 +7699,37 @@ pub(crate) fn emit_ray_meta_load(
                 })
                 .collect()
         }
+        RayMetaKind::TriFetchBasisT | RayMetaKind::TriFetchBasisB => {
+            let inst_op = if candidate {
+                rq_op::CANDIDATE_INSTANCE_INDEX
+            } else {
+                rq_op::COMMITTED_INSTANCE_INDEX
+            };
+            let geom_op = if candidate {
+                rq_op::CANDIDATE_GEOMETRY_INDEX
+            } else {
+                rq_op::COMMITTED_GEOMETRY_INDEX
+            };
+            let prim_op = if candidate {
+                rq_op::CANDIDATE_PRIMITIVE_INDEX
+            } else {
+                rq_op::COMMITTED_PRIMITIVE_INDEX
+            };
+            let inst_idx = s.ray_query_state_i32(block, inst_op, rq);
+            let geom_idx = s.ray_query_state_i32(block, geom_op, rq);
+            let prim_idx = s.ray_query_state_i32(block, prim_op, rq);
+            let base = tlas_meta_base.unwrap_or_else(|| s.m.i32(0));
+            emit_tri_fetch_basis(
+                s,
+                block,
+                base,
+                inst_idx,
+                geom_idx,
+                prim_idx,
+                matches!(kind, RayMetaKind::TriFetchBasisB),
+                num_dwords,
+            )
+        }
     }
 }
 
@@ -6974,11 +7751,12 @@ pub(crate) fn emit_ray_loop(
         let merge_blk = s.m.new_block();
         s.m.terminate(entry_dxil, Term::CondBr(active, trace_blk, merge_blk));
 
-        let (after_blk, traced, cand_outs, pending_anyhit) =
+        let (after_blk, traced, cand_outs, pending_anyhit, two_pass_post) =
             emit_trace_body(s, trace_blk, rl, inputs, i32t, f32t);
         s.m.terminate(after_blk, Term::Br(merge_blk));
 
         let mut merged = Vec::with_capacity(rl.outputs.len() + cand_outs.len());
+        let mut active_phi_cache: HashMap<(V, V), V> = HashMap::new();
         for (binding, &(val_id, traced_v)) in rl.outputs.iter().zip(&traced) {
             let out_v = match binding.output {
                 RayOutput::Zero => s.m.i32(0),
@@ -6991,9 +7769,11 @@ pub(crate) fn emit_ray_loop(
                     let inactive_v = inputs
                         .init_min_front_t
                         .unwrap_or(inputs.t_max);
-                    let phi = s.m.phi(merge_blk, i32t);
-                    s.m.set_phi(phi, vec![(traced_v, after_blk), (inactive_v, entry_dxil)]);
-                    phi
+                    *active_phi_cache.entry((traced_v, inactive_v)).or_insert_with(|| {
+                        let phi = s.m.phi(merge_blk, i32t);
+                        s.m.set_phi(phi, vec![(traced_v, after_blk), (inactive_v, entry_dxil)]);
+                        phi
+                    })
                 }
                 RayOutput::AnyHitState(k) => {
                     let inactive_v = inputs
@@ -7001,32 +7781,61 @@ pub(crate) fn emit_ray_loop(
                         .get(k)
                         .copied()
                         .unwrap_or_else(|| s.m.i32(0));
-                    let phi = s.m.phi(merge_blk, i32t);
-                    s.m.set_phi(phi, vec![(traced_v, after_blk), (inactive_v, entry_dxil)]);
-                    phi
+                    *active_phi_cache.entry((traced_v, inactive_v)).or_insert_with(|| {
+                        let phi = s.m.phi(merge_blk, i32t);
+                        s.m.set_phi(phi, vec![(traced_v, after_blk), (inactive_v, entry_dxil)]);
+                        phi
+                    })
                 }
                 _ => {
                     let inactive_v = binding
                         .fallback
                         .and_then(|fb| inputs.fallbacks.get(&fb).copied())
                         .unwrap_or_else(|| s.m.i32(0));
-                    let phi = s.m.phi(merge_blk, i32t);
-                    s.m.set_phi(phi, vec![(traced_v, after_blk), (inactive_v, entry_dxil)]);
-                    phi
+                    *active_phi_cache.entry((traced_v, inactive_v)).or_insert_with(|| {
+                        let phi = s.m.phi(merge_blk, i32t);
+                        s.m.set_phi(phi, vec![(traced_v, after_blk), (inactive_v, entry_dxil)]);
+                        phi
+                    })
                 }
             };
             merged.push((val_id, out_v));
         }
         merged.extend(cand_outs);
 
+        let two_pass_post = two_pass_post.map(|tp| {
+            let i1t = s.t.i1;
+            let false_v = s.m.bool(false);
+            let q2_hit = s.m.phi(merge_blk, i1t);
+            s.m.set_phi(q2_hit, vec![(tp.q2_hit, after_blk), (false_v, entry_dxil)]);
+            let q1_hit = s.m.phi(merge_blk, i1t);
+            s.m.set_phi(q1_hit, vec![(tp.q1_hit, after_blk), (false_v, entry_dxil)]);
+            let q1_fields = tp.q1_fields.map(|fields| {
+                let zero = s.m.i32(0);
+                let mut m = HashMap::with_capacity(fields.len());
+                for (field, val) in fields {
+                    let phi = s.m.phi(merge_blk, i32t);
+                    s.m.set_phi(phi, vec![(val, after_blk), (zero, entry_dxil)]);
+                    m.insert(field, phi);
+                }
+                m
+            });
+            TwoPassPost {
+                q2_hit,
+                q1_hit,
+                q1_fields,
+            }
+        });
+
         s.m.terminate(merge_blk, Term::Br(exit_dxil));
         RayLoopEmission {
             tail: merge_blk,
             outs: merged,
             pending_anyhit,
+            two_pass_post,
         }
     } else {
-        let (after_blk, mut outs, cand_outs, pending_anyhit) =
+        let (after_blk, mut outs, cand_outs, pending_anyhit, two_pass_post) =
             emit_trace_body(s, entry_dxil, rl, inputs, i32t, f32t);
         outs.extend(cand_outs);
         s.m.terminate(after_blk, Term::Br(exit_dxil));
@@ -7034,6 +7843,7 @@ pub(crate) fn emit_ray_loop(
             tail: after_blk,
             outs,
             pending_anyhit,
+            two_pass_post,
         }
     }
 }
@@ -7132,6 +7942,53 @@ fn emit_committed_hit_output(
     }
 }
 
+fn emit_early_q1_field(
+    s: &mut Shader,
+    block: usize,
+    rq: V,
+    field: EarlyQ1Field,
+    i32t: super::bitcode::Ty,
+) -> V {
+    let out = match field {
+        EarlyQ1Field::Bary(c) => RayOutput::CommittedBary(c),
+        EarlyQ1Field::FrontFace => RayOutput::CommittedFrontFace,
+        EarlyQ1Field::InstanceIndex => RayOutput::CommittedInstanceIndex,
+        EarlyQ1Field::InstanceId => RayOutput::CommittedInstanceId,
+        EarlyQ1Field::InstanceContribution => RayOutput::CommittedInstanceContribution,
+        EarlyQ1Field::GeometryIndex => RayOutput::CommittedGeometryIndex,
+        EarlyQ1Field::PrimitiveIndex => RayOutput::CommittedPrimitiveIndex,
+        EarlyQ1Field::ObjectToWorld(r, c) => RayOutput::CommittedObjectToWorld(r, c),
+        EarlyQ1Field::WorldToObject(r, c) => RayOutput::CommittedWorldToObject(r, c),
+    };
+    emit_committed_hit_output(s, block, rq, out, i32t)
+}
+
+fn early_field_for_output(output: RayOutput) -> Option<EarlyQ1Field> {
+    match output {
+        RayOutput::CommittedBary(c) => Some(EarlyQ1Field::Bary(c)),
+        RayOutput::CommittedFrontFace => Some(EarlyQ1Field::FrontFace),
+        RayOutput::CommittedInstanceIndex => Some(EarlyQ1Field::InstanceIndex),
+        RayOutput::CommittedInstanceId => Some(EarlyQ1Field::InstanceId),
+        RayOutput::CommittedInstanceContribution => Some(EarlyQ1Field::InstanceContribution),
+        RayOutput::CommittedGeometryIndex => Some(EarlyQ1Field::GeometryIndex),
+        RayOutput::CommittedPrimitiveIndex => Some(EarlyQ1Field::PrimitiveIndex),
+        RayOutput::CommittedObjectToWorld(r, c) => Some(EarlyQ1Field::ObjectToWorld(r, c)),
+        RayOutput::CommittedWorldToObject(r, c) => Some(EarlyQ1Field::WorldToObject(r, c)),
+        _ => None,
+    }
+}
+
+enum TwoPassQ1 {
+    /// Pass 1 fields were extracted before Pass 2 started (`p1_rq` is dead during Pass 2).
+    Early {
+        q1_hit: V,
+        t_clamp: V,
+        q1_fields: HashMap<EarlyQ1Field, V>,
+    },
+    /// Pass 1 `RayQuery` handle `q1` remains live across Pass 2.
+    Live { q1: V, q1_hit: V, p1_t: V },
+}
+
 fn emit_trace_body(
     s: &mut Shader,
     start_blk: usize,
@@ -7139,7 +7996,13 @@ fn emit_trace_body(
     inputs: &ResolvedRayInputs,
     i32t: super::bitcode::Ty,
     f32t: super::bitcode::Ty,
-) -> (usize, Vec<(Value, V)>, Vec<(Value, V)>, Option<PendingAnyHit>) {
+) -> (
+    usize,
+    Vec<(Value, V)>,
+    Vec<(Value, V)>,
+    Option<PendingAnyHit>,
+    Option<TwoPassPost>,
+) {
     let mask = match rl.instance_mask {
         RayInput::Const(m) => s.m.i32(m & 0xFF),
         RayInput::Val(_) => {
@@ -7174,51 +8037,448 @@ fn emit_trace_body(
     let skip_proc = (inputs.group_const_flags & ray_flag::SKIP_PROCEDURAL_PRIMITIVES) != 0
         || matches!(rl.ray_flags, RayInput::Const(f) if (f & ray_flag::SKIP_PROCEDURAL_PRIMITIVES) != 0);
 
-    let fbt_two_pass = is_front_back_two_pass_shape(rl)
+    let fbt_mask_split = inputs.fbt_split_mask != 0
+        && is_front_back_two_pass_shape(rl)
+        && (inputs.group_const_flags & ray_flag::FORCE_OPAQUE) == 0;
+
+    let fbt_two_pass = !fbt_mask_split
+        && is_front_back_two_pass_shape(rl)
         && (inputs.group_const_flags & ray_flag::FORCE_NON_OPAQUE) == 0
         && (inputs.group_const_flags & ray_flag::FORCE_OPAQUE) != 0;
 
-    // Two-pass tMax pre-shrink (AnyHit) or zero-exit two-pass pure-opaque FrontBackTrack.
-    let (trace_start_blk, two_pass_q1, fbt_two_pass_min_f) = if let (
-        RayLoopKind::AnyHit(_),
-        Some(q1),
-    ) = (&rl.kind, inputs.rq_opaque)
-    {
+    let fno_spec = is_fno_speculative_eligible(rl)
+        && (inputs.group_const_flags & ray_flag::FORCE_NON_OPAQUE) == 0
+        && (inputs.group_const_flags & ray_flag::FORCE_OPAQUE) == 0;
+
+    // Exact 3-pass mask-split FrontBackTrack (`VICTORY_NATIVE_RT_FBT_SPLIT_MASK != 0`):
+    // - Pass A (`FORCE_OPAQUE | CULL_BACK`, `mask & !cull_bit`): zero-exit single-sided front-faces.
+    // - Pass B (`FORCE_OPAQUE | CULL_FRONT`, `mask & !cull_bit`): zero-exit single-sided back-faces.
+    // - Pass C (`FORCE_NON_OPAQUE`, `mask & cull_bit`, clamped `t_max_c`): exact double-sided
+    //   `Proceed()` loop updating `min_front` and committing back-faces strictly closer than Pass B.
+    if fbt_mask_split {
         let orig_f = match rl.ray_flags {
             RayInput::Const(f) => f,
-            _ => unreachable!("two-pass requires constant ray flags"),
+            _ => unreachable!("mask-split FrontBackTrack requires constant ray flags"),
         };
-        let dyn_flags_p1 = s.m.i32(
-            (orig_f | ray_flag::CULL_NON_OPAQUE) & !inputs.group_opaque_const_flags,
+        let cull_bit = u32::from(inputs.fbt_split_mask);
+        let ss_const = s.m.i32((!cull_bit) & 0xFF);
+        let ds_const = s.m.i32(cull_bit & 0xFF);
+        let mask_ss = s.m.bin(start_blk, Bin::And, mask, ss_const);
+        let mask_ds = s.m.bin(start_blk, Bin::And, mask, ds_const);
+
+        let base_opaque = (orig_f & !ray_flag::FORCE_NON_OPAQUE) | ray_flag::FORCE_OPAQUE;
+        let p1_rq = inputs.rq_opaque.unwrap_or(rq);
+        let p1_const_flags = if inputs.rq_opaque.is_some() {
+            inputs.group_opaque_const_flags
+        } else {
+            inputs.group_const_flags
+        };
+        let needs_min_front = rl
+            .outputs
+            .iter()
+            .any(|b| matches!(b.output, RayOutput::FrontBackMinFrontT));
+        let init_i = inputs.init_min_front_t.unwrap_or(inputs.t_max);
+        let init_f = s.m.cast(start_blk, Cast::Bitcast, init_i, f32t);
+        let one = s.m.i32(1);
+        let zero = s.m.i32(0);
+
+        // Pass A: single-sided front-face trace (`FORCE_OPAQUE | CULL_BACK`).
+        let (b_start_blk, min_front_a) = if needs_min_front {
+            let dyn_flags_front = s.m.i32(
+                (base_opaque | ray_flag::CULL_BACK_FACING_TRIANGLES) & !p1_const_flags,
+            );
+            s.ray_query_trace_inline(
+                start_blk,
+                p1_rq,
+                inputs.tlas,
+                dyn_flags_front,
+                mask_ss,
+                origin,
+                t_min,
+                dir,
+                t_max,
+            );
+            let f_proceed_blk = s.m.new_block();
+            let next_blk = s.m.new_block();
+            s.m.terminate(start_blk, Term::Br(f_proceed_blk));
+            let f_more = s.ray_query_proceed(f_proceed_blk, p1_rq);
+            s.m.terminate(f_proceed_blk, Term::CondBr(f_more, f_proceed_blk, next_blk));
+
+            let f_status = s.ray_query_state_i32(next_blk, rq_op::COMMITTED_STATUS, p1_rq);
+            let f_hit = s.m.cmp(next_blk, pred::EQ, f_status, one);
+            let f_t = s.ray_query_state_f32(next_blk, rq_op::COMMITTED_RAY_T, p1_rq);
+            let f_lt = s.m.cmp(next_blk, pred::OLT, f_t, init_f);
+            let use_f = s.m.bin(next_blk, Bin::And, f_hit, f_lt);
+            let min_front = s.m.select(next_blk, use_f, f_t, init_f);
+            (next_blk, min_front)
+        } else {
+            (start_blk, init_f)
+        };
+
+        // Pass B: single-sided back-face trace (`FORCE_OPAQUE | CULL_FRONT`).
+        let dyn_flags_back = s.m.i32(
+            (base_opaque | ray_flag::CULL_FRONT_FACING_TRIANGLES) & !p1_const_flags,
         );
         s.ray_query_trace_inline(
-            start_blk,
-            q1,
+            b_start_blk,
+            p1_rq,
             inputs.tlas,
-            dyn_flags_p1,
-            mask,
+            dyn_flags_back,
+            mask_ss,
             origin,
             t_min,
             dir,
             t_max,
         );
-        let p1_proceed_blk = s.m.new_block();
-        let p2_start_blk = s.m.new_block();
-        s.m.terminate(start_blk, Term::Br(p1_proceed_blk));
+        let b_proceed_blk = s.m.new_block();
+        let b_done_blk = s.m.new_block();
+        s.m.terminate(b_start_blk, Term::Br(b_proceed_blk));
+        let b_more = s.ray_query_proceed(b_proceed_blk, p1_rq);
+        s.m.terminate(b_proceed_blk, Term::CondBr(b_more, b_proceed_blk, b_done_blk));
 
-        let p1_more = s.ray_query_proceed(p1_proceed_blk, q1);
-        s.m.terminate(p1_proceed_blk, Term::CondBr(p1_more, p1_proceed_blk, p2_start_blk));
+        let b_status = s.ray_query_state_i32(b_done_blk, rq_op::COMMITTED_STATUS, p1_rq);
+        let b_hit = s.m.cmp(b_done_blk, pred::EQ, b_status, one);
 
-        let p1_status = s.ray_query_state_i32(p2_start_blk, rq_op::COMMITTED_STATUS, q1);
-        let one = s.m.i32(1);
-        let q1_hit = s.m.cmp(p2_start_blk, pred::EQ, p1_status, one);
-        let p1_t = s.ray_query_state_f32(p2_start_blk, rq_op::COMMITTED_RAY_T, q1);
-        let t_clamp = s.m.select(p2_start_blk, q1_hit, p1_t, t_max);
+        // Extract Pass B fields early (single-handle mode) or keep `q1` live (2-handle mode).
+        let auto_early: Option<Vec<EarlyQ1Field>> = if inputs.two_pass_early_fields.is_none()
+            && inputs.rq_opaque.is_none()
+        {
+            Some(collect_early_q1_fields(rl, &[]))
+        } else {
+            None
+        };
+        let early_slice = inputs
+            .two_pass_early_fields
+            .as_deref()
+            .or(auto_early.as_deref());
+        let (c_prep_blk, b_t, two_pass_q1) = if let Some(fields) = early_slice {
+            let b_extract_blk = s.m.new_block();
+            let prep_blk = s.m.new_block();
+            s.m.terminate(b_done_blk, Term::CondBr(b_hit, b_extract_blk, prep_blk));
+            let b_t_hit = s.ray_query_state_f32(b_extract_blk, rq_op::COMMITTED_RAY_T, p1_rq);
+            let mut extracted: Vec<(EarlyQ1Field, V)> = Vec::with_capacity(fields.len());
+            for &field in fields {
+                let v = emit_early_q1_field(s, b_extract_blk, p1_rq, field, i32t);
+                extracted.push((field, v));
+            }
+            s.m.terminate(b_extract_blk, Term::Br(prep_blk));
 
-        let dyn_flags_p2 =
-            s.m.i32((orig_f | ray_flag::CULL_OPAQUE) & !inputs.group_const_flags);
+            let bt_phi = s.m.phi(prep_blk, f32t);
+            s.m.set_phi(bt_phi, vec![(b_t_hit, b_extract_blk), (t_max, b_done_blk)]);
+            let mut q1_fields = HashMap::with_capacity(fields.len());
+            for (field, v_hit) in extracted {
+                let phi = s.m.phi(prep_blk, i32t);
+                s.m.set_phi(phi, vec![(v_hit, b_extract_blk), (zero, b_done_blk)]);
+                q1_fields.insert(field, phi);
+            }
+            (
+                prep_blk,
+                bt_phi,
+                TwoPassQ1::Early {
+                    q1_hit: b_hit,
+                    t_clamp: bt_phi,
+                    q1_fields,
+                },
+            )
+        } else {
+            let q1 = inputs.rq_opaque.expect("2-handle mask-split requires rq_opaque");
+            let b_t_raw = s.ray_query_state_f32(b_done_blk, rq_op::COMMITTED_RAY_T, q1);
+            let bt = s.m.select(b_done_blk, b_hit, b_t_raw, t_max);
+            (b_done_blk, bt, TwoPassQ1::Live { q1, q1_hit: b_hit, p1_t: b_t_raw })
+        };
+
+        // Pass C: double-sided `FORCE_NON_OPAQUE` `Proceed()` over `mask_ds`, clamped to
+        // `b_hit ? min(t_max, max(min_front_a, b_t)) : t_max`.
+        let t_max_c = if needs_min_front {
+            let mf_gt_bt = s.m.cmp(c_prep_blk, pred::OGT, min_front_a, b_t);
+            let mf_lt_tmax = s.m.cmp(c_prep_blk, pred::OLT, min_front_a, t_max);
+            let mf_clamped = s.m.select(c_prep_blk, mf_lt_tmax, min_front_a, t_max);
+            let tight = s.m.select(c_prep_blk, mf_gt_bt, mf_clamped, b_t);
+            s.m.select(c_prep_blk, b_hit, tight, t_max)
+        } else {
+            s.m.select(c_prep_blk, b_hit, b_t, t_max)
+        };
+        let has_ds = s.m.cmp(c_prep_blk, pred::NE, mask_ds, zero);
+        let c_trace_blk = s.m.new_block();
+        let c_proceed_blk = s.m.new_block();
+        let c_tri_blk = s.m.new_block();
+        let c_front_blk = s.m.new_block();
+        let c_back_blk = s.m.new_block();
+        let c_commit_blk = s.m.new_block();
+        let c_latch_blk = s.m.new_block();
+        let c_done_blk = s.m.new_block();
+        let after_blk = s.m.new_block();
+        s.m.terminate(c_prep_blk, Term::CondBr(has_ds, c_trace_blk, after_blk));
+
+        let dyn_flags_c = s.m.i32(orig_f & !inputs.group_const_flags);
         s.ray_query_trace_inline(
-            p2_start_blk,
+            c_trace_blk,
+            rq,
+            inputs.tlas,
+            dyn_flags_c,
+            mask_ds,
+            origin,
+            t_min,
+            dir,
+            t_max_c,
+        );
+        s.m.terminate(c_trace_blk, Term::Br(c_proceed_blk));
+
+        let min_phi = s.m.phi(c_proceed_blk, f32t);
+        let back_t_phi = s.m.phi(c_proceed_blk, f32t);
+        let c_more = s.ray_query_proceed(c_proceed_blk, rq);
+        let c_cand_blk = if skip_proc {
+            s.m.terminate(c_proceed_blk, Term::CondBr(c_more, c_tri_blk, c_done_blk));
+            None
+        } else {
+            let cb = s.m.new_block();
+            s.m.terminate(c_proceed_blk, Term::CondBr(c_more, cb, c_done_blk));
+            let ctype = s.ray_query_state_i32(cb, rq_op::CANDIDATE_TYPE, rq);
+            let is_tri = s.m.cmp(cb, pred::EQ, ctype, zero);
+            s.m.terminate(cb, Term::CondBr(is_tri, c_tri_blk, c_latch_blk));
+            Some(cb)
+        };
+
+        let is_ff = s.ray_query_state_i1(c_tri_blk, rq_op::CANDIDATE_TRIANGLE_FRONT_FACE, rq);
+        s.m.terminate(c_tri_blk, Term::CondBr(is_ff, c_front_blk, c_back_blk));
+
+        let new_min = if needs_min_front {
+            let cand_t = s.ray_query_state_f32(c_front_blk, rq_op::CANDIDATE_TRIANGLE_RAY_T, rq);
+            let lt = s.m.cmp(c_front_blk, pred::OLT, cand_t, min_phi);
+            s.m.select(c_front_blk, lt, cand_t, min_phi)
+        } else {
+            min_phi
+        };
+        s.m.terminate(c_front_blk, Term::Br(c_latch_blk));
+
+        // Only commit a double-sided back-face when Pass B missed OR it is strictly closer than `b_t`.
+        let cand_t_b = s.ray_query_state_f32(c_back_blk, rq_op::CANDIDATE_TRIANGLE_RAY_T, rq);
+        let lt_b = s.m.cmp(c_back_blk, pred::OLT, cand_t_b, b_t);
+        let true_v = s.m.bool(true);
+        let not_b_hit = s.m.bin(c_back_blk, Bin::Xor, b_hit, true_v);
+        let allow_commit = s.m.bin(c_back_blk, Bin::Or, not_b_hit, lt_b);
+        s.m.terminate(c_back_blk, Term::CondBr(allow_commit, c_commit_blk, c_latch_blk));
+
+        s.ray_query_commit_non_opaque_triangle_hit(c_commit_blk, rq);
+        s.m.terminate(c_commit_blk, Term::Br(c_latch_blk));
+
+        let min_latch = s.m.phi(c_latch_blk, f32t);
+        let back_t_latch = s.m.phi(c_latch_blk, f32t);
+        let mut latch_in = vec![
+            (new_min, c_front_blk),
+            (min_phi, c_back_blk),
+            (min_phi, c_commit_blk),
+        ];
+        let mut back_t_latch_in = vec![
+            (back_t_phi, c_front_blk),
+            (back_t_phi, c_back_blk),
+            (cand_t_b, c_commit_blk),
+        ];
+        if let Some(cb) = c_cand_blk {
+            latch_in.push((min_phi, cb));
+            back_t_latch_in.push((back_t_phi, cb));
+        }
+        s.m.set_phi(min_latch, latch_in);
+        s.m.set_phi(back_t_latch, back_t_latch_in);
+        s.m.terminate(c_latch_blk, Term::Br(c_proceed_blk));
+        s.m.set_phi(min_phi, vec![(min_front_a, c_trace_blk), (min_latch, c_latch_blk)]);
+        s.m.set_phi(back_t_phi, vec![(t_max_c, c_trace_blk), (back_t_latch, c_latch_blk)]);
+
+        let c_status = s.ray_query_state_i32(c_done_blk, rq_op::COMMITTED_STATUS, rq);
+        let c_hit_raw = s.m.cmp(c_done_blk, pred::EQ, c_status, one);
+        s.m.terminate(c_done_blk, Term::Br(after_blk));
+
+        let false_v = s.m.bool(false);
+        let c_hit = s.m.phi(after_blk, s.t.i1);
+        s.m.set_phi(c_hit, vec![(c_hit_raw, c_done_blk), (false_v, c_prep_blk)]);
+        // Track Pass C's committed back-face `t` directly from `cand_t_b` instead of querying
+        // `COMMITTED_RAY_T(rq)` after reusing `rq` across Pass A/B: AMD RDNA 4 (`amdxc64.dll`)
+        // otherwise adds `tMin` twice when `COMMITTED_RAY_T` is read after `CommitNonOpaqueTriangleHit`
+        // on a reused `RayQuery` handle.
+        let c_back_t = s.m.phi(after_blk, f32t);
+        s.m.set_phi(c_back_t, vec![(back_t_phi, c_done_blk), (b_t, c_prep_blk)]);
+        let final_min_f = if needs_min_front {
+            let mf = s.m.phi(after_blk, f32t);
+            s.m.set_phi(mf, vec![(min_phi, c_done_blk), (min_front_a, c_prep_blk)]);
+            Some(mf)
+        } else {
+            None
+        };
+
+        return emit_two_pass_merge(
+            s,
+            after_blk,
+            rq,
+            rl,
+            inputs,
+            two_pass_q1,
+            c_hit,
+            Some(c_back_t),
+            final_min_f,
+            &[],
+            Vec::new(),
+            None,
+            i32t,
+        );
+    }
+
+    // Speculative opaque Pass 1 (`FORCE_OPAQUE`) -> one-shot `AnyHit` check -> exact
+    // `FORCE_NON_OPAQUE` fallback (single `RayQuery` handle, zero `AnyHit` CFG duplication).
+    // Uses a single reducible loop header (`phase_hdr`) so both constant `FORCE_NON_OPAQUE`
+    // and dynamic `ray_flags` (with a runtime bypass into `phase_hdr`) produce a depth-1
+    // reducible CFG and share `state_phis` across Pass 1 and Pass 2.
+    if fno_spec && let RayLoopKind::AnyHit(ah) = &rl.kind {
+        let p1_proceed_blk = s.m.new_block();
+        let p1_check_blk = s.m.new_block();
+        let phase_hdr = s.m.new_block();
+        let p1_to_ah_blk = s.m.new_block();
+        let p2_dispatch_blk = s.m.new_block();
+        let p2_trace_blk = s.m.new_block();
+        let proceed_blk = s.m.new_block();
+        let p2_to_ah_blk = s.m.new_block();
+        let anyhit_bridge_blk = s.m.new_block();
+        let spec_decide_blk = s.m.new_block();
+        let non_spec_decide_blk = s.m.new_block();
+        let do_commit_blk = s.m.new_block();
+        let latch_blk = s.m.new_block();
+        let after_blk = s.m.new_block();
+
+        let (dyn_flags_p2, dyn_bypass_blk) = match rl.ray_flags {
+            RayInput::Const(orig_f) => {
+                let dyn_flags_p1 = s.m.i32(
+                    ((orig_f & !ray_flag::FORCE_NON_OPAQUE) | ray_flag::FORCE_OPAQUE)
+                        & !inputs.group_const_flags,
+                );
+                s.ray_query_trace_inline(
+                    start_blk,
+                    rq,
+                    inputs.tlas,
+                    dyn_flags_p1,
+                    mask,
+                    origin,
+                    t_min,
+                    dir,
+                    t_max,
+                );
+                s.m.terminate(start_blk, Term::Br(p1_proceed_blk));
+                (s.m.i32(orig_f & !inputs.group_const_flags), None)
+            }
+            RayInput::Val(_) | RayInput::ShiftedMask(_) => {
+                let dyn_f = inputs.ray_flags.unwrap_or_else(|| s.m.i32(0));
+                let bad_bits_const = ray_flag::FORCE_OPAQUE
+                    | ray_flag::CULL_OPAQUE
+                    | ray_flag::CULL_NON_OPAQUE
+                    | ray_flag::SKIP_TRIANGLES
+                    | if !ah.state_vars.is_empty() {
+                        ray_flag::ACCEPT_FIRST_HIT_AND_END_SEARCH
+                    } else {
+                        0
+                    };
+                let zero = s.m.i32(0);
+                let bad_m = s.m.i32(bad_bits_const);
+                let fno_m = s.m.i32(ray_flag::FORCE_NON_OPAQUE);
+                let bad = s.m.bin(start_blk, Bin::And, dyn_f, bad_m);
+                let no_bad = s.m.cmp(start_blk, pred::EQ, bad, zero);
+                let fno = s.m.bin(start_blk, Bin::And, dyn_f, fno_m);
+                let has_fno = s.m.cmp(start_blk, pred::NE, fno, zero);
+                let can_spec = s.m.bin(start_blk, Bin::And, no_bad, has_fno);
+                let p1_trace_blk = s.m.new_block();
+                s.m.terminate(start_blk, Term::CondBr(can_spec, p1_trace_blk, phase_hdr));
+
+                let clear_m = s.m.i32(!ray_flag::FORCE_NON_OPAQUE & !inputs.group_const_flags);
+                let fo_m = s.m.i32(ray_flag::FORCE_OPAQUE & !inputs.group_const_flags);
+                let p1_cleared = s.m.bin(p1_trace_blk, Bin::And, dyn_f, clear_m);
+                let dyn_flags_p1 = s.m.bin(p1_trace_blk, Bin::Or, p1_cleared, fo_m);
+                s.ray_query_trace_inline(
+                    p1_trace_blk,
+                    rq,
+                    inputs.tlas,
+                    dyn_flags_p1,
+                    mask,
+                    origin,
+                    t_min,
+                    dir,
+                    t_max,
+                );
+                s.m.terminate(p1_trace_blk, Term::Br(p1_proceed_blk));
+
+                let p2_flags = if inputs.group_const_flags != 0 {
+                    let keep_m = s.m.i32(!inputs.group_const_flags);
+                    s.m.bin(p2_trace_blk, Bin::And, dyn_f, keep_m)
+                } else {
+                    dyn_f
+                };
+                (p2_flags, Some(start_blk))
+            }
+        };
+
+        let p1_more = s.ray_query_proceed(p1_proceed_blk, rq);
+        s.m.terminate(p1_proceed_blk, Term::CondBr(p1_more, p1_proceed_blk, p1_check_blk));
+
+        let p1_status = s.ray_query_state_i32(p1_check_blk, rq_op::COMMITTED_STATUS, rq);
+        let one = s.m.i32(1);
+        let p1_hit = s.m.cmp(p1_check_blk, pred::EQ, p1_status, one);
+        s.m.terminate(p1_check_blk, Term::CondBr(p1_hit, phase_hdr, after_blk));
+
+        // Single reducible loop header (`phase_hdr`):
+        // - `is_spec = true`:  one-shot Pass 1 `AnyHit` check (`p1_to_ah_blk`).
+        // - `is_spec = false, need_trace = true`:  start Pass 2 `TraceRayInline` (`p2_trace_blk`).
+        // - `is_spec = false, need_trace = false`: next Pass 2 `Proceed()` (`proceed_blk`).
+        let i1t = s.t.i1;
+        let true_v = s.m.bool(true);
+        let false_v = s.m.bool(false);
+        let spec_phi = s.m.phi(phase_hdr, i1t);
+        let need_trace_phi = s.m.phi(phase_hdr, i1t);
+        let mut spec_inc = vec![
+            (true_v, p1_check_blk),
+            (false_v, spec_decide_blk),
+            (false_v, latch_blk),
+        ];
+        let mut trace_inc = vec![
+            (false_v, p1_check_blk),
+            (true_v, spec_decide_blk),
+            (false_v, latch_blk),
+        ];
+        if let Some(bypass) = dyn_bypass_blk {
+            spec_inc.push((false_v, bypass));
+            trace_inc.push((true_v, bypass));
+        }
+        s.m.set_phi(spec_phi, spec_inc);
+        s.m.set_phi(need_trace_phi, trace_inc);
+
+        let needs_committed_ray_t = rl
+            .outputs
+            .iter()
+            .any(|b| matches!(b.output, RayOutput::CommittedRayT));
+        let p2_t_phi = needs_committed_ray_t.then(|| s.m.phi(phase_hdr, i32t));
+        let from_p1_phi =
+            (needs_committed_ray_t && dyn_bypass_blk.is_some()).then(|| s.m.phi(phase_hdr, i1t));
+        if let Some(fp1) = from_p1_phi {
+            s.m.set_phi(
+                fp1,
+                vec![
+                    (true_v, p1_check_blk),
+                    (true_v, spec_decide_blk),
+                    (fp1, latch_blk),
+                    (false_v, dyn_bypass_blk.unwrap()),
+                ],
+            );
+        }
+
+        let mut state_phis = Vec::with_capacity(ah.state_vars.len());
+        for _ in &ah.state_vars {
+            state_phis.push(s.m.phi(phase_hdr, i32t));
+        }
+        s.m.terminate(phase_hdr, Term::CondBr(spec_phi, p1_to_ah_blk, p2_dispatch_blk));
+        s.m.terminate(
+            p2_dispatch_blk,
+            Term::CondBr(need_trace_phi, p2_trace_blk, proceed_blk),
+        );
+
+        // Pass 2 fallback: reached when Pass 1's opaque hit is rejected by `AnyHit`, or
+        // when dynamic `ray_flags` do not qualify for speculative Pass 1.
+        s.ray_query_trace_inline(
+            p2_trace_blk,
             rq,
             inputs.tlas,
             dyn_flags_p2,
@@ -7226,9 +8486,429 @@ fn emit_trace_body(
             origin,
             t_min,
             dir,
-            t_clamp,
+            t_max,
         );
-        (p2_start_blk, Some((q1, q1_hit, p1_t)), None)
+        s.m.terminate(p2_trace_blk, Term::Br(proceed_blk));
+
+        let p2_done_blk = s.m.new_block();
+        let more = s.ray_query_proceed(proceed_blk, rq);
+        let cand_check_blk = if skip_proc {
+            s.m.terminate(proceed_blk, Term::CondBr(more, p2_to_ah_blk, p2_done_blk));
+            None
+        } else {
+            let cb = s.m.new_block();
+            s.m.terminate(proceed_blk, Term::CondBr(more, cb, p2_done_blk));
+            let ctype = s.ray_query_state_i32(cb, rq_op::CANDIDATE_TYPE, rq);
+            let zero = s.m.i32(0);
+            let is_tri = s.m.cmp(cb, pred::EQ, ctype, zero);
+            s.m.terminate(cb, Term::CondBr(is_tri, p2_to_ah_blk, latch_blk));
+            Some(cb)
+        };
+
+        // Materialize each unique candidate triangle input from Committed* (Pass 1) vs
+        // Candidate* (Pass 2) in the two incoming adapter blocks and merge via PHI in
+        // `anyhit_bridge_blk`, avoiding UB from querying Candidate* without an active candidate.
+        let mut bridged_cache: HashMap<CandidateInput, V> = HashMap::new();
+        let mut cand_outs: Vec<(Value, V)> = Vec::with_capacity(ah.inputs.len());
+        for &(val_id, ci) in &ah.inputs {
+            let v = match ci {
+                CandidateInput::RayT | CandidateInput::Bary(_) | CandidateInput::FrontFace => {
+                    *bridged_cache.entry(ci).or_insert_with(|| {
+                        let comm_out = match ci {
+                            CandidateInput::RayT => RayOutput::CommittedRayT,
+                            CandidateInput::Bary(c) => RayOutput::CommittedBary(c),
+                            CandidateInput::FrontFace => RayOutput::CommittedFrontFace,
+                            _ => unreachable!(),
+                        };
+                        let v_comm = emit_committed_hit_output(s, p1_to_ah_blk, rq, comm_out, i32t);
+                        let v_cand = emit_cand_input(s, p2_to_ah_blk, rq, ci);
+                        let phi = s.m.phi(anyhit_bridge_blk, i32t);
+                        s.m.set_phi(phi, vec![(v_comm, p1_to_ah_blk), (v_cand, p2_to_ah_blk)]);
+                        phi
+                    })
+                }
+                CandidateInput::One => s.m.i32(1),
+                CandidateInput::Zero => s.m.i32(0),
+                CandidateInput::CopyOf(pre) => inputs
+                    .fallbacks
+                    .get(&pre)
+                    .copied()
+                    .unwrap_or_else(|| s.m.i32(0)),
+                CandidateInput::StateVar(k) => state_phis[k],
+            };
+            cand_outs.push((val_id, v));
+        }
+
+        // Track committed `t` without ever calling `COMMITTED_RAY_T(rq)` after Pass 2's
+        // `CommitNonOpaqueTriangleHit` on a reused handle (AMD RDNA 4 `amdxc64.dll` otherwise
+        // adds `tMin` twice):
+        // - Pass 1 accept: reuse `bridged_cache[RayT]` (or a single `p1_to_ah_blk` read).
+        // - Pass 2 after Pass 1 (`FORCE_NON_OPAQUE`): every commit passes through `do_commit_blk`,
+        //   so `p2_t_phi` tracks the exact committed `CANDIDATE_TRIANGLE_RAY_T`.
+        // - Pass 2 dynamic bypass (`!from_p1_phi`): Pass 1 never ran, so `COMMITTED_RAY_T` is safe
+        //   and covers opaque auto-commits too.
+        let bridged_ray_t = bridged_cache.get(&CandidateInput::RayT).copied();
+        let p1_spec_ray_t = if needs_committed_ray_t {
+            if let Some(bt) = bridged_ray_t {
+                Some(bt)
+            } else {
+                let v_comm = emit_committed_hit_output(
+                    s,
+                    p1_to_ah_blk,
+                    rq,
+                    RayOutput::CommittedRayT,
+                    i32t,
+                );
+                let phi = s.m.phi(anyhit_bridge_blk, i32t);
+                s.m.set_phi(phi, vec![(v_comm, p1_to_ah_blk), (inputs.t_max, p2_to_ah_blk)]);
+                Some(phi)
+            }
+        } else {
+            None
+        };
+
+        s.m.terminate(p1_to_ah_blk, Term::Br(anyhit_bridge_blk));
+        s.m.terminate(p2_to_ah_blk, Term::Br(anyhit_bridge_blk));
+        let anyhit_entry_dxil = inputs.anyhit_entry_dxil.expect("anyhit entry dxil block");
+        s.m.terminate(anyhit_bridge_blk, Term::Br(anyhit_entry_dxil));
+
+        let commit_ray_t = if needs_committed_ray_t {
+            Some(bridged_ray_t.unwrap_or_else(|| {
+                emit_cand_input(s, do_commit_blk, rq, CandidateInput::RayT)
+            }))
+        } else {
+            None
+        };
+        s.ray_query_commit_non_opaque_triangle_hit(do_commit_blk, rq);
+        if ah.accept_first_hit {
+            s.ray_query_abort(do_commit_blk, rq);
+        }
+        s.m.terminate(do_commit_blk, Term::Br(latch_blk));
+
+        let mut latch_phis = Vec::new();
+        if cand_check_blk.is_some() {
+            latch_phis.reserve(ah.state_vars.len());
+            for _ in &ah.state_vars {
+                latch_phis.push(s.m.phi(latch_blk, i32t));
+            }
+        }
+        if let (Some(pt_phi), Some(ct)) = (p2_t_phi, commit_ray_t) {
+            let pt_latch = s.m.phi(latch_blk, i32t);
+            let mut pt_latch_inc = vec![
+                (pt_phi, non_spec_decide_blk),
+                (ct, do_commit_blk),
+            ];
+            if let Some(cb) = cand_check_blk {
+                pt_latch_inc.push((pt_phi, cb));
+            }
+            s.m.set_phi(pt_latch, pt_latch_inc);
+            let mut pt_hdr_inc = vec![
+                (inputs.t_max, p1_check_blk),
+                (inputs.t_max, spec_decide_blk),
+                (pt_latch, latch_blk),
+            ];
+            if let Some(bypass) = dyn_bypass_blk {
+                pt_hdr_inc.push((inputs.t_max, bypass));
+            }
+            s.m.set_phi(pt_phi, pt_hdr_inc);
+        }
+        s.m.terminate(latch_blk, Term::Br(phase_hdr));
+
+        let mut final_state_phis = Vec::with_capacity(ah.state_vars.len());
+        for _ in &ah.state_vars {
+            final_state_phis.push(s.m.phi(after_blk, i32t));
+        }
+
+        let (p2_exit_blk, p2_ray_t) = if let Some(pt_phi) = p2_t_phi {
+            if let Some(fp1) = from_p1_phi {
+                let p2_dyn_read_blk = s.m.new_block();
+                let p2_done_join = s.m.new_block();
+                s.m.terminate(
+                    p2_done_blk,
+                    Term::CondBr(fp1, p2_done_join, p2_dyn_read_blk),
+                );
+                let dyn_t = emit_committed_hit_output(
+                    s,
+                    p2_dyn_read_blk,
+                    rq,
+                    RayOutput::CommittedRayT,
+                    i32t,
+                );
+                s.m.terminate(p2_dyn_read_blk, Term::Br(p2_done_join));
+                let joined_t = s.m.phi(p2_done_join, i32t);
+                s.m.set_phi(
+                    joined_t,
+                    vec![(pt_phi, p2_done_blk), (dyn_t, p2_dyn_read_blk)],
+                );
+                s.m.terminate(p2_done_join, Term::Br(after_blk));
+                (p2_done_join, Some(joined_t))
+            } else {
+                s.m.terminate(p2_done_blk, Term::Br(after_blk));
+                (p2_done_blk, Some(pt_phi))
+            }
+        } else {
+            s.m.terminate(p2_done_blk, Term::Br(after_blk));
+            (p2_done_blk, None)
+        };
+
+        let pending_anyhit = Some(PendingAnyHit {
+            start_blk: p1_check_blk,
+            cand_check_blk,
+            anyhit_bridge_blk,
+            do_commit_blk,
+            latch_blk,
+            state_phis,
+            latch_phis,
+            init_vals: inputs.anyhit_inits.clone(),
+            spec: Some(SpeculativeAnyHit {
+                spec_phi,
+                spec_decide_blk,
+                non_spec_decide_blk,
+                p1_check_blk,
+                dyn_bypass_blk,
+                proceed_blk: p2_exit_blk,
+                after_blk,
+                p2_trace_blk: phase_hdr,
+                final_state_phis: final_state_phis.clone(),
+            }),
+        });
+
+        let needs_status = rl.outputs.iter().any(|b| {
+            matches!(
+                b.output,
+                RayOutput::CommittedStatusTriNode
+                    | RayOutput::CommittedRayT
+                    | RayOutput::CommittedBary(_)
+                    | RayOutput::CommittedFrontFace
+            )
+        });
+        let (hit_tri, hit_any) = if needs_status {
+            let status = s.ray_query_state_i32(after_blk, rq_op::COMMITTED_STATUS, rq);
+            let zero = s.m.i32(0);
+            (
+                Some(s.m.cmp(after_blk, pred::EQ, status, one)),
+                Some(s.m.cmp(after_blk, pred::NE, status, zero)),
+            )
+        } else {
+            (None, None)
+        };
+        let mut raw_cache: HashMap<RayOutput, V> = HashMap::new();
+        let mut outs = Vec::with_capacity(rl.outputs.len());
+        for binding in &rl.outputs {
+            let v = match binding.output {
+                RayOutput::CommittedStatusTriNode => {
+                    let zero = s.m.i32(0);
+                    s.m.select(after_blk, hit_tri.expect("status"), one, zero)
+                }
+                RayOutput::CommittedRayT => {
+                    let t_i = *raw_cache.entry(RayOutput::CommittedRayT).or_insert_with(|| {
+                        let p1t = p1_spec_ray_t.expect("p1_spec_ray_t");
+                        let p2t = p2_ray_t.expect("p2_ray_t");
+                        let phi = s.m.phi(after_blk, i32t);
+                        s.m.set_phi(
+                            phi,
+                            vec![
+                                (inputs.t_max, p1_check_blk),
+                                (p1t, spec_decide_blk),
+                                (p2t, p2_exit_blk),
+                            ],
+                        );
+                        phi
+                    });
+                    let miss_t = binding
+                        .fallback
+                        .and_then(|fb| inputs.fallbacks.get(&fb).copied())
+                        .unwrap_or(inputs.t_max);
+                    s.m.select(after_blk, hit_any.expect("status"), t_i, miss_t)
+                }
+                RayOutput::CommittedBary(comp) => {
+                    let b_i = *raw_cache
+                        .entry(RayOutput::CommittedBary(comp))
+                        .or_insert_with(|| {
+                            emit_committed_hit_output(
+                                s,
+                                after_blk,
+                                rq,
+                                RayOutput::CommittedBary(comp),
+                                i32t,
+                            )
+                        });
+                    let miss_b = binding
+                        .fallback
+                        .and_then(|fb| inputs.fallbacks.get(&fb).copied())
+                        .unwrap_or_else(|| s.m.i32(0));
+                    s.m.select(after_blk, hit_any.expect("status"), b_i, miss_b)
+                }
+                RayOutput::CommittedFrontFace => {
+                    let ff_v = *raw_cache
+                        .entry(RayOutput::CommittedFrontFace)
+                        .or_insert_with(|| {
+                            emit_committed_hit_output(
+                                s,
+                                after_blk,
+                                rq,
+                                RayOutput::CommittedFrontFace,
+                                i32t,
+                            )
+                        });
+                    let miss_ff = binding
+                        .fallback
+                        .and_then(|fb| inputs.fallbacks.get(&fb).copied())
+                        .unwrap_or_else(|| s.m.i32(0));
+                    s.m.select(after_blk, hit_any.expect("status"), ff_v, miss_ff)
+                }
+                committed @ (RayOutput::CommittedInstanceIndex
+                | RayOutput::CommittedInstanceId
+                | RayOutput::CommittedInstanceContribution
+                | RayOutput::CommittedGeometryIndex
+                | RayOutput::CommittedPrimitiveIndex
+                | RayOutput::CommittedObjectToWorld(_, _)
+                | RayOutput::CommittedWorldToObject(_, _)) => *raw_cache
+                    .entry(committed)
+                    .or_insert_with(|| emit_committed_hit_output(s, after_blk, rq, committed, i32t)),
+                RayOutput::AnyHitState(k) => final_state_phis[k],
+                RayOutput::Zero => s.m.i32(0),
+                RayOutput::CopyOf(pre) => inputs
+                    .fallbacks
+                    .get(&pre)
+                    .copied()
+                    .unwrap_or_else(|| s.m.i32(0)),
+                RayOutput::FrontBackMinFrontT => {
+                    unreachable!("speculative FNO has no FrontBackMinFrontT")
+                }
+            };
+            outs.push((binding.value, v));
+        }
+        return (after_blk, outs, cand_outs, pending_anyhit, None);
+    }
+
+    // Two-pass tMax pre-shrink (AnyHit) or zero-exit two-pass pure-opaque FrontBackTrack.
+    let (trace_start_blk, two_pass_q1, fbt_two_pass_min_f) = if let RayLoopKind::AnyHit(_) = &rl.kind
+        && (inputs.two_pass_early_fields.is_some() || inputs.rq_opaque.is_some())
+    {
+        let orig_f = match rl.ray_flags {
+            RayInput::Const(f) => f,
+            _ => unreachable!("two-pass requires constant ray flags"),
+        };
+        if let Some(fields) = &inputs.two_pass_early_fields {
+            let p1_rq = inputs.rq_opaque.unwrap_or(rq);
+            let p1_const_flags = if inputs.rq_opaque.is_some() {
+                inputs.group_opaque_const_flags
+            } else {
+                inputs.group_const_flags
+            };
+            let dyn_flags_p1 = s.m.i32((orig_f | ray_flag::CULL_NON_OPAQUE) & !p1_const_flags);
+            s.ray_query_trace_inline(
+                start_blk,
+                p1_rq,
+                inputs.tlas,
+                dyn_flags_p1,
+                mask,
+                origin,
+                t_min,
+                dir,
+                t_max,
+            );
+            let p1_proceed_blk = s.m.new_block();
+            let p1_done_blk = s.m.new_block();
+            let p1_extract_blk = s.m.new_block();
+            let p2_start_blk = s.m.new_block();
+            s.m.terminate(start_blk, Term::Br(p1_proceed_blk));
+
+            let p1_more = s.ray_query_proceed(p1_proceed_blk, p1_rq);
+            s.m.terminate(p1_proceed_blk, Term::CondBr(p1_more, p1_proceed_blk, p1_done_blk));
+
+            let p1_status = s.ray_query_state_i32(p1_done_blk, rq_op::COMMITTED_STATUS, p1_rq);
+            let one = s.m.i32(1);
+            let q1_hit = s.m.cmp(p1_done_blk, pred::EQ, p1_status, one);
+            s.m.terminate(p1_done_blk, Term::CondBr(q1_hit, p1_extract_blk, p2_start_blk));
+
+            // Read `CommittedRayT(p1_rq)` and all unique Pass 1 fields once before Pass 2 starts,
+            // releasing Pass 1's `RayQuery` state (and reusing `rq` directly when `rq_opaque` is None).
+            let p1_t_hit = s.ray_query_state_f32(p1_extract_blk, rq_op::COMMITTED_RAY_T, p1_rq);
+            let mut extracted_hit: Vec<(EarlyQ1Field, V)> = Vec::with_capacity(fields.len());
+            for &field in fields {
+                let v = emit_early_q1_field(s, p1_extract_blk, p1_rq, field, i32t);
+                extracted_hit.push((field, v));
+            }
+            s.m.terminate(p1_extract_blk, Term::Br(p2_start_blk));
+
+            let t_clamp = s.m.phi(p2_start_blk, f32t);
+            s.m.set_phi(t_clamp, vec![(p1_t_hit, p1_extract_blk), (t_max, p1_done_blk)]);
+            let zero = s.m.i32(0);
+            let mut q1_fields: HashMap<EarlyQ1Field, V> = HashMap::with_capacity(fields.len());
+            for (field, v_hit) in extracted_hit {
+                let phi = s.m.phi(p2_start_blk, i32t);
+                s.m.set_phi(phi, vec![(v_hit, p1_extract_blk), (zero, p1_done_blk)]);
+                q1_fields.insert(field, phi);
+            }
+
+            let dyn_flags_p2 =
+                s.m.i32((orig_f | ray_flag::CULL_OPAQUE) & !inputs.group_const_flags);
+            s.ray_query_trace_inline(
+                p2_start_blk,
+                rq,
+                inputs.tlas,
+                dyn_flags_p2,
+                mask,
+                origin,
+                t_min,
+                dir,
+                t_clamp,
+            );
+            (
+                p2_start_blk,
+                Some(TwoPassQ1::Early {
+                    q1_hit,
+                    t_clamp,
+                    q1_fields,
+                }),
+                None,
+            )
+        } else {
+            let q1 = inputs.rq_opaque.expect("two-pass q1");
+            let dyn_flags_p1 = s.m.i32(
+                (orig_f | ray_flag::CULL_NON_OPAQUE) & !inputs.group_opaque_const_flags,
+            );
+            s.ray_query_trace_inline(
+                start_blk,
+                q1,
+                inputs.tlas,
+                dyn_flags_p1,
+                mask,
+                origin,
+                t_min,
+                dir,
+                t_max,
+            );
+            let p1_proceed_blk = s.m.new_block();
+            let p2_start_blk = s.m.new_block();
+            s.m.terminate(start_blk, Term::Br(p1_proceed_blk));
+
+            let p1_more = s.ray_query_proceed(p1_proceed_blk, q1);
+            s.m.terminate(p1_proceed_blk, Term::CondBr(p1_more, p1_proceed_blk, p2_start_blk));
+
+            let p1_status = s.ray_query_state_i32(p2_start_blk, rq_op::COMMITTED_STATUS, q1);
+            let one = s.m.i32(1);
+            let q1_hit = s.m.cmp(p2_start_blk, pred::EQ, p1_status, one);
+            let p1_t = s.ray_query_state_f32(p2_start_blk, rq_op::COMMITTED_RAY_T, q1);
+            let t_clamp = s.m.select(p2_start_blk, q1_hit, p1_t, t_max);
+
+            let dyn_flags_p2 =
+                s.m.i32((orig_f | ray_flag::CULL_OPAQUE) & !inputs.group_const_flags);
+            s.ray_query_trace_inline(
+                p2_start_blk,
+                rq,
+                inputs.tlas,
+                dyn_flags_p2,
+                mask,
+                origin,
+                t_min,
+                dir,
+                t_clamp,
+            );
+            (p2_start_blk, Some(TwoPassQ1::Live { q1, q1_hit, p1_t }), None)
+        }
     } else if fbt_two_pass {
         let orig_f = match rl.ray_flags {
             RayInput::Const(f) => f,
@@ -7450,97 +9130,30 @@ fn emit_trace_body(
                 state_phis: state_phis.clone(),
                 latch_phis,
                 init_vals: inputs.anyhit_inits.clone(),
+                spec: None,
             });
         }
     }
 
-    if let Some((q1, q1_hit, p1_t)) = two_pass_q1 {
+    if let Some(tp) = two_pass_q1 {
         let q2_status = s.ray_query_state_i32(after_blk, rq_op::COMMITTED_STATUS, rq);
         let one = s.m.i32(1);
         let q2_hit = s.m.cmp(after_blk, pred::EQ, q2_status, one);
-        let needs_hit_fields = rl.outputs.iter().any(|b| {
-            !matches!(
-                b.output,
-                RayOutput::CommittedStatusTriNode | RayOutput::Zero | RayOutput::CopyOf(_)
-            )
-        });
-        if !needs_hit_fields {
-            let any_hit = s.m.bin(after_blk, Bin::Or, q2_hit, q1_hit);
-            let zero = s.m.i32(0);
-            let mut outs = Vec::with_capacity(rl.outputs.len());
-            for binding in &rl.outputs {
-                let v = match binding.output {
-                    RayOutput::CommittedStatusTriNode => s.m.select(after_blk, any_hit, one, zero),
-                    RayOutput::Zero => zero,
-                    RayOutput::CopyOf(pre) => inputs
-                        .fallbacks
-                        .get(&pre)
-                        .copied()
-                        .unwrap_or(zero),
-                    _ => unreachable!(),
-                };
-                outs.push((binding.value, v));
-            }
-            return (after_blk, outs, cand_outs, pending_anyhit);
-        }
-
-        let from_q2_blk = s.m.new_block();
-        let check_q1_blk = s.m.new_block();
-        let from_q1_blk = s.m.new_block();
-        let miss_blk = s.m.new_block();
-        let done_blk = s.m.new_block();
-
-        s.m.terminate(after_blk, Term::CondBr(q2_hit, from_q2_blk, check_q1_blk));
-        s.m.terminate(check_q1_blk, Term::CondBr(q1_hit, from_q1_blk, miss_blk));
-
-        let mut outs = Vec::with_capacity(rl.outputs.len());
-        for binding in &rl.outputs {
-            let v = match binding.output {
-                RayOutput::Zero => s.m.i32(0),
-                RayOutput::CopyOf(pre) => inputs
-                    .fallbacks
-                    .get(&pre)
-                    .copied()
-                    .unwrap_or_else(|| s.m.i32(0)),
-                RayOutput::AnyHitState(k) => state_phis[k],
-                RayOutput::FrontBackMinFrontT => {
-                    let mf = front_back_min_f.expect("front_back min phi");
-                    s.m.cast(done_blk, Cast::Bitcast, mf, i32t)
-                }
-                committed => {
-                    let v2 = emit_committed_hit_output(s, from_q2_blk, rq, committed, i32t);
-                    // Reuse `p1_t` instead of querying `COMMITTED_RAY_T(q1)` a second time:
-                    // AMD RDNA 4 (`amdxc64.dll`) adds `tMin` twice on a repeated read across `q2`.
-                    let v1 = if matches!(committed, RayOutput::CommittedRayT) {
-                        s.m.cast(from_q1_blk, Cast::Bitcast, p1_t, i32t)
-                    } else {
-                        emit_committed_hit_output(s, from_q1_blk, q1, committed, i32t)
-                    };
-                    let v_miss = match committed {
-                        RayOutput::CommittedRayT => binding
-                            .fallback
-                            .and_then(|fb| inputs.fallbacks.get(&fb).copied())
-                            .unwrap_or(inputs.t_max),
-                        RayOutput::CommittedBary(_) | RayOutput::CommittedFrontFace => binding
-                            .fallback
-                            .and_then(|fb| inputs.fallbacks.get(&fb).copied())
-                            .unwrap_or_else(|| s.m.i32(0)),
-                        _ => s.m.i32(0),
-                    };
-                    let phi = s.m.phi(done_blk, i32t);
-                    s.m.set_phi(
-                        phi,
-                        vec![(v2, from_q2_blk), (v1, from_q1_blk), (v_miss, miss_blk)],
-                    );
-                    phi
-                }
-            };
-            outs.push((binding.value, v));
-        }
-        s.m.terminate(from_q2_blk, Term::Br(done_blk));
-        s.m.terminate(from_q1_blk, Term::Br(done_blk));
-        s.m.terminate(miss_blk, Term::Br(done_blk));
-        return (done_blk, outs, cand_outs, pending_anyhit);
+        return emit_two_pass_merge(
+            s,
+            after_blk,
+            rq,
+            rl,
+            inputs,
+            tp,
+            q2_hit,
+            None,
+            front_back_min_f,
+            &state_phis,
+            cand_outs,
+            pending_anyhit,
+            i32t,
+        );
     }
 
     // Read `CommittedStatus` once if any output needs hit/miss selection.
@@ -7565,6 +9178,7 @@ fn emit_trace_body(
         (None, None)
     };
 
+    let mut raw_cache: HashMap<RayOutput, V> = HashMap::new();
     let mut outs = Vec::with_capacity(rl.outputs.len());
     for binding in &rl.outputs {
         let v = match binding.output {
@@ -7574,8 +9188,9 @@ fn emit_trace_body(
                 s.m.select(after_blk, hit_tri.expect("status"), one, zero)
             }
             RayOutput::CommittedRayT => {
-                let t_f = s.ray_query_state_f32(after_blk, rq_op::COMMITTED_RAY_T, rq);
-                let t_i = s.m.cast(after_blk, Cast::Bitcast, t_f, i32t);
+                let t_i = *raw_cache.entry(RayOutput::CommittedRayT).or_insert_with(|| {
+                    emit_committed_hit_output(s, after_blk, rq, RayOutput::CommittedRayT, i32t)
+                });
                 let miss_t = binding
                     .fallback
                     .and_then(|fb| inputs.fallbacks.get(&fb).copied())
@@ -7583,13 +9198,17 @@ fn emit_trace_body(
                 s.m.select(after_blk, hit_any.expect("status"), t_i, miss_t)
             }
             RayOutput::CommittedBary(comp) => {
-                let b_f = s.ray_query_state_vec_f32(
-                    after_blk,
-                    rq_op::COMMITTED_TRIANGLE_BARYCENTRICS,
-                    rq,
-                    comp,
-                );
-                let b_i = s.m.cast(after_blk, Cast::Bitcast, b_f, i32t);
+                let b_i = *raw_cache
+                    .entry(RayOutput::CommittedBary(comp))
+                    .or_insert_with(|| {
+                        emit_committed_hit_output(
+                            s,
+                            after_blk,
+                            rq,
+                            RayOutput::CommittedBary(comp),
+                            i32t,
+                        )
+                    });
                 let miss_b = binding
                     .fallback
                     .and_then(|fb| inputs.fallbacks.get(&fb).copied())
@@ -7597,51 +9216,32 @@ fn emit_trace_body(
                 s.m.select(after_blk, hit_any.expect("status"), b_i, miss_b)
             }
             RayOutput::CommittedFrontFace => {
-                let ff = s.ray_query_state_i1(after_blk, rq_op::COMMITTED_TRIANGLE_FRONT_FACE, rq);
-                let front = s.m.i32(0xFE);
-                let back = s.m.i32(0xFF);
-                let ff_v = s.m.select(after_blk, ff, front, back);
+                let ff_v = *raw_cache
+                    .entry(RayOutput::CommittedFrontFace)
+                    .or_insert_with(|| {
+                        emit_committed_hit_output(
+                            s,
+                            after_blk,
+                            rq,
+                            RayOutput::CommittedFrontFace,
+                            i32t,
+                        )
+                    });
                 let miss_ff = binding
                     .fallback
                     .and_then(|fb| inputs.fallbacks.get(&fb).copied())
                     .unwrap_or_else(|| s.m.i32(0));
                 s.m.select(after_blk, hit_any.expect("status"), ff_v, miss_ff)
             }
-            RayOutput::CommittedInstanceIndex => {
-                s.ray_query_state_i32(after_blk, rq_op::COMMITTED_INSTANCE_INDEX, rq)
-            }
-            RayOutput::CommittedInstanceId => {
-                s.ray_query_state_i32(after_blk, rq_op::COMMITTED_INSTANCE_ID, rq)
-            }
-            RayOutput::CommittedInstanceContribution => {
-                s.ray_query_state_i32(after_blk, rq_op::COMMITTED_INSTANCE_CONTRIBUTION, rq)
-            }
-            RayOutput::CommittedGeometryIndex => {
-                s.ray_query_state_i32(after_blk, rq_op::COMMITTED_GEOMETRY_INDEX, rq)
-            }
-            RayOutput::CommittedPrimitiveIndex => {
-                s.ray_query_state_i32(after_blk, rq_op::COMMITTED_PRIMITIVE_INDEX, rq)
-            }
-            RayOutput::CommittedObjectToWorld(row, col) => {
-                let m = s.ray_query_state_mat_f32(
-                    after_blk,
-                    rq_op::COMMITTED_OBJECT_TO_WORLD_3X4,
-                    rq,
-                    row,
-                    col,
-                );
-                s.m.cast(after_blk, Cast::Bitcast, m, i32t)
-            }
-            RayOutput::CommittedWorldToObject(row, col) => {
-                let m = s.ray_query_state_mat_f32(
-                    after_blk,
-                    rq_op::COMMITTED_WORLD_TO_OBJECT_3X4,
-                    rq,
-                    row,
-                    col,
-                );
-                s.m.cast(after_blk, Cast::Bitcast, m, i32t)
-            }
+            committed @ (RayOutput::CommittedInstanceIndex
+            | RayOutput::CommittedInstanceId
+            | RayOutput::CommittedInstanceContribution
+            | RayOutput::CommittedGeometryIndex
+            | RayOutput::CommittedPrimitiveIndex
+            | RayOutput::CommittedObjectToWorld(_, _)
+            | RayOutput::CommittedWorldToObject(_, _)) => *raw_cache
+                .entry(committed)
+                .or_insert_with(|| emit_committed_hit_output(s, after_blk, rq, committed, i32t)),
             RayOutput::FrontBackMinFrontT => {
                 let mf = front_back_min_f.expect("front_back min phi");
                 s.m.cast(after_blk, Cast::Bitcast, mf, i32t)
@@ -7657,7 +9257,262 @@ fn emit_trace_body(
         outs.push((binding.value, v));
     }
 
-    (after_blk, outs, cand_outs, pending_anyhit)
+    (after_blk, outs, cand_outs, pending_anyhit, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_two_pass_merge(
+    s: &mut Shader,
+    after_blk: usize,
+    rq: V,
+    rl: &RayLoop,
+    inputs: &ResolvedRayInputs,
+    tp: TwoPassQ1,
+    q2_hit: V,
+    q2_ray_t_override: Option<V>,
+    front_back_min_f: Option<V>,
+    state_phis: &[V],
+    cand_outs: Vec<(Value, V)>,
+    pending_anyhit: Option<PendingAnyHit>,
+    i32t: super::bitcode::Ty,
+) -> (
+    usize,
+    Vec<(Value, V)>,
+    Vec<(Value, V)>,
+    Option<PendingAnyHit>,
+    Option<TwoPassPost>,
+) {
+    let one = s.m.i32(1);
+    let needs_hit_fields = rl.outputs.iter().any(|b| {
+        !matches!(
+            b.output,
+            RayOutput::CommittedStatusTriNode
+                | RayOutput::Zero
+                | RayOutput::CopyOf(_)
+                | RayOutput::AnyHitState(_)
+                | RayOutput::FrontBackMinFrontT
+        )
+    });
+    let q1_hit = match &tp {
+        TwoPassQ1::Early { q1_hit, .. } | TwoPassQ1::Live { q1_hit, .. } => *q1_hit,
+    };
+    if !needs_hit_fields {
+        let any_hit = s.m.bin(after_blk, Bin::Or, q2_hit, q1_hit);
+        let zero = s.m.i32(0);
+        let mut outs = Vec::with_capacity(rl.outputs.len());
+        for binding in &rl.outputs {
+            let v = match binding.output {
+                RayOutput::CommittedStatusTriNode => s.m.select(after_blk, any_hit, one, zero),
+                RayOutput::AnyHitState(k) => state_phis[k],
+                RayOutput::FrontBackMinFrontT => {
+                    let mf = front_back_min_f.expect("front_back min phi");
+                    s.m.cast(after_blk, Cast::Bitcast, mf, i32t)
+                }
+                RayOutput::Zero => zero,
+                RayOutput::CopyOf(pre) => inputs
+                    .fallbacks
+                    .get(&pre)
+                    .copied()
+                    .unwrap_or(zero),
+                _ => unreachable!(),
+            };
+            outs.push((binding.value, v));
+        }
+        let q1_fields = match tp {
+            TwoPassQ1::Early { q1_fields, .. } => Some(q1_fields),
+            TwoPassQ1::Live { .. } => None,
+        };
+        return (
+            after_blk,
+            outs,
+            cand_outs,
+            pending_anyhit,
+            Some(TwoPassPost {
+                q2_hit,
+                q1_hit,
+                q1_fields,
+            }),
+        );
+    }
+
+    let miss_val_for = |s: &mut Shader, binding: &RayOutputBinding| -> V {
+        match binding.output {
+            RayOutput::CommittedRayT => binding
+                .fallback
+                .and_then(|fb| inputs.fallbacks.get(&fb).copied())
+                .unwrap_or(inputs.t_max),
+            RayOutput::CommittedBary(_) | RayOutput::CommittedFrontFace => binding
+                .fallback
+                .and_then(|fb| inputs.fallbacks.get(&fb).copied())
+                .unwrap_or_else(|| s.m.i32(0)),
+            _ => s.m.i32(0),
+        }
+    };
+
+    let mut q2_cache: HashMap<RayOutput, V> = HashMap::new();
+    let mut phi_cache: HashMap<(RayOutput, Option<Value>), V> = HashMap::new();
+    match tp {
+        TwoPassQ1::Early {
+            q1_hit,
+            t_clamp,
+            q1_fields,
+        } => {
+            let from_q2_blk = s.m.new_block();
+            let not_q2_blk = s.m.new_block();
+            let done_blk = s.m.new_block();
+            s.m.terminate(after_blk, Term::CondBr(q2_hit, from_q2_blk, not_q2_blk));
+
+            let mut t_clamp_i: Option<V> = None;
+            let mut outs = Vec::with_capacity(rl.outputs.len());
+            for binding in &rl.outputs {
+                let v = match binding.output {
+                    RayOutput::Zero => s.m.i32(0),
+                    RayOutput::CopyOf(pre) => inputs
+                        .fallbacks
+                        .get(&pre)
+                        .copied()
+                        .unwrap_or_else(|| s.m.i32(0)),
+                    RayOutput::AnyHitState(k) => state_phis[k],
+                    RayOutput::FrontBackMinFrontT => {
+                        let mf = front_back_min_f.expect("front_back min phi");
+                        s.m.cast(done_blk, Cast::Bitcast, mf, i32t)
+                    }
+                    committed => {
+                        if let Some(&cached) = phi_cache.get(&(committed, binding.fallback)) {
+                            cached
+                        } else {
+                            let v2 = *q2_cache.entry(committed).or_insert_with(|| {
+                                if matches!(committed, RayOutput::CommittedRayT)
+                                    && let Some(t_f) = q2_ray_t_override
+                                {
+                                    s.m.cast(from_q2_blk, Cast::Bitcast, t_f, i32t)
+                                } else {
+                                    emit_committed_hit_output(s, from_q2_blk, rq, committed, i32t)
+                                }
+                            });
+                            let v_miss = miss_val_for(s, binding);
+                            let v_not_q2 = match committed {
+                                RayOutput::CommittedStatusTriNode => {
+                                    let zero = s.m.i32(0);
+                                    s.m.select(not_q2_blk, q1_hit, one, zero)
+                                }
+                                RayOutput::CommittedRayT => {
+                                    let ti = *t_clamp_i.get_or_insert_with(|| {
+                                        s.m.cast(not_q2_blk, Cast::Bitcast, t_clamp, i32t)
+                                    });
+                                    s.m.select(not_q2_blk, q1_hit, ti, v_miss)
+                                }
+                                _ => {
+                                    let field = early_field_for_output(committed)
+                                        .expect("early q1 field for committed output");
+                                    let v1 = *q1_fields
+                                        .get(&field)
+                                        .expect("early q1 field pre-extracted");
+                                    if matches!(
+                                        committed,
+                                        RayOutput::CommittedBary(_)
+                                            | RayOutput::CommittedFrontFace
+                                    ) {
+                                        s.m.select(not_q2_blk, q1_hit, v1, v_miss)
+                                    } else {
+                                        v1
+                                    }
+                                }
+                            };
+                            let phi = s.m.phi(done_blk, i32t);
+                            s.m.set_phi(phi, vec![(v2, from_q2_blk), (v_not_q2, not_q2_blk)]);
+                            phi_cache.insert((committed, binding.fallback), phi);
+                            phi
+                        }
+                    }
+                };
+                outs.push((binding.value, v));
+            }
+            s.m.terminate(from_q2_blk, Term::Br(done_blk));
+            s.m.terminate(not_q2_blk, Term::Br(done_blk));
+            (
+                done_blk,
+                outs,
+                cand_outs,
+                pending_anyhit,
+                Some(TwoPassPost {
+                    q2_hit,
+                    q1_hit,
+                    q1_fields: Some(q1_fields),
+                }),
+            )
+        }
+        TwoPassQ1::Live { q1, q1_hit, p1_t } => {
+            let from_q2_blk = s.m.new_block();
+            let check_q1_blk = s.m.new_block();
+            let from_q1_blk = s.m.new_block();
+            let miss_blk = s.m.new_block();
+            let done_blk = s.m.new_block();
+
+            s.m.terminate(after_blk, Term::CondBr(q2_hit, from_q2_blk, check_q1_blk));
+            s.m.terminate(check_q1_blk, Term::CondBr(q1_hit, from_q1_blk, miss_blk));
+
+            let mut q1_cache: HashMap<RayOutput, V> = HashMap::new();
+            let mut outs = Vec::with_capacity(rl.outputs.len());
+            for binding in &rl.outputs {
+                let v = match binding.output {
+                    RayOutput::Zero => s.m.i32(0),
+                    RayOutput::CopyOf(pre) => inputs
+                        .fallbacks
+                        .get(&pre)
+                        .copied()
+                        .unwrap_or_else(|| s.m.i32(0)),
+                    RayOutput::AnyHitState(k) => state_phis[k],
+                    RayOutput::FrontBackMinFrontT => {
+                        let mf = front_back_min_f.expect("front_back min phi");
+                        s.m.cast(done_blk, Cast::Bitcast, mf, i32t)
+                    }
+                    committed => {
+                        let v2 = *q2_cache.entry(committed).or_insert_with(|| {
+                            if matches!(committed, RayOutput::CommittedRayT)
+                                && let Some(t_f) = q2_ray_t_override
+                            {
+                                s.m.cast(from_q2_blk, Cast::Bitcast, t_f, i32t)
+                            } else {
+                                emit_committed_hit_output(s, from_q2_blk, rq, committed, i32t)
+                            }
+                        });
+                        // Reuse `p1_t` instead of querying `COMMITTED_RAY_T(q1)` a second time:
+                        // AMD RDNA 4 (`amdxc64.dll`) adds `tMin` twice on a repeated read across `q2`.
+                        let v1 = *q1_cache.entry(committed).or_insert_with(|| {
+                            if matches!(committed, RayOutput::CommittedRayT) {
+                                s.m.cast(from_q1_blk, Cast::Bitcast, p1_t, i32t)
+                            } else {
+                                emit_committed_hit_output(s, from_q1_blk, q1, committed, i32t)
+                            }
+                        });
+                        let v_miss = miss_val_for(s, binding);
+                        let phi = s.m.phi(done_blk, i32t);
+                        s.m.set_phi(
+                            phi,
+                            vec![(v2, from_q2_blk), (v1, from_q1_blk), (v_miss, miss_blk)],
+                        );
+                        phi
+                    }
+                };
+                outs.push((binding.value, v));
+            }
+            s.m.terminate(from_q2_blk, Term::Br(done_blk));
+            s.m.terminate(from_q1_blk, Term::Br(done_blk));
+            s.m.terminate(miss_blk, Term::Br(done_blk));
+            (
+                done_blk,
+                outs,
+                cand_outs,
+                pending_anyhit,
+                Some(TwoPassPost {
+                    q2_hit,
+                    q1_hit,
+                    q1_fields: None,
+                }),
+            )
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -8028,6 +9883,7 @@ mod tests {
         let inputs = ResolvedRayInputs {
             rq,
             rq_opaque: None,
+            two_pass_early_fields: None,
             tlas,
             active_ray: Some(s.m.bool(true)),
             origin: [zero, zero, zero],
@@ -8041,6 +9897,7 @@ mod tests {
                 | ray_flag::CULL_BACK_FACING_TRIANGLES
                 | ray_flag::SKIP_PROCEDURAL_PRIMITIVES,
             group_opaque_const_flags: 0,
+            fbt_split_mask: 0,
             init_min_front_t: None,
             anyhit_inits: vec![],
             anyhit_entry_dxil: None,
@@ -8106,10 +9963,20 @@ mod tests {
             !is_front_back_two_pass_eligible(&rl),
             "FrontBackTrack two-pass must be opt-in (off by default for TRIANGLE_CULL_DISABLE parity)"
         );
+        // Default mask-split (`0x02`) clears FORCE_NON_OPAQUE on the shared handle so Pass A/B can use FORCE_OPAQUE;
+        // disabling mask-split (`Some(0)`) preserves FORCE_NON_OPAQUE for the single-pass Proceed() fallback.
         assert_eq!(
             effective_const_ray_flags(&rl),
+            Some(flags & !ray_flag::FORCE_NON_OPAQUE),
+            "default mask-split FrontBackTrack clears FORCE_NON_OPAQUE"
+        );
+        let prev_split = super::super::lower::TEST_NATIVE_RT_FBT_SPLIT_MASK.replace(Some(0));
+        let nosplit_flags = effective_const_ray_flags(&rl);
+        super::super::lower::TEST_NATIVE_RT_FBT_SPLIT_MASK.set(prev_split);
+        assert_eq!(
+            nosplit_flags,
             Some(flags),
-            "default FrontBackTrack preserves FORCE_NON_OPAQUE"
+            "non-split FrontBackTrack preserves FORCE_NON_OPAQUE"
         );
         let two_pass_flags = (flags & !ray_flag::FORCE_NON_OPAQUE) | ray_flag::FORCE_OPAQUE;
 
@@ -8134,6 +10001,7 @@ mod tests {
             let inputs = ResolvedRayInputs {
                 rq,
                 rq_opaque: None,
+                two_pass_early_fields: None,
                 tlas,
                 active_ray: Some(s.m.bool(true)),
                 origin: [zero, zero, zero],
@@ -8144,6 +10012,7 @@ mod tests {
                 ray_flags: None,
                 group_const_flags: alloc_flags,
                 group_opaque_const_flags: 0,
+                fbt_split_mask: 0,
                 init_min_front_t: Some(ten_f),
                 anyhit_inits: vec![],
                 anyhit_entry_dxil: None,
@@ -8248,6 +10117,7 @@ mod tests {
         let inputs = ResolvedRayInputs {
             rq,
             rq_opaque: None,
+            two_pass_early_fields: None,
             tlas,
             active_ray: Some(s.m.bool(true)),
             origin: [zero, zero, zero],
@@ -8258,6 +10128,7 @@ mod tests {
             ray_flags: None,
             group_const_flags: flags,
             group_opaque_const_flags: 0,
+            fbt_split_mask: 0,
             init_min_front_t: None,
             anyhit_inits: vec![zero],
             anyhit_entry_dxil: Some(anyhit_body),
@@ -8276,9 +10147,17 @@ mod tests {
         let _cand_t = emit_cand_input(&mut s, anyhit_body, rq, CandidateInput::RayT);
         let _cand_bary = emit_cand_input(&mut s, anyhit_body, rq, CandidateInput::Bary(0));
         let _cand_ff = emit_cand_input(&mut s, anyhit_body, rq, CandidateInput::FrontFace);
-        let cand_inst = emit_ray_meta_load(&mut s, anyhit_body, rq, true, RayMetaKind::InstanceId, 1);
-        let cand_geom =
-            emit_ray_meta_load(&mut s, anyhit_body, rq, true, RayMetaKind::GeometryIndexShl8, 1);
+        let cand_inst =
+            emit_ray_meta_load(&mut s, anyhit_body, rq, true, RayMetaKind::InstanceId, 1, None);
+        let cand_geom = emit_ray_meta_load(
+            &mut s,
+            anyhit_body,
+            rq,
+            true,
+            RayMetaKind::GeometryIndexShl8,
+            1,
+            None,
+        );
         let accept = s.m.cmp(anyhit_body, pred::NE, cand_inst[0], zero);
         s.m.terminate(
             anyhit_body,
@@ -8292,9 +10171,17 @@ mod tests {
             ],
         );
         // Exercise committed metadata emission post-loop.
-        let _xform =
-            emit_ray_meta_load(&mut s, exit, rq, false, RayMetaKind::ObjectToWorld(0), 4);
-        let _prim = emit_ray_meta_load(&mut s, exit, rq, false, RayMetaKind::PrimitiveIndex, 1);
+        let _xform = emit_ray_meta_load(
+            &mut s,
+            exit,
+            rq,
+            false,
+            RayMetaKind::ObjectToWorld(0),
+            4,
+            None,
+        );
+        let _prim =
+            emit_ray_meta_load(&mut s, exit, rq, false, RayMetaKind::PrimitiveIndex, 1, None);
         s.m.terminate(exit, Term::Ret);
 
         let mut dxbc = s.finish();
@@ -8365,6 +10252,7 @@ mod tests {
         let inputs = ResolvedRayInputs {
             rq,
             rq_opaque: None,
+            two_pass_early_fields: None,
             tlas,
             active_ray: None,
             origin: [zero, zero, zero],
@@ -8375,6 +10263,7 @@ mod tests {
             ray_flags: None,
             group_const_flags: flags,
             group_opaque_const_flags: 0,
+            fbt_split_mask: 0,
             init_min_front_t: None,
             anyhit_inits: vec![zero],
             anyhit_entry_dxil: Some(anyhit_body),
@@ -8533,11 +10422,27 @@ mod tests {
             true,
             false
         )));
+        // With `VICTORY_NATIVE_RT_TWOPASS_STATE` default ON, closest-hit `AnyHit` loops with
+        // `state_vars` are eligible for two-pass `tMax` pre-shrink; setting it OFF disables it.
+        let prev_tp_state = super::super::lower::TEST_NATIVE_RT_TWOPASS_STATE.replace(Some(true));
+        let hs_on = super::super::host_settings();
+        let fp_on = super::super::translation_fingerprint();
+        assert!(is_two_pass_eligible(&make_anyhit(
+            RayInput::Const(ray_flag::NONE),
+            false,
+            true
+        )));
+        super::super::lower::TEST_NATIVE_RT_TWOPASS_STATE.set(Some(false));
+        let hs_off = super::super::host_settings();
+        let fp_off = super::super::translation_fingerprint();
         assert!(!is_two_pass_eligible(&make_anyhit(
             RayInput::Const(ray_flag::NONE),
             false,
             true
         )));
+        assert_ne!(hs_on, hs_off, "VICTORY_NATIVE_RT_TWOPASS_STATE must update host_settings()");
+        assert_ne!(fp_on, fp_off, "VICTORY_NATIVE_RT_TWOPASS_STATE must update translation_fingerprint()");
+        super::super::lower::TEST_NATIVE_RT_TWOPASS_STATE.set(prev_tp_state);
         assert!(!is_two_pass_eligible(&make_anyhit(
             RayInput::Val(Value(99)),
             false,
@@ -8568,6 +10473,7 @@ mod tests {
         let inputs = ResolvedRayInputs {
             rq: q2,
             rq_opaque: Some(q1),
+            two_pass_early_fields: None,
             tlas,
             active_ray: Some(s.m.bool(true)),
             origin: [zero, zero, zero],
@@ -8578,6 +10484,7 @@ mod tests {
             ray_flags: None,
             group_const_flags: q2_flags,
             group_opaque_const_flags: q1_flags,
+            fbt_split_mask: 0,
             init_min_front_t: None,
             anyhit_inits: vec![],
             anyhit_entry_dxil: Some(anyhit_body),
@@ -8602,6 +10509,519 @@ mod tests {
         ) {
             v.validate(&mut dxbc)
                 .expect("two-pass CULL_NON_OPAQUE + CULL_OPAQUE DXIL valid");
+        }
+    }
+
+    #[test]
+    fn two_pass_anyhit_with_state_vars_and_early_extract_validates() {
+        let base_flags =
+            ray_flag::CULL_BACK_FACING_TRIANGLES | ray_flag::SKIP_PROCEDURAL_PRIMITIVES;
+        let rl = RayLoop {
+            rq_group: 0,
+            entry_block: 1,
+            exit_block: 3,
+            exit_pred: 1,
+            skipped_blocks: vec![],
+            template: RayTemplate::Bvh64,
+            kind: RayLoopKind::AnyHit(AnyHitInfo {
+                opacity_block: 1,
+                entry_block: 2,
+                tail_block: 2,
+                body_blocks: vec![2],
+                skipped_tail_insts: vec![],
+                accept_mask: Value(20),
+                accept_invert: false,
+                accept_first_hit: false,
+                inputs: vec![
+                    (Value(15), CandidateInput::RayT),
+                    (Value(18), CandidateInput::StateVar(0)),
+                ],
+                const_lane_atoms: vec![],
+                state_vars: vec![AnyHitStateVar {
+                    init: RayInput::Const(0),
+                    next: Value(19),
+                    reg: Reg::V(0),
+                }],
+                cand_meta_loads: vec![],
+            }),
+            tlas_load: (0, 0),
+            tlas_root_load: None,
+            active_ray_mask: None,
+            origin: [RayInput::Val(Value(1)); 3],
+            t_min: None,
+            dir: [RayInput::Val(Value(2)); 3],
+            t_max: RayInput::Val(Value(3)),
+            instance_mask: RayInput::Const(0xFF),
+            ray_flags: RayInput::Const(base_flags),
+            outputs: vec![
+                RayOutputBinding {
+                    value: Value(10),
+                    output: RayOutput::CommittedStatusTriNode,
+                    fallback: Some(Value(0)),
+                },
+                RayOutputBinding {
+                    value: Value(11),
+                    output: RayOutput::CommittedRayT,
+                    fallback: Some(Value(3)),
+                },
+                RayOutputBinding {
+                    value: Value(12),
+                    output: RayOutput::AnyHitState(0),
+                    fallback: Some(Value(0)),
+                },
+                RayOutputBinding {
+                    value: Value(13),
+                    output: RayOutput::CommittedGeometryIndex,
+                    fallback: None,
+                },
+                // Duplicate output binding should be deduplicated inside `emit_trace_body`.
+                RayOutputBinding {
+                    value: Value(14),
+                    output: RayOutput::CommittedGeometryIndex,
+                    fallback: None,
+                },
+            ],
+            committed_meta_loads: vec![
+                ((3, 0), RayMetaKind::InstanceIndex),
+                ((3, 1), RayMetaKind::GeometryIndexShl8),
+                ((3, 2), RayMetaKind::PrimitiveIndex),
+            ],
+        };
+
+        let fields = collect_early_q1_fields(
+            &rl,
+            &[
+                (RayMetaKind::InstanceIndex, 1),
+                (RayMetaKind::GeometryIndexShl8, 1),
+                (RayMetaKind::PrimitiveIndex, 1),
+            ],
+        );
+        // GeometryIndex is shared between `rl.outputs` and `GeometryIndexShl8`.
+        assert_eq!(fields.len(), 3, "expected 3 deduplicated early q1 fields: {fields:?}");
+        assert!(fields.len() <= EARLY_Q1_MAX_DWORDS);
+
+        let mut s = Shader::new(false);
+        s.threads = Some([8, 8, 1]);
+        let entry = s.entry;
+        let anyhit_body = s.m.new_block();
+        let exit = s.m.new_block();
+        let tlas = s.rtas_root_srv_handle(entry, 0);
+
+        // Single AllocateRayQuery handle (`rq_opaque: None`) reused across Pass 1 and Pass 2!
+        let rq = s.allocate_ray_query(entry, base_flags);
+        let zero = s.m.i32(0);
+        let one_f = s.m.i32(1.0f32.to_bits());
+        let ten_f = s.m.i32(10.0f32.to_bits());
+        let mut fallbacks = HashMap::new();
+        fallbacks.insert(Value(0), zero);
+        fallbacks.insert(Value(3), ten_f);
+
+        let inputs = ResolvedRayInputs {
+            rq,
+            rq_opaque: None,
+            two_pass_early_fields: Some(fields),
+            tlas,
+            active_ray: Some(s.m.bool(true)),
+            origin: [zero, zero, zero],
+            t_min: None,
+            dir: [one_f, zero, zero],
+            t_max: ten_f,
+            instance_mask: None,
+            ray_flags: None,
+            group_const_flags: base_flags,
+            group_opaque_const_flags: 0,
+            fbt_split_mask: 0,
+            init_min_front_t: None,
+            anyhit_inits: vec![zero],
+            anyhit_entry_dxil: Some(anyhit_body),
+            fallbacks,
+        };
+
+        let emitted = emit_ray_loop(&mut s, entry, exit, &rl, &inputs);
+        let tp = emitted.two_pass_post.expect("early-extract two_pass_post");
+        let q1_fields = tp.q1_fields.expect("early q1_fields map");
+        assert!(q1_fields.contains_key(&EarlyQ1Field::GeometryIndex));
+        assert!(q1_fields.contains_key(&EarlyQ1Field::InstanceIndex));
+        assert!(q1_fields.contains_key(&EarlyQ1Field::PrimitiveIndex));
+        // Duplicate CommittedGeometryIndex output bindings produce the exact same SSA value.
+        let g13 = emitted.outs.iter().find(|&&(v, _)| v == Value(13)).unwrap().1;
+        let g14 = emitted.outs.iter().find(|&&(v, _)| v == Value(14)).unwrap().1;
+        assert_eq!(g13, g14, "duplicate CommittedGeometryIndex outputs must share one query");
+
+        let pending = emitted.pending_anyhit.expect("pending anyhit");
+        let cand_t = emit_cand_input(&mut s, anyhit_body, rq, CandidateInput::RayT);
+        let accept = s.m.cmp(anyhit_body, pred::NE, cand_t, zero);
+        s.m.terminate(
+            anyhit_body,
+            Term::CondBr(accept, pending.do_commit_blk, pending.latch_blk),
+        );
+        s.m.set_phi(
+            pending.state_phis[0],
+            vec![
+                (pending.init_vals[0], pending.start_blk),
+                (cand_t, pending.latch_blk),
+            ],
+        );
+        let _geom_shl8 = resolve_early_q1_meta(
+            &mut s,
+            exit,
+            &q1_fields,
+            RayMetaKind::GeometryIndexShl8,
+            1,
+            None,
+        )
+        .expect("resolve early GeometryIndexShl8");
+        s.m.terminate(exit, Term::Ret);
+
+        let mut dxbc = s.finish();
+        assert!(dxbc.starts_with(b"DXBC"));
+        if let Ok(mut v) = crate::emit::validator::Validator::load(
+            crate::emit::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut dxbc)
+                .expect("single-handle early-extract two-pass AnyHit + state_vars DXIL valid");
+        }
+    }
+
+    #[test]
+    fn fno_speculative_fast_path_eligibility_and_dxil_valid() {
+        let flags = ray_flag::FORCE_NON_OPAQUE | ray_flag::SKIP_PROCEDURAL_PRIMITIVES;
+        let make_fno = |accept_first_hit: bool, has_state_vars: bool| RayLoop {
+            rq_group: 0,
+            entry_block: 1,
+            exit_block: 3,
+            exit_pred: 1,
+            skipped_blocks: vec![],
+            template: RayTemplate::Bvh64,
+            kind: RayLoopKind::AnyHit(AnyHitInfo {
+                opacity_block: 1,
+                entry_block: 2,
+                tail_block: 2,
+                body_blocks: vec![2],
+                skipped_tail_insts: vec![],
+                accept_mask: Value(20),
+                accept_invert: false,
+                accept_first_hit,
+                inputs: vec![
+                    (Value(15), CandidateInput::RayT),
+                    (Value(17), CandidateInput::FrontFace),
+                ],
+                const_lane_atoms: vec![],
+                state_vars: if has_state_vars {
+                    vec![AnyHitStateVar {
+                        init: RayInput::Const(0),
+                        next: Value(19),
+                        reg: Reg::V(0),
+                    }]
+                } else {
+                    vec![]
+                },
+                cand_meta_loads: vec![],
+            }),
+            tlas_load: (0, 0),
+            tlas_root_load: None,
+            active_ray_mask: None,
+            origin: [RayInput::Val(Value(1)); 3],
+            t_min: None,
+            dir: [RayInput::Val(Value(2)); 3],
+            t_max: RayInput::Val(Value(3)),
+            instance_mask: RayInput::Const(0xFF),
+            ray_flags: RayInput::Const(flags),
+            outputs: vec![
+                RayOutputBinding {
+                    value: Value(10),
+                    output: RayOutput::CommittedStatusTriNode,
+                    fallback: Some(Value(0)),
+                },
+                RayOutputBinding {
+                    value: Value(11),
+                    output: RayOutput::CommittedRayT,
+                    fallback: Some(Value(3)),
+                },
+                RayOutputBinding {
+                    value: Value(12),
+                    output: RayOutput::CommittedGeometryIndex,
+                    fallback: None,
+                },
+            ],
+            committed_meta_loads: vec![],
+        };
+
+        let rl_closest = make_fno(false, false);
+        let rl_afh = make_fno(true, false);
+        let rl_state = make_fno(false, true);
+        let rl_afh_state = make_fno(true, true);
+        let mut rl_dyn_state = make_fno(false, true);
+        rl_dyn_state.ray_flags = RayInput::Val(Value(99));
+
+        let prev_fno = super::super::lower::TEST_NATIVE_RT_FNO_MODE.replace(Some(2));
+        let hs_m2 = super::super::host_settings();
+        let fp_m2 = super::super::translation_fingerprint();
+        assert!(is_fno_speculative_eligible(&rl_closest));
+        assert!(is_fno_speculative_eligible(&rl_afh));
+        assert!(is_fno_speculative_eligible(&rl_state));
+        assert!(!is_fno_speculative_eligible(&rl_afh_state));
+        assert!(is_fno_speculative_eligible(&rl_dyn_state));
+        assert_eq!(
+            effective_const_ray_flags(&rl_closest),
+            Some(ray_flag::SKIP_PROCEDURAL_PRIMITIVES),
+            "mode 2 strips FORCE_NON_OPAQUE from constRayFlags for Pass 1 FORCE_OPAQUE reuse"
+        );
+        assert_eq!(effective_const_ray_flags(&rl_dyn_state), None);
+
+        super::super::lower::TEST_NATIVE_RT_FNO_MODE.set(Some(1));
+        let hs_m1 = super::super::host_settings();
+        let fp_m1 = super::super::translation_fingerprint();
+        assert!(!is_fno_speculative_eligible(&rl_closest));
+        assert_eq!(effective_const_ray_flags(&rl_closest), Some(flags));
+
+        super::super::lower::TEST_NATIVE_RT_FNO_MODE.set(Some(0));
+        let hs_m0 = super::super::host_settings();
+        assert_ne!(hs_m2, hs_m1, "VICTORY_NATIVE_RT_FNO_MODE=2 vs 1 must update host_settings()");
+        assert_ne!(hs_m1, hs_m0, "VICTORY_NATIVE_RT_FNO_MODE=1 vs 0 must update host_settings()");
+        assert_ne!(fp_m2, fp_m1, "VICTORY_NATIVE_RT_FNO_MODE must update translation_fingerprint()");
+        super::super::lower::TEST_NATIVE_RT_FNO_MODE.set(prev_fno);
+
+        // Emit speculative fast-path DXIL and validate with `dxil.dll`.
+        let mut s = Shader::new(false);
+        s.threads = Some([8, 8, 1]);
+        let entry = s.entry;
+        let anyhit_body = s.m.new_block();
+        let exit = s.m.new_block();
+        let tlas = s.rtas_root_srv_handle(entry, 0);
+
+        let alloc_flags = ray_flag::SKIP_PROCEDURAL_PRIMITIVES;
+        let rq = s.allocate_ray_query(entry, alloc_flags);
+        let zero = s.m.i32(0);
+        let one_f = s.m.i32(1.0f32.to_bits());
+        let ten_f = s.m.i32(10.0f32.to_bits());
+        let mut fallbacks = HashMap::new();
+        fallbacks.insert(Value(0), zero);
+        fallbacks.insert(Value(3), ten_f);
+
+        let inputs = ResolvedRayInputs {
+            rq,
+            rq_opaque: None,
+            two_pass_early_fields: None,
+            tlas,
+            active_ray: Some(s.m.bool(true)),
+            origin: [zero, zero, zero],
+            t_min: None,
+            dir: [one_f, zero, zero],
+            t_max: ten_f,
+            instance_mask: None,
+            ray_flags: None,
+            group_const_flags: alloc_flags,
+            group_opaque_const_flags: 0,
+            fbt_split_mask: 0,
+            init_min_front_t: None,
+            anyhit_inits: vec![],
+            anyhit_entry_dxil: Some(anyhit_body),
+            fallbacks,
+        };
+
+        let emitted = emit_ray_loop(&mut s, entry, exit, &rl_closest, &inputs);
+        let pending = emitted.pending_anyhit.expect("pending anyhit");
+        let spec = pending.spec.expect("speculative FNO metadata");
+        // CandidateInput::RayT (Value(15)) is already PHI-bridged in `emitted.outs`.
+        let bridged_t = emitted.outs.iter().find(|&&(v, _)| v == Value(15)).unwrap().1;
+
+        // Guarded candidate/committed metadata read using `spec.spec_phi`.
+        let b_comm = s.m.new_block();
+        let b_cand = s.m.new_block();
+        let b_join = s.m.new_block();
+        s.m.terminate(anyhit_body, Term::CondBr(spec.spec_phi, b_comm, b_cand));
+        let g_comm = emit_ray_meta_load(
+            &mut s,
+            b_comm,
+            rq,
+            false,
+            RayMetaKind::GeometryIndexShl8,
+            1,
+            None,
+        )[0];
+        s.m.terminate(b_comm, Term::Br(b_join));
+        let g_cand = emit_ray_meta_load(
+            &mut s,
+            b_cand,
+            rq,
+            true,
+            RayMetaKind::GeometryIndexShl8,
+            1,
+            None,
+        )[0];
+        s.m.terminate(b_cand, Term::Br(b_join));
+        let g_phi = s.m.phi(b_join, s.t.i32);
+        s.m.set_phi(g_phi, vec![(g_comm, b_comm), (g_cand, b_cand)]);
+
+        let combined = s.m.bin(b_join, Bin::Or, g_phi, bridged_t);
+        let accept = s.m.cmp(b_join, pred::NE, combined, zero);
+        s.m.terminate(
+            b_join,
+            Term::CondBr(spec.spec_phi, spec.spec_decide_blk, spec.non_spec_decide_blk),
+        );
+        s.m.terminate(
+            spec.spec_decide_blk,
+            Term::CondBr(accept, spec.after_blk, spec.p2_trace_blk),
+        );
+        s.m.terminate(
+            spec.non_spec_decide_blk,
+            Term::CondBr(accept, pending.do_commit_blk, pending.latch_blk),
+        );
+        s.m.terminate(exit, Term::Ret);
+
+        let mut dxbc = s.finish();
+        assert!(dxbc.starts_with(b"DXBC"));
+        if let Ok(mut v) = crate::emit::validator::Validator::load(
+            crate::emit::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut dxbc)
+                .expect("speculative FORCE_NON_OPAQUE AnyHit DXIL must pass dxil.dll validation");
+        }
+    }
+
+    #[test]
+    fn front_back_mask_split_eligibility_and_dxil_valid() {
+        let flags = ray_flag::FORCE_NON_OPAQUE | ray_flag::SKIP_PROCEDURAL_PRIMITIVES;
+        let rl = RayLoop {
+            rq_group: 0,
+            entry_block: 1,
+            exit_block: 2,
+            exit_pred: 1,
+            skipped_blocks: vec![],
+            template: RayTemplate::Bvh64,
+            kind: RayLoopKind::FrontBackTrack {
+                init_min_front_t: RayInput::Val(Value(7)),
+            },
+            tlas_load: (0, 0),
+            tlas_root_load: None,
+            active_ray_mask: None,
+            origin: [RayInput::Val(Value(1)); 3],
+            t_min: None,
+            dir: [RayInput::Val(Value(2)); 3],
+            t_max: RayInput::Val(Value(7)),
+            instance_mask: RayInput::Const(0xFF),
+            ray_flags: RayInput::Const(flags),
+            outputs: vec![
+                RayOutputBinding {
+                    value: Value(10),
+                    output: RayOutput::CommittedStatusTriNode,
+                    fallback: Some(Value(0)),
+                },
+                RayOutputBinding {
+                    value: Value(11),
+                    output: RayOutput::CommittedRayT,
+                    fallback: Some(Value(7)),
+                },
+                RayOutputBinding {
+                    value: Value(12),
+                    output: RayOutput::FrontBackMinFrontT,
+                    fallback: Some(Value(7)),
+                },
+                RayOutputBinding {
+                    value: Value(13),
+                    output: RayOutput::CommittedGeometryIndex,
+                    fallback: None,
+                },
+            ],
+            committed_meta_loads: vec![],
+        };
+
+        let prev = super::super::lower::TEST_NATIVE_RT_FBT_SPLIT_MASK.replace(Some(0));
+        let hs_off = super::super::host_settings();
+        let fp_off = super::super::translation_fingerprint();
+        assert!(!is_front_back_mask_split_eligible(&rl));
+        assert_eq!(effective_const_ray_flags(&rl), Some(flags));
+
+        super::super::lower::TEST_NATIVE_RT_FBT_SPLIT_MASK.set(Some(0x80));
+        let hs_on = super::super::host_settings();
+        let fp_on = super::super::translation_fingerprint();
+        assert!(is_front_back_mask_split_eligible(&rl));
+        assert!(!is_front_back_two_pass_eligible(&rl));
+        assert_eq!(
+            effective_const_ray_flags(&rl),
+            Some(ray_flag::SKIP_PROCEDURAL_PRIMITIVES),
+            "mask-split FrontBackTrack strips FORCE_NON_OPAQUE so single rq runs FORCE_OPAQUE + FORCE_NON_OPAQUE"
+        );
+        assert_ne!(hs_off, hs_on, "VICTORY_NATIVE_RT_FBT_SPLIT_MASK must update host_settings()");
+        assert_ne!(
+            fp_off, fp_on,
+            "VICTORY_NATIVE_RT_FBT_SPLIT_MASK must update translation_fingerprint()"
+        );
+        super::super::lower::TEST_NATIVE_RT_FBT_SPLIT_MASK.set(prev);
+
+        // Validate both single-handle early-extract mode and 2-handle fallback mode with dxil.dll.
+        for two_handle in [false, true] {
+            let mut s = Shader::new(false);
+            s.threads = Some([8, 8, 1]);
+            let entry = s.entry;
+            let exit = s.m.new_block();
+            let tlas = s.rtas_root_srv_handle(entry, 0);
+
+            let (rq, rq_opaque, q2_fl, q1_fl, early) = if two_handle {
+                let q1_fl = ray_flag::FORCE_OPAQUE | ray_flag::SKIP_PROCEDURAL_PRIMITIVES;
+                let q2_fl = ray_flag::FORCE_NON_OPAQUE | ray_flag::SKIP_PROCEDURAL_PRIMITIVES;
+                (
+                    s.allocate_ray_query(entry, q2_fl),
+                    Some(s.allocate_ray_query(entry, q1_fl)),
+                    q2_fl,
+                    q1_fl,
+                    None,
+                )
+            } else {
+                let base_fl = ray_flag::SKIP_PROCEDURAL_PRIMITIVES;
+                (
+                    s.allocate_ray_query(entry, base_fl),
+                    None,
+                    base_fl,
+                    0,
+                    Some(collect_early_q1_fields(&rl, &[])),
+                )
+            };
+
+            let zero = s.m.i32(0);
+            let one_f = s.m.i32(1.0f32.to_bits());
+            let ten_f = s.m.i32(10.0f32.to_bits());
+            let mut fallbacks = HashMap::new();
+            fallbacks.insert(Value(0), zero);
+            fallbacks.insert(Value(7), ten_f);
+
+            let inputs = ResolvedRayInputs {
+                rq,
+                rq_opaque,
+                two_pass_early_fields: early,
+                tlas,
+                active_ray: Some(s.m.bool(true)),
+                origin: [zero, zero, zero],
+                t_min: None,
+                dir: [one_f, zero, zero],
+                t_max: ten_f,
+                instance_mask: None,
+                ray_flags: None,
+                group_const_flags: q2_fl,
+                group_opaque_const_flags: q1_fl,
+                fbt_split_mask: 0x80,
+                init_min_front_t: Some(ten_f),
+                anyhit_inits: vec![],
+                anyhit_entry_dxil: None,
+                fallbacks,
+            };
+
+            let emitted = emit_ray_loop(&mut s, entry, exit, &rl, &inputs);
+            assert!(emitted.pending_anyhit.is_none());
+            assert!(emitted.two_pass_post.is_some());
+            assert_eq!(emitted.outs.len(), 4);
+            s.m.terminate(exit, Term::Ret);
+
+            let mut dxbc = s.finish();
+            assert!(dxbc.starts_with(b"DXBC"));
+            if let Ok(mut v) = crate::emit::validator::Validator::load(
+                crate::emit::validator::Validator::default_path().as_deref(),
+            ) {
+                v.validate(&mut dxbc).unwrap_or_else(|e| {
+                    panic!("mask-split FrontBackTrack (two_handle={two_handle}) DXIL invalid: {e}")
+                });
+            }
         }
     }
 

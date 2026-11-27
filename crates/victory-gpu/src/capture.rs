@@ -1,7 +1,9 @@
 //! Presented frames written to PNG files, to see what reaches the screen:
 //! with `VICTORY_CAPTURE=<folder>`, every frame whose number is a power of
 //! two (the frames the log reports) is saved as `frame-<n>.png`, at half
-//! size. Only in builds with diagnostics.
+//! size. Only in builds with diagnostics (except `<folder>/want`, which works
+//! in release builds too).
+#![cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 
 use std::path::PathBuf;
 
@@ -14,6 +16,27 @@ pub(crate) fn folder() -> Option<&'static PathBuf> {
     FOLDER
         .get_or_init(|| std::env::var_os("VICTORY_CAPTURE").map(PathBuf::from))
         .as_ref()
+}
+
+/// Checks for an on-demand `<VICTORY_CAPTURE>/want` trigger file (at most once
+/// every 250 ms; zero filesystem calls when `VICTORY_CAPTURE` is unset),
+/// deleting it and returning `true` to save the next presented frame as a PNG
+/// in both release and diagnostics builds.
+pub(crate) fn take_want() -> bool {
+    let Some(dir) = folder() else {
+        return false;
+    };
+    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    let now = std::time::Instant::now();
+    {
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        if last.is_some_and(|t| now.duration_since(t) < std::time::Duration::from_millis(250)) {
+            return false;
+        }
+        *last = Some(now);
+    }
+    let path = dir.join("want");
+    path.exists() && std::fs::remove_file(&path).is_ok()
 }
 
 /// Frames listed in `VICTORY_CAPTURE_FRAMES` (comma-separated): saved

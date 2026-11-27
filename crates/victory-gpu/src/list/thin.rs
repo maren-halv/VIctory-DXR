@@ -64,6 +64,7 @@ pub(crate) fn wanted() -> bool {
 pub(super) struct Front {
     recording: Option<Arc<Recording>>,
     words: Vec<u64>,
+    dxr_ops: Vec<crate::dxr::DxrOp>,
     closed: bool,
     submitted: bool,
 }
@@ -84,6 +85,17 @@ impl Front {
             recording.abandoned.store(true, Release);
         }
         self.words.clear();
+        self.dxr_ops.clear();
+    }
+
+    /// Appends a native DXR operation to this list's thin stream in exact
+    /// command-recording order with zero global mutex contention.
+    fn put_dxr_op(&mut self, op: crate::dxr::DxrOp) {
+        if self.closed || self.recording.is_none() {
+            return;
+        }
+        self.dxr_ops.push(op);
+        self.put(DXR_OP, &[]);
     }
 
     /// Begins a recording, with `pipeline` bound.
@@ -192,10 +204,11 @@ impl Front {
         }
         let fresh = held(&WORDS).pop().unwrap_or_else(|| Vec::with_capacity(CHUNK + 256));
         let words = std::mem::replace(&mut self.words, fresh);
+        let dxr_ops = std::mem::take(&mut self.dxr_ops);
         CHUNKS.fetch_add(1, Relaxed);
         let schedule = {
             let mut inner = held(&recording.inner);
-            inner.chunks.push_back(words);
+            inner.chunks.push_back((words, dxr_ops));
             !std::mem::replace(&mut inner.scheduled, true)
         };
         if schedule {
@@ -244,7 +257,7 @@ pub(crate) struct Recording {
 
 #[derive(Default)]
 struct Inner {
-    chunks: VecDeque<Vec<u64>>,
+    chunks: VecDeque<(Vec<u64>, Vec<crate::dxr::DxrOp>)>,
     /// Streams translated (commands may name places in them until the end).
     kept: Vec<Vec<u64>>,
     /// It is among [`READY`] or being translated.
@@ -288,9 +301,9 @@ impl Recording {
     /// Translates what there is.
     fn run(&self) {
         loop {
-            let (chunk, back) = {
+            let (chunk, chunk_dxr_ops, back) = {
                 let mut inner = held(&self.inner);
-                let Some(chunk) = inner.chunks.pop_front() else {
+                let Some((chunk, chunk_dxr_ops)) = inner.chunks.pop_front() else {
                     inner.scheduled = false;
                     if inner.waiting_for_back {
                         self.moved.notify_all();
@@ -299,6 +312,7 @@ impl Recording {
                 };
                 if inner.back == 0
                     && inner.chunks.is_empty()
+                    && chunk_dxr_ops.is_empty()
                     && chunk.len() == 3
                     && chunk[0] == (RESET | (1 << 16))
                     && chunk[2] == CLOSE
@@ -318,10 +332,10 @@ impl Recording {
                 if inner.back == 0 {
                     inner.back = back_list(self.kind) as usize;
                 }
-                (chunk, inner.back as This)
+                (chunk, chunk_dxr_ops, inner.back as This)
             };
             let began = std::time::Instant::now();
-            let (calls, closed) = translate(back, &chunk, || self.abandoned.load(Acquire));
+            let (calls, closed) = translate(back, &chunk, chunk_dxr_ops, || self.abandoned.load(Acquire));
             STATS[0].fetch_add(calls, Relaxed);
             STATS[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
             let mut inner = held(&self.inner);
@@ -343,7 +357,14 @@ impl Recording {
 impl Drop for Recording {
     fn drop(&mut self) {
         let inner = self.inner.get_mut().unwrap_or_else(|e| e.into_inner());
-        give_back(inner.chunks.drain(..).chain(std::mem::take(&mut inner.kept)).collect());
+        give_back(
+            inner
+                .chunks
+                .drain(..)
+                .map(|(words, _)| words)
+                .chain(std::mem::take(&mut inner.kept))
+                .collect(),
+        );
         if inner.back != 0 {
             if !inner.closed {
                 // Left in the middle.
@@ -450,6 +471,12 @@ fn front<'a>(this: This) -> &'a mut Front {
     // SAFETY: the title passes one of our lists; a list is recorded by one
     // thread at a time.
     unsafe { &mut (*this.cast_mut().cast::<List>()).thin }
+}
+
+/// Queues a native DXR operation onto a `VICTORY_THIN=1` front-end list's
+/// local command stream without touching any global mutex.
+pub(super) fn queue_dxr_op(this: This, op: crate::dxr::DxrOp) {
+    front(this).put_dxr_op(op);
 }
 
 /// Lets a host API record at the current position of the title's open list.
@@ -600,6 +627,7 @@ const TARGETS: u64 = after(13);
 const CLEAR_RTV: u64 = after(14);
 const CLEAR_DSV: u64 = after(15);
 const COPY_TEXTURE: u64 = after(16);
+const DXR_OP: u64 = after(17);
 
 /// The bytes of `count` things at `items` (none if null).
 fn bytes_of<'a, T>(items: *const T, count: usize) -> &'a [u8] {
@@ -1035,10 +1063,16 @@ fn unpack_barrier_groups(count: usize, words: &[u64]) -> Option<Vec<super::Barri
 
 /// Makes the calls of a stream on `list`: how many, and whether the last one
 /// closed it. Once `left` says so only what must not be lost is done.
-fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool) {
+fn translate(
+    list: This,
+    stream: &[u64],
+    dxr_ops: Vec<crate::dxr::DxrOp>,
+    left: impl Fn() -> bool,
+) -> (u64, bool) {
     let _retire_batch = crate::host::RetireBatchGuard::enter();
     let (mut i, mut calls, mut closed) = (0, 0, false);
     let mut skip = left();
+    let mut dxr_iter = dxr_ops.into_iter();
     // Hold `list.state` across consecutive pure-state/draw/dispatch calls so
     // the worker does not re-acquire the mutex and query QPC on every call.
     let mut held_state: Option<(&crate::host::HostList, std::sync::MutexGuard<'_, crate::draw::State>)> = None;
@@ -1193,6 +1227,13 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
                     at_or(w, 2 + step),
                     at(w, 2 + 2 * step, boxed),
                 );
+            }
+            DXR_OP => {
+                if let Some(dxr_op) = dxr_iter.next()
+                    && let Some(host) = super::host_list(list)
+                {
+                    host.push_dxr_op(dxr_op);
+                }
             }
             _ => {}
         }
@@ -1400,5 +1441,42 @@ mod tests {
         let s2 = std::mem::take(&mut f.words);
         assert_eq!(s2[0] & 0xffff, BARRIER_GROUPS);
         assert_eq!((s2[1], s2[2]), (1, 1));
+    }
+
+    /// DXR operations are recorded directly into each list's local thin stream
+    /// (preserving FIFO order across `hand_over` and clearing cleanly on `leave`).
+    #[test]
+    fn dxr_ops_round_trip_per_list_without_global_mutex() {
+        let mut f = Front::default();
+        let rec = Arc::new(Recording::new(0));
+        f.recording = Some(rec.clone());
+        f.put_dxr_op(crate::dxr::DxrOp::CopyAs {
+            dest_va: 0x1000,
+            source_va: 0x2000,
+            mode: 0,
+        });
+        f.put_dxr_op(crate::dxr::DxrOp::ExtractStaticBlas {
+            dest_va: 0x3000,
+            size_bytes: 4096,
+        });
+        assert_eq!(f.words, vec![DXR_OP, DXR_OP]);
+        assert_eq!(f.dxr_ops.len(), 2);
+
+        // `leave()` clears pending ops cleanly without leaking or panicking.
+        f.leave();
+        assert!(f.words.is_empty());
+        assert!(f.dxr_ops.is_empty());
+        assert!(rec.abandoned.load(Acquire));
+
+        // Closed front drops incoming DXR ops cleanly.
+        f.recording = Some(Arc::new(Recording::new(0)));
+        f.closed = true;
+        f.put_dxr_op(crate::dxr::DxrOp::CopyAs {
+            dest_va: 0x4000,
+            source_va: 0x5000,
+            mode: 1,
+        });
+        assert!(f.words.is_empty());
+        assert!(f.dxr_ops.is_empty());
     }
 }

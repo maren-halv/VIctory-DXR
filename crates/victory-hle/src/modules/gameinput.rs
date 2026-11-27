@@ -160,14 +160,7 @@ trait Source: Send {
     fn rumble(&mut self, slot: usize, motors: [f32; 4]);
 }
 
-fn fallback(keys: &[KeyState]) -> PadState {
-    let on = |vk: u8| {
-        if keys.iter().any(|k| k.virtual_key == vk) {
-            1.0
-        } else {
-            0.0
-        }
-    };
+fn fallback_with(on: impl Fn(u8) -> f32) -> PadState {
     PadState {
         buttons: FALLBACK_BUTTONS
             .iter()
@@ -180,6 +173,20 @@ fn fallback(keys: &[KeyState]) -> PadState {
         right_x: on(b'L') - on(b'J'),
         right_y: on(b'I') - on(b'K'),
     }
+}
+
+fn fallback(keys: &[KeyState]) -> PadState {
+    fallback_with(|vk| {
+        if keys.iter().any(|k| k.virtual_key == vk) {
+            1.0
+        } else {
+            0.0
+        }
+    })
+}
+
+fn fallback_vks(vks: &[u8]) -> PadState {
+    fallback_with(|vk| if vks.contains(&vk) { 1.0 } else { 0.0 })
 }
 
 /// Two pads as one: buttons of both, and of each axis and trigger the one
@@ -1650,11 +1657,8 @@ mod host {
 
     fn apply_scripted_buttons(pad: &mut PadState, buf: &mut Vec<u8>) {
         scripted_into(buf);
-        for &vk in buf.iter() {
-            if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk)
-            {
-                pad.buttons |= button;
-            }
+        if !buf.is_empty() {
+            *pad = super::merged(*pad, super::fallback_vks(buf));
         }
     }
 
@@ -2294,6 +2298,23 @@ mod host {
             ),
             (1.0, -1.0, 1.0, 0.0)
         );
+    }
+
+    #[test]
+    fn scripted_fallback_vks_drive_sticks_triggers_and_buttons() {
+        let physical = PadState {
+            buttons: B,
+            left_x: 0.25,
+            ..Default::default()
+        };
+        let scripted = super::fallback_vks(&[0x0D, b'W', b'L', b'Z', b'C']);
+        let combined = super::merged(physical, scripted);
+        assert_eq!(combined.buttons, A | B);
+        assert_eq!(combined.left_x, 0.25);
+        assert_eq!(combined.left_y, 1.0);
+        assert_eq!(combined.right_x, 1.0);
+        assert_eq!(combined.left_trigger, 1.0);
+        assert_eq!(combined.right_trigger, 1.0);
     }
 
     #[test]

@@ -325,12 +325,22 @@ pub(crate) fn builder_rests(why: &'static str) {
     }
 }
 
+#[cfg(windows)]
+fn builder_allowed_for(bvh_builder_env: Option<&std::ffi::OsStr>, rehydrate_via_builder: bool) -> bool {
+    bvh_builder_env.is_some_and(|v| v == "1") || rehydrate_via_builder
+}
+
 /// At a dispatch of a builder pipeline: whether the builder runs (see
 /// [`Builder`]).
 #[cfg(windows)]
 pub(crate) fn builder_runs() -> bool {
     static ALLOWED: OnceLock<bool> = OnceLock::new();
-    if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
+    if !*ALLOWED.get_or_init(|| {
+        builder_allowed_for(
+            std::env::var_os("VICTORY_BVH_BUILDER").as_deref(),
+            crate::dxr::rehydrate_via_builder(),
+        )
+    }) {
         return false;
     }
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
@@ -908,5 +918,20 @@ mod tests {
                 (1, 28)
             );
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn builder_allowed_decouples_rehydration_from_bvh_builder_env() {
+        use std::ffi::OsStr;
+        // RT-Off: BVH_BUILDER unset or "0", rehydrate_via_builder false -> builder stays off.
+        assert!(!builder_allowed_for(None, false));
+        assert!(!builder_allowed_for(Some(OsStr::new("0")), false));
+        // Dual-run: BVH_BUILDER=1 -> builder runs regardless of rehydrate_via_builder.
+        assert!(builder_allowed_for(Some(OsStr::new("1")), false));
+        assert!(builder_allowed_for(Some(OsStr::new("1")), true));
+        // Suppress-builder with BVH_BUILDER=0: rehydrate_via_builder allows rehydration dispatches.
+        assert!(builder_allowed_for(None, true));
+        assert!(builder_allowed_for(Some(OsStr::new("0")), true));
     }
 }

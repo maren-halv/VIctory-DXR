@@ -2371,39 +2371,66 @@ pub(crate) fn let_go_idle() {
     static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let keep = *KEEP
         .get_or_init(|| !matches!(std::env::var("VICTORY_TEXTURE_KEEP").as_deref(), Ok("0") | Ok("1")));
+    let mut emergency = false;
     let mut policy = match memory {
         Some([budget, used, ..]) if keep => {
-            let used = used.saturating_sub(crate::pool::texture_room())
+            let eff = used.saturating_sub(crate::pool::texture_room())
                 + crate::shadow::card_room_kept()
                 + targets_room_kept()
                 + crate::dxr::dxr_room_kept();
-            crate::host::vram_keep(budget, used)
+            emergency = budget > 0 && eff >= budget / 100 * 96;
+            crate::host::vram_keep(budget, eff)
         }
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),
     };
     if let Some(limit) = texture_budget_bytes() {
         let filled = KINDS[1].load(Relaxed) + crate::tiles::given_total();
+        if limit > 0 && filled >= limit / 100 * 96 {
+            emergency = true;
+        }
         policy = tighter_keep(policy, crate::host::vram_keep(limit, filled));
     }
     let (idle_ms, most) = policy;
+    // If a pressure pass just walked a full cycle and found nothing evictable,
+    // wait 500 ms before rescanning ~100k textures unless VRAM hits emergency.
+    const EMPTY_COOLDOWN_MS: u64 = 500;
+    static EMPTY_AT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if most != u64::MAX && !emergency {
+        let last_empty = EMPTY_AT_MS.load(Relaxed);
+        if last_empty != 0 && crate::host::now_ms().saturating_sub(last_empty) < EMPTY_COOLDOWN_MS {
+            return;
+        }
+    }
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
     // Without a byte limit, while textures are kept for minutes, a part of
     // them at each look, the next one at the next: a play has over 100,000
-    // (`VICTORY_TEXTURE_SWEEP=whole`: all each time, as before).
+    // (`VICTORY_TEXTURE_SWEEP=whole`: all each time, as before). Under
+    // non-emergency VRAM pressure (`91%..96%`), chunked scanning + a per-call
+    // retirement cap avoid multi-hundred-millisecond `victory-submit` stalls.
     const PART: usize = 8192;
+    const PART_PRESSURE: usize = 16_384;
+    const MAX_RETIRE_PER_CALL: u64 = 256;
     static FROM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static FROM_PRESSURE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     static WHOLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let whole = *WHOLE.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_some_and(|v| v == "whole"));
     let part = if most != u64::MAX {
-        0
+        if whole || emergency { usize::MAX } else { PART_PRESSURE }
     } else if whole || idle_ms < 60_000 {
         usize::MAX
     } else {
         PART
     };
-    let from = if part == PART { FROM.load(Relaxed) } else { 0 };
+    let from = if most != u64::MAX {
+        if part == PART_PRESSURE { FROM_PRESSURE.load(Relaxed) } else { 0 }
+    } else if part == PART {
+        FROM.load(Relaxed)
+    } else {
+        0
+    };
+    let mut wrapped_pressure = false;
     let began = std::time::Instant::now();
     // Snapshot idle candidates under `TEXTURES`, bump their refcounts, then
     // release `TEXTURES` before sorting, locking per-resource mutexes, or
@@ -2416,7 +2443,11 @@ pub(crate) fn let_go_idle() {
             if most != u64::MAX {
                 // With a limit, evict never-remade textures before already-remade
                 // ones, longest idle first within each group.
-                for &at in all.iter() {
+                let mut looked = 0;
+                let mut last_at = 0;
+                for &at in all.range(from..).take(part) {
+                    looked += 1;
+                    last_at = at;
                     // SAFETY: a texture leaves the table before it is freed,
                     // under the lock held here (`Drop for Resource`).
                     let r = unsafe { &*(at as *const Resource) };
@@ -2433,6 +2464,16 @@ pub(crate) fn let_go_idle() {
                     {
                         by_age.push((u8::from(remade), used & 0xffff_ffff, at));
                     }
+                }
+                if part == PART_PRESSURE {
+                    if looked == PART_PRESSURE {
+                        FROM_PRESSURE.store(last_at.saturating_add(1), Relaxed);
+                    } else {
+                        FROM_PRESSURE.store(0, Relaxed);
+                        wrapped_pressure = true;
+                    }
+                } else {
+                    wrapped_pressure = true;
                 }
             } else {
                 let mut looked = 0;
@@ -2468,8 +2509,9 @@ pub(crate) fn let_go_idle() {
             plain.into_iter().map(|at| Held(at as This)).collect()
         }
     };
+    let max_retire = if emergency || whole { u64::MAX } else { MAX_RETIRE_PER_CALL };
     for held in candidates {
-        if bytes >= most {
+        if bytes >= most || went >= max_retire {
             break;
         }
         let at = held.0 as usize;
@@ -2508,6 +2550,13 @@ pub(crate) fn let_go_idle() {
                 first = Some(at);
             }
             crate::host::retire(host);
+        }
+    }
+    if most != u64::MAX {
+        if went > 0 {
+            EMPTY_AT_MS.store(0, Relaxed);
+        } else if wrapped_pressure {
+            EMPTY_AT_MS.store(crate::host::now_ms(), Relaxed);
         }
     }
     SWEPT_US[0].fetch_add(1, Relaxed);

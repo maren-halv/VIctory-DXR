@@ -562,6 +562,7 @@ fn emit_front_back_track_two_pass_cs() -> Vec<u8> {
     let inputs = ResolvedRayInputs {
         rq,
         rq_opaque: None,
+        two_pass_early_fields: None,
         tlas,
         active_ray: None,
         origin: [ox, zero_f_i, zero_f_i],
@@ -572,6 +573,7 @@ fn emit_front_back_track_two_pass_cs() -> Vec<u8> {
         ray_flags: None,
         group_const_flags: alloc_flags,
         group_opaque_const_flags: 0,
+        fbt_split_mask: 0,
         init_min_front_t: Some(init_min_front_t),
         anyhit_inits: vec![],
         anyhit_entry_dxil: None,
@@ -657,6 +659,26 @@ fn run_rayquery_gpu(
     use_heap: bool,
     geoms: &[TriangleGeom<'_>],
     inst: &InstanceSpec,
+    out_dwords: u32,
+) -> Result<Vec<u32>, String> {
+    run_rayquery_gpu_instances(
+        host,
+        cs_dxil,
+        use_heap,
+        geoms,
+        std::slice::from_ref(inst),
+        out_dwords,
+    )
+}
+
+/// Builds BLAS + multi-instance TLAS on `host`, dispatches `cs_dxil` (`(1, 1, 1)`),
+/// and reads back `out_dwords` from `u0, space1`.
+fn run_rayquery_gpu_instances(
+    host: &Host,
+    cs_dxil: &[u8],
+    use_heap: bool,
+    geoms: &[TriangleGeom<'_>],
+    insts: &[InstanceSpec],
     out_dwords: u32,
 ) -> Result<Vec<u32>, String> {
     let dev = &host.device;
@@ -834,22 +856,26 @@ fn run_rayquery_gpu(
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
         )?;
 
-        let instance_desc = D3D12_RAYTRACING_INSTANCE_DESC {
-            Transform: inst.transform,
-            _bitfield1: (inst.instance_id & 0x00FF_FFFF) | (u32::from(inst.instance_mask) << 24),
-            _bitfield2: (inst.contrib & 0x00FF_FFFF) | (u32::from(inst.flags) << 24),
-            AccelerationStructure: blas.GetGPUVirtualAddress(),
-        };
+        let instance_descs: Vec<D3D12_RAYTRACING_INSTANCE_DESC> = insts
+            .iter()
+            .map(|inst| D3D12_RAYTRACING_INSTANCE_DESC {
+                Transform: inst.transform,
+                _bitfield1: (inst.instance_id & 0x00FF_FFFF)
+                    | (u32::from(inst.instance_mask) << 24),
+                _bitfield2: (inst.contrib & 0x00FF_FFFF) | (u32::from(inst.flags) << 24),
+                AccelerationStructure: blas.GetGPUVirtualAddress(),
+            })
+            .collect();
         let inst_bytes = std::slice::from_raw_parts(
-            (&raw const instance_desc).cast::<u8>(),
-            size_of::<D3D12_RAYTRACING_INSTANCE_DESC>(),
+            instance_descs.as_ptr().cast::<u8>(),
+            instance_descs.len() * size_of::<D3D12_RAYTRACING_INSTANCE_DESC>(),
         );
         let inst_buf = upload_bytes(inst_bytes)?;
 
         let tlas_inputs = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
             Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL,
             Flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE,
-            NumDescs: 1,
+            NumDescs: instance_descs.len() as u32,
             DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
             Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
                 InstanceDescs: inst_buf.GetGPUVirtualAddress(),
@@ -1425,4 +1451,1084 @@ fn gpu_rayquery_front_back_track_two_pass_opaque() {
         "lane 5 minFrontFaceT got {}, want 1.5",
         f32::from_bits(l5[2])
     );
+}
+
+/// `[numthreads(3, 1, 1)]` compute shader generated directly via `emit_ray_loop` for a
+/// stateless `FORCE_NON_OPAQUE` `AnyHit` loop in speculative opaque fast-path mode:
+/// - Rejects `GeometryIndex == 1`, accepts all other geometries.
+/// - Exercises Pass 1 accept (lane 0), Pass 1 reject -> Pass 2 exact fallback (lane 1),
+///   and Pass 1 miss -> skip AnyHit + Pass 2 (lane 2), with non-zero `t_min = 0.5`.
+fn emit_fno_speculative_cs() -> Vec<u8> {
+    use super::rayquery_lift::{
+        AnyHitInfo, CandidateInput, RayInput, RayLoop, RayLoopKind, RayMetaKind, RayOutput,
+        RayOutputBinding, RayTemplate, ResolvedRayInputs, emit_ray_loop, emit_ray_meta_load,
+        ray_flag,
+    };
+    use crate::ir::Value;
+    use std::collections::HashMap;
+
+    let mut s = Shader::new(false);
+    s.threads = Some([3, 1, 1]);
+    let entry = s.entry;
+    let anyhit_body = s.m.new_block();
+    let done = s.m.new_block();
+
+    let uav = s.root_uav_handle(0);
+    let tlas = s.rtas_root_srv_handle(entry, 0);
+
+    let i32t = s.t.i32;
+    let tid = s.op(
+        entry,
+        "flattenedThreadIdInGroup.i32",
+        Attr::ReadNone,
+        i32t,
+        96,
+        &[],
+    );
+    let zero_i = s.m.i32(0);
+    let ten_f = s.m.f32(10.0f32.to_bits());
+    let tid_f = s.m.cast(entry, Cast::UiToFp, tid, s.t.f32);
+    let ox_f = s.m.bin(entry, Bin::Mul, tid_f, ten_f);
+    let ox = s.m.cast(entry, Cast::Bitcast, ox_f, i32t);
+    let zero_f_i = s.m.i32(0.0f32.to_bits());
+    let one_f_i = s.m.i32(1.0f32.to_bits());
+    let t_min_i = s.m.i32(0.5f32.to_bits());
+    let t_max_i = s.m.i32(100.0f32.to_bits());
+
+    let guest_flags = ray_flag::FORCE_NON_OPAQUE | ray_flag::SKIP_PROCEDURAL_PRIMITIVES;
+    let alloc_flags = ray_flag::SKIP_PROCEDURAL_PRIMITIVES;
+    let rl = RayLoop {
+        rq_group: 0,
+        entry_block: 1,
+        exit_block: 3,
+        exit_pred: 1,
+        skipped_blocks: vec![],
+        template: RayTemplate::Bvh64,
+        kind: RayLoopKind::AnyHit(AnyHitInfo {
+            opacity_block: 1,
+            entry_block: 2,
+            tail_block: 2,
+            body_blocks: vec![2],
+            skipped_tail_insts: vec![],
+            accept_mask: Value(20),
+            accept_invert: false,
+            accept_first_hit: false,
+            inputs: vec![(Value(15), CandidateInput::RayT)],
+            const_lane_atoms: vec![],
+            state_vars: vec![],
+            cand_meta_loads: vec![],
+        }),
+        tlas_load: (0, 0),
+        tlas_root_load: None,
+        active_ray_mask: None,
+        origin: [RayInput::Val(Value(1)); 3],
+        t_min: Some(RayInput::Val(Value(2))),
+        dir: [RayInput::Val(Value(3)); 3],
+        t_max: RayInput::Val(Value(4)),
+        instance_mask: RayInput::Const(0xFF),
+        ray_flags: RayInput::Const(guest_flags),
+        outputs: vec![
+            RayOutputBinding {
+                value: Value(10),
+                output: RayOutput::CommittedStatusTriNode,
+                fallback: Some(Value(0)),
+            },
+            RayOutputBinding {
+                value: Value(11),
+                output: RayOutput::CommittedRayT,
+                fallback: Some(Value(4)),
+            },
+            RayOutputBinding {
+                value: Value(12),
+                output: RayOutput::CommittedGeometryIndex,
+                fallback: None,
+            },
+            RayOutputBinding {
+                value: Value(13),
+                output: RayOutput::CommittedPrimitiveIndex,
+                fallback: None,
+            },
+        ],
+        committed_meta_loads: vec![],
+    };
+
+    let rq = s.allocate_ray_query(entry, alloc_flags);
+    let mut fallbacks = HashMap::new();
+    fallbacks.insert(Value(0), zero_i);
+    fallbacks.insert(Value(4), t_max_i);
+    let inputs = ResolvedRayInputs {
+        rq,
+        rq_opaque: None,
+        two_pass_early_fields: None,
+        tlas,
+        active_ray: None,
+        origin: [ox, zero_f_i, zero_f_i],
+        t_min: Some(t_min_i),
+        dir: [zero_f_i, zero_f_i, one_f_i],
+        t_max: t_max_i,
+        instance_mask: None,
+        ray_flags: None,
+        group_const_flags: alloc_flags,
+        group_opaque_const_flags: 0,
+        fbt_split_mask: 0,
+        init_min_front_t: None,
+        anyhit_inits: vec![],
+        anyhit_entry_dxil: Some(anyhit_body),
+        fallbacks,
+    };
+
+    let emitted = emit_ray_loop(&mut s, entry, done, &rl, &inputs);
+    let pending = emitted.pending_anyhit.expect("pending anyhit");
+    let spec = pending.spec.expect("speculative FNO metadata");
+
+    // AnyHit body: read GeometryIndexShl8 guarded by `spec_phi`, reject geom 1 (`1 << 8 = 256`).
+    let b_comm = s.m.new_block();
+    let b_cand = s.m.new_block();
+    let b_join = s.m.new_block();
+    s.m.terminate(anyhit_body, Term::CondBr(spec.spec_phi, b_comm, b_cand));
+    let g_comm =
+        emit_ray_meta_load(&mut s, b_comm, rq, false, RayMetaKind::GeometryIndexShl8, 1, None)[0];
+    s.m.terminate(b_comm, Term::Br(b_join));
+    let g_cand =
+        emit_ray_meta_load(&mut s, b_cand, rq, true, RayMetaKind::GeometryIndexShl8, 1, None)[0];
+    s.m.terminate(b_cand, Term::Br(b_join));
+    let g_phi = s.m.phi(b_join, i32t);
+    s.m.set_phi(g_phi, vec![(g_comm, b_comm), (g_cand, b_cand)]);
+    let reject_val = s.m.i32(1 << 8);
+    let accept = s.m.cmp(b_join, pred::NE, g_phi, reject_val);
+    s.m.terminate(
+        b_join,
+        Term::CondBr(spec.spec_phi, spec.spec_decide_blk, spec.non_spec_decide_blk),
+    );
+    s.m.terminate(
+        spec.spec_decide_blk,
+        Term::CondBr(accept, spec.after_blk, spec.p2_trace_blk),
+    );
+    s.m.terminate(
+        spec.non_spec_decide_blk,
+        Term::CondBr(accept, pending.do_commit_blk, pending.latch_blk),
+    );
+
+    let stride = s.m.i32(PROCEED_LANE_STRIDE_DWORDS * 4);
+    let base = s.m.bin(done, Bin::Mul, tid, stride);
+    for (k, &val_id) in [Value(10), Value(11), Value(12), Value(13)].iter().enumerate() {
+        let v = emitted.outs.iter().find(|&&(id, _)| id == val_id).unwrap().1;
+        let off = byte_offset(&mut s, done, base, k as u32);
+        store_i32(&mut s, done, uav, off, v);
+    }
+
+    s.m.terminate(done, Term::Ret);
+    s.finish()
+}
+
+#[test]
+fn gpu_rayquery_fno_speculative_opaque_fast_path() {
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let dxil = emit_fno_speculative_cs();
+    validate_dxil("fno_speculative_fast_path", &dxil);
+
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; skipped");
+        return;
+    };
+    if !has_raytracing_tier_1_1(&host) {
+        eprintln!("hardware device lacks DXR Tier 1.1; skipped");
+        return;
+    }
+
+    // Lane 0 (x=0): geom 0 (OPAQUE at z=2.0) -> accepted on Pass 1 fast-path!
+    let g0 = [[-2.0f32, -2.0, 2.0], [2.0, -2.0, 2.0], [0.0, 2.0, 2.0]];
+    // Lane 1 (x=10): geom 1 (OPAQUE at z=2.0, rejected!) before geom 2 (OPAQUE at z=5.0, accepted!)
+    // -> Pass 1 hits geom 1, AnyHit rejects it, Pass 2 exact fallback commits geom 2!
+    let g1 = [[8.0f32, -2.0, 2.0], [12.0, -2.0, 2.0], [10.0, 2.0, 2.0]];
+    let g2 = [[8.0f32, -2.0, 5.0], [12.0, -2.0, 5.0], [10.0, 2.0, 5.0]];
+    // Lane 2 (x=20): no geometry -> Pass 1 miss skips AnyHit and Pass 2!
+    let geoms = [
+        TriangleGeom {
+            vertices: &g0,
+            flags: D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE,
+        },
+        TriangleGeom {
+            vertices: &g1,
+            flags: D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE,
+        },
+        TriangleGeom {
+            vertices: &g2,
+            flags: D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE,
+        },
+    ];
+    let inst = InstanceSpec {
+        transform: [
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+        ],
+        instance_id: 0,
+        instance_mask: 0xFF,
+        contrib: 0,
+        flags: 0,
+    };
+
+    let out = run_rayquery_gpu(
+        &host,
+        &dxil,
+        false,
+        &geoms,
+        &inst,
+        3 * PROCEED_LANE_STRIDE_DWORDS,
+    )
+    .unwrap_or_else(|e| panic!("fno speculative run_rayquery_gpu failed: {e}"));
+
+    let stride = PROCEED_LANE_STRIDE_DWORDS as usize;
+    let l0 = &out[0..stride];
+    assert_eq!(l0[0], 1, "lane 0 (Pass 1 accept) CommittedStatus");
+    assert!(
+        (f32::from_bits(l0[1]) - 2.0).abs() < 1e-4,
+        "lane 0 CommittedRayT got {}, want 2.0 (t_min=0.5)",
+        f32::from_bits(l0[1])
+    );
+    assert_eq!(l0[2], 0, "lane 0 CommittedGeometryIndex (geom 0)");
+
+    let l1 = &out[stride..2 * stride];
+    assert_eq!(l1[0], 1, "lane 1 (Pass 1 reject -> Pass 2 fallback) CommittedStatus");
+    assert!(
+        (f32::from_bits(l1[1]) - 5.0).abs() < 1e-4,
+        "lane 1 CommittedRayT got {}, want 5.0",
+        f32::from_bits(l1[1])
+    );
+    assert_eq!(l1[2], 2, "lane 1 CommittedGeometryIndex (geom 2)");
+
+    let l2 = &out[2 * stride..3 * stride];
+    assert_eq!(l2[0], 0, "lane 2 (Pass 1 miss) CommittedStatus");
+    assert!(
+        (f32::from_bits(l2[1]) - 100.0).abs() < 1e-4,
+        "lane 2 CommittedRayT miss fallback got {}, want 100.0",
+        f32::from_bits(l2[1])
+    );
+}
+
+/// `[numthreads(4, 1, 1)]` compute shader testing exact 3-pass mask-split `FrontBackTrack`
+/// (`fbt_split_mask = 0x80`, single `RayQuery` handle) across single-sided (`mask=0x7F`) and
+/// `TRIANGLE_CULL_DISABLE` double-sided (`mask=0x80`) instances.
+fn emit_front_back_track_mask_split_cs() -> Vec<u8> {
+    use super::rayquery_lift::{
+        RayInput, RayLoop, RayLoopKind, RayOutput, RayOutputBinding, RayTemplate,
+        ResolvedRayInputs, collect_early_q1_fields, emit_ray_loop, ray_flag,
+    };
+    use crate::ir::Value;
+    use std::collections::HashMap;
+
+    let mut s = Shader::new(false);
+    s.threads = Some([4, 1, 1]);
+    let entry = s.entry;
+    let done = s.m.new_block();
+
+    let uav = s.root_uav_handle(0);
+    let tlas = s.rtas_root_srv_handle(entry, 0);
+
+    let i32t = s.t.i32;
+    let tid = s.op(
+        entry,
+        "flattenedThreadIdInGroup.i32",
+        Attr::ReadNone,
+        i32t,
+        96,
+        &[],
+    );
+    let zero_i = s.m.i32(0);
+    let ten_f = s.m.f32(10.0f32.to_bits());
+    let tid_f = s.m.cast(entry, Cast::UiToFp, tid, s.t.f32);
+    let ox_f = s.m.bin(entry, Bin::Mul, tid_f, ten_f);
+    let ox = s.m.cast(entry, Cast::Bitcast, ox_f, i32t);
+    let zero_f_i = s.m.i32(0.0f32.to_bits());
+    let one_f_i = s.m.i32(1.0f32.to_bits());
+    let t_min_i = s.m.i32(0.001f32.to_bits());
+    let t_max_i = s.m.i32(100.0f32.to_bits());
+
+    let guest_flags = ray_flag::FORCE_NON_OPAQUE | ray_flag::SKIP_PROCEDURAL_PRIMITIVES;
+    let alloc_flags = ray_flag::SKIP_PROCEDURAL_PRIMITIVES;
+    let rl = RayLoop {
+        rq_group: 0,
+        entry_block: 1,
+        exit_block: 2,
+        exit_pred: 1,
+        skipped_blocks: vec![],
+        template: RayTemplate::Bvh64,
+        kind: RayLoopKind::FrontBackTrack {
+            init_min_front_t: RayInput::Val(Value(7)),
+        },
+        tlas_load: (0, 0),
+        tlas_root_load: None,
+        active_ray_mask: None,
+        origin: [RayInput::Val(Value(1)); 3],
+        t_min: Some(RayInput::Val(Value(2))),
+        dir: [RayInput::Val(Value(3)); 3],
+        t_max: RayInput::Val(Value(7)),
+        instance_mask: RayInput::Const(0xFF),
+        ray_flags: RayInput::Const(guest_flags),
+        outputs: vec![
+            RayOutputBinding {
+                value: Value(10),
+                output: RayOutput::CommittedStatusTriNode,
+                fallback: Some(Value(0)),
+            },
+            RayOutputBinding {
+                value: Value(11),
+                output: RayOutput::CommittedRayT,
+                fallback: Some(Value(7)),
+            },
+            RayOutputBinding {
+                value: Value(12),
+                output: RayOutput::FrontBackMinFrontT,
+                fallback: Some(Value(7)),
+            },
+            RayOutputBinding {
+                value: Value(13),
+                output: RayOutput::CommittedFrontFace,
+                fallback: Some(Value(0)),
+            },
+            RayOutputBinding {
+                value: Value(14),
+                output: RayOutput::CommittedGeometryIndex,
+                fallback: None,
+            },
+            RayOutputBinding {
+                value: Value(15),
+                output: RayOutput::CommittedInstanceId,
+                fallback: None,
+            },
+            RayOutputBinding {
+                value: Value(16),
+                output: RayOutput::CommittedPrimitiveIndex,
+                fallback: None,
+            },
+        ],
+        committed_meta_loads: vec![],
+    };
+
+    let rq = s.allocate_ray_query(entry, alloc_flags);
+    let mut fallbacks = HashMap::new();
+    fallbacks.insert(Value(0), zero_i);
+    fallbacks.insert(Value(7), t_max_i);
+    let inputs = ResolvedRayInputs {
+        rq,
+        rq_opaque: None,
+        two_pass_early_fields: Some(collect_early_q1_fields(&rl, &[])),
+        tlas,
+        active_ray: None,
+        origin: [ox, zero_f_i, zero_f_i],
+        t_min: Some(t_min_i),
+        dir: [zero_f_i, zero_f_i, one_f_i],
+        t_max: t_max_i,
+        instance_mask: None,
+        ray_flags: None,
+        group_const_flags: alloc_flags,
+        group_opaque_const_flags: 0,
+        fbt_split_mask: 0x80,
+        init_min_front_t: Some(t_max_i),
+        anyhit_inits: vec![],
+        anyhit_entry_dxil: None,
+        fallbacks,
+    };
+
+    let emitted = emit_ray_loop(&mut s, entry, done, &rl, &inputs);
+    let stride = s.m.i32(FBT_LANE_STRIDE_DWORDS * 4);
+    let base = s.m.bin(done, Bin::Mul, tid, stride);
+    for (k, &(_, val)) in emitted.outs.iter().enumerate() {
+        let off = byte_offset(&mut s, done, base, k as u32);
+        store_i32(&mut s, done, uav, off, val);
+    }
+
+    s.m.terminate(done, Term::Ret);
+    s.finish()
+}
+
+#[test]
+fn gpu_rayquery_front_back_track_mask_split_exact() {
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let dxil = emit_front_back_track_mask_split_cs();
+    validate_dxil("front_back_track_mask_split_exact", &dxil);
+
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; skipped");
+        return;
+    };
+    if !has_raytracing_tier_1_1(&host) {
+        eprintln!("hardware device lacks DXR Tier 1.1; skipped");
+        return;
+    }
+
+    let front_tri = |x: f32, z: f32| [[x - 2.0, -2.0, z], [x, 2.0, z], [x + 2.0, -2.0, z]];
+    let back_tri = |x: f32, z: f32| [[x - 2.0, -2.0, z], [x + 2.0, -2.0, z], [x, 2.0, z]];
+
+    // Single-sided instance (tx = 0, mask = 0x7F) sees geoms placed at x = 0..30:
+    //   Lane 1 (x=10): single-sided back at z=4.0 (geom 0)
+    //   Lane 2 (x=20): single-sided back at z=6.0 (geom 1)
+    //   Lane 3 (x=30): single-sided front at z=3.0 (geom 2)
+    // Double-sided TRIANGLE_CULL_DISABLE instance (tx = -100, mask = 0x80) sees geoms at x = 100..130:
+    //   Lane 0 (x=100->0): double-sided front at z=2.0 (geom 3) + double-sided back at z=6.0 (geom 4)
+    //   Lane 1 (x=110->10): double-sided back at z=10.0 (geom 5, FARTHER than ss back 4.0!)
+    //                     + double-sided front at z=50.0 (geom 6, must still update minFrontFaceT!)
+    //   Lane 2 (x=120->20): double-sided back at z=2.0 (geom 7, CLOSER than ss back 6.0!)
+    let g0 = back_tri(10.0, 4.0);
+    let g1 = back_tri(20.0, 6.0);
+    let g2 = front_tri(30.0, 3.0);
+    let g3 = front_tri(100.0, 2.0);
+    let g4 = back_tri(100.0, 6.0);
+    let g5 = back_tri(110.0, 10.0);
+    let g6 = front_tri(110.0, 50.0);
+    let g7 = back_tri(120.0, 2.0);
+    let geoms = [
+        TriangleGeom { vertices: &g0, flags: D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE },
+        TriangleGeom { vertices: &g1, flags: D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE },
+        TriangleGeom { vertices: &g2, flags: D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE },
+        TriangleGeom { vertices: &g3, flags: D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE },
+        TriangleGeom { vertices: &g4, flags: D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE },
+        TriangleGeom { vertices: &g5, flags: D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE },
+        TriangleGeom { vertices: &g6, flags: D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE },
+        TriangleGeom { vertices: &g7, flags: D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE },
+    ];
+    let insts = [
+        InstanceSpec {
+            transform: [
+                1.0, 0.0, 0.0, 0.0,
+                0.0, 1.0, 0.0, 0.0,
+                0.0, 0.0, 1.0, 0.0,
+            ],
+            instance_id: 0x1111,
+            instance_mask: 0x7F,
+            contrib: 0,
+            flags: 0,
+        },
+        InstanceSpec {
+            transform: [
+                1.0, 0.0, 0.0, -100.0,
+                0.0, 1.0, 0.0, 0.0,
+                0.0, 0.0, 1.0, 0.0,
+            ],
+            instance_id: 0x2222,
+            instance_mask: 0x80,
+            contrib: 0,
+            // D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE = 1
+            flags: 1,
+        },
+    ];
+
+    let out = run_rayquery_gpu_instances(
+        &host,
+        &dxil,
+        false,
+        &geoms,
+        &insts,
+        4 * FBT_LANE_STRIDE_DWORDS,
+    )
+    .unwrap_or_else(|e| panic!("mask-split FrontBackTrack run_rayquery_gpu_instances failed: {e}"));
+
+    let stride = FBT_LANE_STRIDE_DWORDS as usize;
+    let lane = |k: usize| &out[k * stride..(k + 1) * stride];
+
+    // Lane 0: double-sided front (z=2) + double-sided back (z=6) on TRIANGLE_CULL_DISABLE.
+    let l0 = lane(0);
+    assert_eq!(l0[0], 1, "lane 0 CommittedStatus");
+    assert!((f32::from_bits(l0[1]) - 6.0).abs() < 1e-4, "lane 0 CommittedRayT got {}, want 6.0", f32::from_bits(l0[1]));
+    assert!((f32::from_bits(l0[2]) - 2.0).abs() < 1e-4, "lane 0 minFrontFaceT got {}, want 2.0", f32::from_bits(l0[2]));
+    assert_eq!(l0[3], 0xFF, "lane 0 CommittedFrontFace must be back (0xFF)");
+    assert_eq!(l0[4], 4, "lane 0 CommittedGeometryIndex (ds back geom 4)");
+    assert_eq!(l0[5], 0x2222, "lane 0 CommittedInstanceId (ds instance)");
+
+    // Lane 1: single-sided back (z=4) beats farther double-sided back (z=10), while double-sided front (z=50) updates minFrontFaceT!
+    let l1 = lane(1);
+    assert_eq!(l1[0], 1, "lane 1 CommittedStatus");
+    assert!((f32::from_bits(l1[1]) - 4.0).abs() < 1e-4, "lane 1 CommittedRayT got {}, want 4.0 (ss back wins)", f32::from_bits(l1[1]));
+    assert!((f32::from_bits(l1[2]) - 50.0).abs() < 1e-4, "lane 1 minFrontFaceT got {}, want 50.0 (ds front tracked)", f32::from_bits(l1[2]));
+    assert_eq!(l1[3], 0xFF, "lane 1 CommittedFrontFace must be back (0xFF)");
+    assert_eq!(l1[4], 0, "lane 1 CommittedGeometryIndex (ss back geom 0)");
+    assert_eq!(l1[5], 0x1111, "lane 1 CommittedInstanceId (ss instance)");
+
+    // Lane 2: closer double-sided back (z=2) beats farther single-sided back (z=6).
+    let l2 = lane(2);
+    assert_eq!(l2[0], 1, "lane 2 CommittedStatus");
+    assert!((f32::from_bits(l2[1]) - 2.0).abs() < 1e-4, "lane 2 CommittedRayT got {}, want 2.0 (ds back wins)", f32::from_bits(l2[1]));
+    assert!((f32::from_bits(l2[2]) - 100.0).abs() < 1e-4, "lane 2 minFrontFaceT got {}, want 100.0", f32::from_bits(l2[2]));
+    assert_eq!(l2[4], 7, "lane 2 CommittedGeometryIndex (ds back geom 7)");
+    assert_eq!(l2[5], 0x2222, "lane 2 CommittedInstanceId (ds instance)");
+
+    // Lane 3: single-sided front-only (z=3) -> no back-face hit, minFrontFaceT=3.0.
+    let l3 = lane(3);
+    assert_eq!(l3[0], 0, "lane 3 CommittedStatus");
+    assert!((f32::from_bits(l3[1]) - 100.0).abs() < 1e-4, "lane 3 CommittedRayT got {}, want 100.0", f32::from_bits(l3[1]));
+    assert!((f32::from_bits(l3[2]) - 3.0).abs() < 1e-4, "lane 3 minFrontFaceT got {}, want 3.0", f32::from_bits(l3[2]));
+}
+
+/// `[numthreads(4, 1, 1)]` compute shader testing speculative opaque fast-path with BOTH
+/// dynamic `ray_flags` (`RayInput::Val`) and loop-carried `AnyHit` `state_vars` (`min_portal_t`,
+/// initialized to `10000.0`, updated on rejected geom 1 portal hits), exercising `cand_check_blk`,
+/// `latch_phis`, `ah_state_phis`, and `final_state_phis` on live DXR 1.1 hardware.
+fn emit_fno_speculative_state_dyn_cs() -> Vec<u8> {
+    use super::rayquery_lift::{
+        AnyHitInfo, AnyHitStateVar, CandidateInput, RayInput, RayLoop, RayLoopKind, RayMetaKind,
+        RayOutput, RayOutputBinding, RayTemplate, ResolvedRayInputs, emit_ray_loop,
+        emit_ray_meta_load, ray_flag,
+    };
+    use crate::ir::Value;
+    use std::collections::HashMap;
+
+    let mut s = Shader::new(false);
+    s.threads = Some([4, 1, 1]);
+    let entry = s.entry;
+    let anyhit_body = s.m.new_block();
+    let done = s.m.new_block();
+
+    let uav = s.root_uav_handle(0);
+    let tlas = s.rtas_root_srv_handle(entry, 0);
+
+    let i32t = s.t.i32;
+    let f32t = s.t.f32;
+    let tid = s.op(
+        entry,
+        "flattenedThreadIdInGroup.i32",
+        Attr::ReadNone,
+        i32t,
+        96,
+        &[],
+    );
+    let zero_i = s.m.i32(0);
+    let ten_f = s.m.f32(10.0f32.to_bits());
+    let tid_f = s.m.cast(entry, Cast::UiToFp, tid, f32t);
+    let ox_f = s.m.bin(entry, Bin::Mul, tid_f, ten_f);
+    let ox = s.m.cast(entry, Cast::Bitcast, ox_f, i32t);
+    let zero_f_i = s.m.i32(0.0f32.to_bits());
+    let one_f_i = s.m.i32(1.0f32.to_bits());
+    let t_min_i = s.m.i32(0.5f32.to_bits());
+    let t_max_i = s.m.i32(100.0f32.to_bits());
+    let init_portal_t_i = s.m.i32(10000.0f32.to_bits());
+
+    // Lanes 0, 1, 2 pass FORCE_NON_OPAQUE (triggers speculative Pass 1);
+    // Lane 3 passes FORCE_OPAQUE (dynamic guard bypasses Pass 1 directly to Pass 2).
+    let three = s.m.i32(3);
+    let is_lane3 = s.m.cmp(entry, pred::EQ, tid, three);
+    let f_fo = s.m.i32(ray_flag::FORCE_OPAQUE);
+    let f_fno = s.m.i32(ray_flag::FORCE_NON_OPAQUE);
+    let dyn_flags = s.m.select(entry, is_lane3, f_fo, f_fno);
+
+    let rl = RayLoop {
+        rq_group: 0,
+        entry_block: 1,
+        exit_block: 3,
+        exit_pred: 1,
+        skipped_blocks: vec![],
+        template: RayTemplate::Bvh64,
+        kind: RayLoopKind::AnyHit(AnyHitInfo {
+            opacity_block: 1,
+            entry_block: 2,
+            tail_block: 2,
+            body_blocks: vec![2],
+            skipped_tail_insts: vec![],
+            accept_mask: Value(99),
+            accept_invert: false,
+            accept_first_hit: false,
+            inputs: vec![
+                (Value(20), CandidateInput::RayT),
+                (Value(21), CandidateInput::StateVar(0)),
+            ],
+            const_lane_atoms: vec![],
+            state_vars: vec![AnyHitStateVar {
+                reg: crate::ir::Reg::V(10),
+                init: RayInput::Val(Value(5)),
+                next: Value(22),
+            }],
+            cand_meta_loads: vec![],
+        }),
+        tlas_load: (0, 0),
+        tlas_root_load: None,
+        active_ray_mask: None,
+        origin: [RayInput::Val(Value(1)); 3],
+        t_min: Some(RayInput::Val(Value(2))),
+        dir: [RayInput::Val(Value(3)); 3],
+        t_max: RayInput::Val(Value(4)),
+        instance_mask: RayInput::Const(0xFF),
+        ray_flags: RayInput::Val(Value(6)),
+        outputs: vec![
+            RayOutputBinding {
+                value: Value(10),
+                output: RayOutput::CommittedStatusTriNode,
+                fallback: Some(Value(0)),
+            },
+            RayOutputBinding {
+                value: Value(11),
+                output: RayOutput::CommittedRayT,
+                fallback: Some(Value(4)),
+            },
+            RayOutputBinding {
+                value: Value(12),
+                output: RayOutput::CommittedGeometryIndex,
+                fallback: None,
+            },
+            RayOutputBinding {
+                value: Value(13),
+                output: RayOutput::AnyHitState(0),
+                fallback: None,
+            },
+        ],
+        committed_meta_loads: vec![],
+    };
+
+    let rq = s.allocate_ray_query(entry, 0);
+    let mut fallbacks = HashMap::new();
+    fallbacks.insert(Value(0), zero_i);
+    fallbacks.insert(Value(4), t_max_i);
+    let inputs = ResolvedRayInputs {
+        rq,
+        rq_opaque: None,
+        two_pass_early_fields: None,
+        tlas,
+        active_ray: None,
+        origin: [ox, zero_f_i, zero_f_i],
+        t_min: Some(t_min_i),
+        dir: [zero_f_i, zero_f_i, one_f_i],
+        t_max: t_max_i,
+        instance_mask: None,
+        ray_flags: Some(dyn_flags),
+        group_const_flags: 0,
+        group_opaque_const_flags: 0,
+        fbt_split_mask: 0,
+        init_min_front_t: None,
+        anyhit_inits: vec![init_portal_t_i],
+        anyhit_entry_dxil: Some(anyhit_body),
+        fallbacks,
+    };
+
+    let emitted = emit_ray_loop(&mut s, entry, done, &rl, &inputs);
+    let pending = emitted.pending_anyhit.expect("pending anyhit");
+    let spec = pending.spec.as_ref().expect("speculative FNO metadata");
+    let cand_t_i = emitted.outs.iter().find(|&&(id, _)| id == Value(20)).unwrap().1;
+    let state_in_i = emitted.outs.iter().find(|&&(id, _)| id == Value(21)).unwrap().1;
+
+    // AnyHit body: reject geom 1 (`1 << 8`), and when rejecting geom 1 update state_var = min(state, cand_t).
+    let b_comm = s.m.new_block();
+    let b_cand = s.m.new_block();
+    let b_join = s.m.new_block();
+    s.m.terminate(anyhit_body, Term::CondBr(spec.spec_phi, b_comm, b_cand));
+    let g_comm =
+        emit_ray_meta_load(&mut s, b_comm, rq, false, RayMetaKind::GeometryIndexShl8, 1, None)[0];
+    s.m.terminate(b_comm, Term::Br(b_join));
+    let g_cand =
+        emit_ray_meta_load(&mut s, b_cand, rq, true, RayMetaKind::GeometryIndexShl8, 1, None)[0];
+    s.m.terminate(b_cand, Term::Br(b_join));
+    let g_phi = s.m.phi(b_join, i32t);
+    s.m.set_phi(g_phi, vec![(g_comm, b_comm), (g_cand, b_cand)]);
+
+    let portal_val = s.m.i32(1 << 8);
+    let portal3_val = s.m.i32(3 << 8);
+    let is_g1 = s.m.cmp(b_join, pred::EQ, g_phi, portal_val);
+    let is_g3 = s.m.cmp(b_join, pred::EQ, g_phi, portal3_val);
+    let is_portal = s.m.bin(b_join, Bin::Or, is_g1, is_g3);
+    let true_b = s.m.bool(true);
+    let accept = s.m.bin(b_join, Bin::Xor, is_portal, true_b);
+
+    let cand_t_f = s.m.cast(b_join, Cast::Bitcast, cand_t_i, f32t);
+    let state_in_f = s.m.cast(b_join, Cast::Bitcast, state_in_i, f32t);
+    let t_lt = s.m.cmp(b_join, pred::OLT, cand_t_f, state_in_f);
+    let min_t_f = s.m.select(b_join, t_lt, cand_t_f, state_in_f);
+    let min_t_i = s.m.cast(b_join, Cast::Bitcast, min_t_f, i32t);
+    let next_state = s.m.select(b_join, is_portal, min_t_i, state_in_i);
+
+    s.m.terminate(
+        b_join,
+        Term::CondBr(spec.spec_phi, spec.spec_decide_blk, spec.non_spec_decide_blk),
+    );
+    s.m.terminate(
+        spec.spec_decide_blk,
+        Term::CondBr(accept, spec.after_blk, spec.p2_trace_blk),
+    );
+    s.m.terminate(
+        spec.non_spec_decide_blk,
+        Term::CondBr(accept, pending.do_commit_blk, pending.latch_blk),
+    );
+    let cb = pending.cand_check_blk.expect("dynamic flags keeps cand_check_blk");
+    s.m.set_phi(
+        pending.latch_phis[0],
+        vec![
+            (pending.state_phis[0], cb),
+            (next_state, spec.non_spec_decide_blk),
+            (next_state, pending.do_commit_blk),
+        ],
+    );
+    let mut hdr_inc = vec![
+        (pending.init_vals[0], spec.p1_check_blk),
+        (pending.init_vals[0], spec.spec_decide_blk),
+        (pending.latch_phis[0], pending.latch_blk),
+    ];
+    if let Some(bypass) = spec.dyn_bypass_blk {
+        hdr_inc.push((pending.init_vals[0], bypass));
+    }
+    s.m.set_phi(pending.state_phis[0], hdr_inc);
+    s.m.set_phi(
+        spec.final_state_phis[0],
+        vec![
+            (pending.init_vals[0], spec.p1_check_blk),
+            (next_state, spec.spec_decide_blk),
+            (pending.state_phis[0], spec.proceed_blk),
+        ],
+    );
+
+    let stride = s.m.i32(PROCEED_LANE_STRIDE_DWORDS * 4);
+    let base = s.m.bin(done, Bin::Mul, tid, stride);
+    for (k, &val_id) in [Value(10), Value(11), Value(12), Value(13)].iter().enumerate() {
+        let v = emitted.outs.iter().find(|&&(id, _)| id == val_id).unwrap().1;
+        let off = byte_offset(&mut s, done, base, k as u32);
+        store_i32(&mut s, done, uav, off, v);
+    }
+
+    s.m.terminate(done, Term::Ret);
+    s.finish()
+}
+
+#[test]
+fn gpu_rayquery_fno_speculative_state_vars_and_dynamic_flags() {
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let dxil = emit_fno_speculative_state_dyn_cs();
+    validate_dxil("fno_speculative_state_dyn", &dxil);
+
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; skipped");
+        return;
+    };
+    if !has_raytracing_tier_1_1(&host) {
+        eprintln!("hardware device lacks DXR Tier 1.1; skipped");
+        return;
+    }
+
+    // Lane 0 (x=0): geom 0 (solid at z=2.0) -> Pass 1 accept; state stays 10000.0.
+    let g0 = [[-2.0f32, -2.0, 2.0], [2.0, -2.0, 2.0], [0.0, 2.0, 2.0]];
+    // Lane 1 (x=10): geom 1 (portal at z=2.0, rejected + updates state=2.0) before geom 2 (solid at z=5.0).
+    let g1 = [[8.0f32, -2.0, 2.0], [12.0, -2.0, 2.0], [10.0, 2.0, 2.0]];
+    let g2 = [[8.0f32, -2.0, 5.0], [12.0, -2.0, 5.0], [10.0, 2.0, 5.0]];
+    // Lane 2 (x=20): empty -> Pass 1 miss; state stays 10000.0.
+    // Lane 3 (x=30): geom 1 (at z=3.0) with dynamic FORCE_OPAQUE -> skips AnyHit completely, commits geom 1!
+    let g3_portal = [[28.0f32, -2.0, 3.0], [32.0, -2.0, 3.0], [30.0, 2.0, 3.0]];
+    let geoms = [
+        TriangleGeom {
+            vertices: &g0,
+            flags: D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE,
+        },
+        TriangleGeom {
+            vertices: &g1,
+            flags: D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE,
+        },
+        TriangleGeom {
+            vertices: &g2,
+            flags: D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE,
+        },
+        TriangleGeom {
+            vertices: &g3_portal,
+            flags: D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE,
+        },
+    ];
+    let inst = InstanceSpec {
+        transform: [
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+        ],
+        instance_id: 0,
+        instance_mask: 0xFF,
+        contrib: 0,
+        flags: 0,
+    };
+
+    let out = run_rayquery_gpu(
+        &host,
+        &dxil,
+        false,
+        &geoms,
+        &inst,
+        4 * PROCEED_LANE_STRIDE_DWORDS,
+    )
+    .unwrap_or_else(|e| panic!("fno speculative state+dyn run_rayquery_gpu failed: {e}"));
+
+    let stride = PROCEED_LANE_STRIDE_DWORDS as usize;
+    let lane = |k: usize| &out[k * stride..(k + 1) * stride];
+
+    let l0 = lane(0);
+    assert_eq!(l0[0], 1, "lane 0 Pass 1 accept status");
+    assert!((f32::from_bits(l0[1]) - 2.0).abs() < 1e-4, "lane 0 t got {}", f32::from_bits(l0[1]));
+    assert_eq!(l0[2], 0, "lane 0 geom 0");
+    assert!((f32::from_bits(l0[3]) - 10000.0).abs() < 1e-3, "lane 0 state untouched, got {}", f32::from_bits(l0[3]));
+
+    let l1 = lane(1);
+    assert_eq!(l1[0], 1, "lane 1 Pass 2 fallback status");
+    assert!((f32::from_bits(l1[1]) - 5.0).abs() < 1e-4, "lane 1 t got {}, want 5.0", f32::from_bits(l1[1]));
+    assert_eq!(l1[2], 2, "lane 1 geom 2");
+    assert!((f32::from_bits(l1[3]) - 2.0).abs() < 1e-4, "lane 1 portal state got {}, want 2.0", f32::from_bits(l1[3]));
+
+    let l2 = lane(2);
+    assert_eq!(l2[0], 0, "lane 2 miss status");
+    assert!((f32::from_bits(l2[3]) - 10000.0).abs() < 1e-3, "lane 2 miss state got {}", f32::from_bits(l2[3]));
+
+    let l3 = lane(3);
+    assert_eq!(l3[0], 1, "lane 3 dynamic FORCE_OPAQUE status");
+    assert!((f32::from_bits(l3[1]) - 3.0).abs() < 1e-4, "lane 3 t got {}, want 3.0", f32::from_bits(l3[1]));
+    assert_eq!(l3[2], 3, "lane 3 geom 3");
+    assert!((f32::from_bits(l3[3]) - 10000.0).abs() < 1e-3, "lane 3 state untouched, got {}", f32::from_bits(l3[3]));
+}
+
+#[test]
+fn gpu_tri_fetch_basis_octahedral_normals() {
+    use super::rayquery_lift::emit_tri_fetch_basis;
+    use super::shader::{
+        DXR_NORMALS_DATA_BASE, DXR_NORMALS_FALLBACK, DXR_NORMALS_GEOM_BASE, SLOT_DXR_NORMALS,
+        pack_oct_normal_u32,
+    };
+
+    let cases: &[[f32; 3]] = &[
+        [1.0, 0.0, 0.0],
+        [-1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, -1.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [0.0, 0.0, -1.0],
+        [1.0, 2.0, 3.0],
+        [-1.0, 2.0, 3.0],
+        [1.0, -2.0, 3.0],
+        [-1.0, -2.0, 3.0],
+        [1.0, 2.0, -3.0],
+        [-1.0, 2.0, -3.0],
+        [1.0, -2.0, -3.0],
+        [-1.0, -2.0, -3.0],
+        // Lane 14: fallback (`tlas_meta_base == 0`) must unpack word 0 -> (0, 0, 1).
+        [0.0, 0.0, 1.0],
+    ];
+    let n_lanes = cases.len() as u32;
+
+    let mut s = Shader::new(false);
+    s.threads = Some([n_lanes, 1, 1]);
+    let entry = s.entry;
+    let uav = s.root_uav_handle(0);
+    let i32t = s.t.i32;
+    let tid = s.op(
+        entry,
+        "flattenedThreadIdInGroup.i32",
+        Attr::ReadNone,
+        i32t,
+        96,
+        &[],
+    );
+    let last_lane = s.m.i32(n_lanes - 1);
+    let is_fallback = s.m.cmp(entry, pred::EQ, tid, last_lane);
+    let zero_i = s.m.i32(0);
+    let one_i = s.m.i32(1);
+    let tlas_base = s.m.select(entry, is_fallback, zero_i, one_i);
+    let inst_idx = s.m.i32(5);
+    let geom_idx = s.m.i32(2);
+    let t_vec = emit_tri_fetch_basis(&mut s, entry, tlas_base, inst_idx, geom_idx, tid, false, 3);
+    let b_vec = emit_tri_fetch_basis(&mut s, entry, tlas_base, inst_idx, geom_idx, tid, true, 3);
+    let stride = s.m.i32(6 * 4);
+    let base = s.m.bin(entry, Bin::Mul, tid, stride);
+    for k in 0..3 {
+        let off_t = byte_offset(&mut s, entry, base, k as u32);
+        store_i32(&mut s, entry, uav, off_t, t_vec[k]);
+        let off_b = byte_offset(&mut s, entry, base, (k + 3) as u32);
+        store_i32(&mut s, entry, uav, off_b, b_vec[k]);
+    }
+    s.m.terminate(entry, Term::Ret);
+    let dxil = s.finish();
+    validate_dxil("tri_fetch_basis_octahedral", &dxil);
+
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; skipped");
+        return;
+    };
+
+    // Populate a sparse `SLOT_DXR_NORMALS` buffer covering Region 0/1/2.
+    let total_words = (DXR_NORMALS_DATA_BASE + n_lanes + 16) as usize;
+    let mut table = vec![0u32; total_words];
+    table[0] = DXR_NORMALS_FALLBACK;
+    // TLAS slot base = 1, instance_index = 5 -> geom_table_off = GEOM_BASE + 10.
+    let geom_table_off = DXR_NORMALS_GEOM_BASE + 10;
+    table[(1 + 5) as usize] = geom_table_off;
+    // geom_index = 2 -> prim_data_off = DATA_BASE.
+    table[(geom_table_off + 2) as usize] = DXR_NORMALS_DATA_BASE;
+    for (i, &[nx, ny, nz]) in cases.iter().enumerate() {
+        table[(DXR_NORMALS_DATA_BASE as usize) + i] = pack_oct_normal_u32(nx, ny, nz);
+    }
+
+    let dev = &host.device;
+    let params = [
+        D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                    ShaderRegister: 0,
+                    RegisterSpace: ROOT_CBV_SPACE,
+                    Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        },
+        D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                    ShaderRegister: u32::from(SLOT_DXR_NORMALS),
+                    RegisterSpace: ROOT_CBV_SPACE,
+                    Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        },
+    ];
+    let rs_desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
+        Version: D3D_ROOT_SIGNATURE_VERSION_1_1,
+        Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
+            Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 {
+                NumParameters: params.len() as u32,
+                pParameters: params.as_ptr(),
+                NumStaticSamplers: 0,
+                pStaticSamplers: std::ptr::null(),
+                Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
+            },
+        },
+    };
+    let out: Vec<u32> = unsafe {
+        let mut blob = None;
+        let mut error = None;
+        D3D12SerializeVersionedRootSignature(&rs_desc, &mut blob, Some(&mut error)).unwrap();
+        let blob: ID3DBlob = blob.unwrap();
+        let rs_bytes = std::slice::from_raw_parts(
+            blob.GetBufferPointer().cast::<u8>(),
+            blob.GetBufferSize(),
+        );
+        let root_sig: ID3D12RootSignature = dev.CreateRootSignature(0, rs_bytes).unwrap();
+        let pso = host.compute_pipeline_with(&root_sig, &dxil).unwrap();
+        let queue: ID3D12CommandQueue = dev
+            .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                ..Default::default()
+            })
+            .unwrap();
+        let alloc: ID3D12CommandAllocator = dev
+            .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+            .unwrap();
+        let list: ID3D12GraphicsCommandList = dev
+            .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, &pso)
+            .unwrap();
+        let buf_desc = |size: u64, flags: D3D12_RESOURCE_FLAGS| D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: flags,
+            ..Default::default()
+        };
+        let make = |heap: D3D12_HEAP_TYPE, size: u64, flags, state| {
+            let mut r: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: heap, ..Default::default() },
+                D3D12_HEAP_FLAG_NONE,
+                &buf_desc(size, flags),
+                state,
+                None,
+                &mut r,
+            )
+            .unwrap();
+            r.unwrap()
+        };
+        let srv_bytes = (table.len() * 4) as u64;
+        let srv_buf = make(
+            D3D12_HEAP_TYPE_UPLOAD,
+            srv_bytes,
+            D3D12_RESOURCE_FLAG_NONE,
+            D3D12_RESOURCE_STATE_GENERIC_READ,
+        );
+        let mut p = std::ptr::null_mut();
+        srv_buf.Map(0, None, Some(&mut p)).unwrap();
+        std::ptr::copy_nonoverlapping(table.as_ptr().cast::<u8>(), p.cast::<u8>(), srv_bytes as usize);
+        srv_buf.Unmap(0, None);
+
+        let out_dwords = (n_lanes * 6) as usize;
+        let out_bytes = (out_dwords * 4).max(256) as u64;
+        let uav_buf = make(
+            D3D12_HEAP_TYPE_DEFAULT,
+            out_bytes,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        );
+        let rb_buf = make(
+            D3D12_HEAP_TYPE_READBACK,
+            out_bytes,
+            D3D12_RESOURCE_FLAG_NONE,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+        );
+        list.SetComputeRootSignature(&root_sig);
+        list.SetComputeRootUnorderedAccessView(0, uav_buf.GetGPUVirtualAddress());
+        list.SetComputeRootShaderResourceView(1, srv_buf.GetGPUVirtualAddress());
+        list.Dispatch(1, 1, 1);
+        let bar = D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                    pResource: std::mem::ManuallyDrop::new(Some(uav_buf.clone())),
+                    Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                    StateBefore: D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    StateAfter: D3D12_RESOURCE_STATE_COPY_SOURCE,
+                }),
+            },
+        };
+        list.ResourceBarrier(&[bar]);
+        list.CopyBufferRegion(&rb_buf, 0, &uav_buf, 0, out_bytes);
+        list.Close().unwrap();
+        let cmd_list: ID3D12CommandList = list.cast().unwrap();
+        queue.ExecuteCommandLists(&[Some(cmd_list)]);
+        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+        queue.Signal(&fence, 1).unwrap();
+        while fence.GetCompletedValue() < 1 {
+            std::thread::yield_now();
+        }
+        let mut rp = std::ptr::null_mut();
+        rb_buf.Map(0, None, Some(&mut rp)).unwrap();
+        let slice = std::slice::from_raw_parts(rp.cast::<u32>(), out_dwords);
+        let res = slice.to_vec();
+        rb_buf.Unmap(0, None);
+        res
+    };
+
+    for (i, &[nx0, ny0, nz0]) in cases.iter().enumerate() {
+        let inv = (nx0 * nx0 + ny0 * ny0 + nz0 * nz0).sqrt().recip();
+        let want = [nx0 * inv, ny0 * inv, nz0 * inv];
+        let base = i * 6;
+        let t = [
+            f32::from_bits(out[base]),
+            f32::from_bits(out[base + 1]),
+            f32::from_bits(out[base + 2]),
+        ];
+        let b = [
+            f32::from_bits(out[base + 3]),
+            f32::from_bits(out[base + 4]),
+            f32::from_bits(out[base + 5]),
+        ];
+        let cross = [
+            t[1] * b[2] - t[2] * b[1],
+            t[2] * b[0] - t[0] * b[2],
+            t[0] * b[1] - t[1] * b[0],
+        ];
+        let err = ((cross[0] - want[0]).powi(2)
+            + (cross[1] - want[1]).powi(2)
+            + (cross[2] - want[2]).powi(2))
+        .sqrt();
+        assert!(
+            err < 1e-3,
+            "lane {i}: want={want:?} got cross(T,B)={cross:?} (T={t:?}, B={b:?}) err={err}"
+        );
+    }
 }

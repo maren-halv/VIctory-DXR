@@ -2693,6 +2693,15 @@ impl State {
                         }
                         continue;
                     }
+                    if srv && slot == victory_shader::emit::SLOT_DXR_NORMALS {
+                        // Ours: GPU octahedral geometric-normal lookup table for lifted
+                        // `RayQuery` shaders using `CommittedTriangleVertexPositions`.
+                        let gpu = crate::dxr::normals_gpu_va();
+                        if gpu != 0 {
+                            self.set_root_gpu(list, compute, param, RootGpuKind::Srv, gpu);
+                        }
+                        continue;
+                    }
                     let tabled = srv && crate::pipeline::host::bounded_root_srvs();
                     let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
