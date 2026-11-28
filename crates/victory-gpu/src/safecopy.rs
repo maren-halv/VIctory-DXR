@@ -258,6 +258,62 @@ fn ensure_not_tripwired(addr: *const u8, len: usize) {
     }
 }
 
+/// Copies `[src_va, src_va + len)` into `dst` when `[src_va, src_va + len)`
+/// overlaps one or more active shadow Mode-1/Mode-2 `PAGE_NOACCESS` tripwires.
+/// Satisfies tripwired sub-ranges from host-side `shadow.data` WITHOUT calling
+/// `watch::tripwire_touch` and WITHOUT faulting `PAGE_NOACCESS` (Spec-Trap #4),
+/// while copying into `dst` via `victory_safe_copy` so faults on `dst` still trap.
+unsafe fn copy_bypassing_tripwire(dst: *mut u8, src: *const u8, len: usize) -> bool {
+    let src_addr = src as usize;
+    let end = src_addr.saturating_add(len);
+    let runs = crate::shadow::tripwired_overlap_runs(src_addr, len);
+    if runs.is_empty() {
+        ensure_not_tripwired(src, len);
+        // SAFETY: caller's contract.
+        return unsafe { victory_safe_copy(dst, src, len) != 0 };
+    }
+    let mut buf = [0u8; 4096];
+    let mut pos = src_addr;
+    for (run_start, run_end) in runs {
+        if pos < run_start {
+            let gap = run_start - pos;
+            ensure_not_tripwired(pos as *const u8, gap);
+            // SAFETY: within `[src, src + len)` and `[dst, dst + len)`.
+            if unsafe { victory_safe_copy(dst.add(pos - src_addr), pos as *const u8, gap) } == 0 {
+                return false;
+            }
+            pos = run_start;
+        }
+        while pos < run_end {
+            let n = (run_end - pos).min(buf.len());
+            let dst_ptr = unsafe { dst.add(pos - src_addr) };
+            if crate::shadow::read_tripwired_into(pos, &mut buf[..n]) {
+                // SAFETY: `buf` is valid readable stack memory; faults on `dst_ptr` trap cleanly.
+                if unsafe { victory_safe_copy(dst_ptr, buf.as_ptr(), n) } == 0 {
+                    return false;
+                }
+            } else {
+                // Concurrent disarm race: fall back safely to direct guest copy.
+                ensure_not_tripwired(pos as *const u8, n);
+                // SAFETY: caller's contract.
+                if unsafe { victory_safe_copy(dst_ptr, pos as *const u8, n) } == 0 {
+                    return false;
+                }
+            }
+            pos += n;
+        }
+    }
+    if pos < end {
+        let tail = end - pos;
+        ensure_not_tripwired(pos as *const u8, tail);
+        // SAFETY: within `[src, src + len)` and `[dst, dst + len)`.
+        if unsafe { victory_safe_copy(dst.add(pos - src_addr), pos as *const u8, tail) } == 0 {
+            return false;
+        }
+    }
+    true
+}
+
 /// The records of 32 bytes at `title` (`records` of them) that differ from
 /// those in `seen`: each is read once, goes over the one in `seen`, and gets
 /// its bit in `bits` (record n: bit n % 64 of word n / 64). False if a page
@@ -270,7 +326,26 @@ fn ensure_not_tripwired(addr: *const u8, len: usize) {
 /// 0; `title` is as [`copy`]'s source. [`on`] must have been asked.
 pub(crate) unsafe fn changed(title: *const u8, seen: *mut u8, records: usize, bits: &mut [u64]) -> bool {
     assert!(bits.len() >= records.div_ceil(64));
-    ensure_not_tripwired(title, records.saturating_mul(32));
+    let total_bytes = records.saturating_mul(32);
+    if total_bytes != 0 && crate::shadow::is_tripwired(title as usize, total_bytes) {
+        let mut rec = [0u8; 32];
+        for i in 0..records {
+            let off = i * 32;
+            // SAFETY: caller guarantees `seen` holds `records * 32` bytes; `copy_bypassing_tripwire`
+            // never disarms active shadow tripwires and traps any missing guest page.
+            if !unsafe { copy_bypassing_tripwire(rec.as_mut_ptr(), title.add(off), 32) } {
+                return false;
+            }
+            // SAFETY: `seen` is exclusively writable for `records * 32` bytes.
+            let seen_rec = unsafe { std::slice::from_raw_parts_mut(seen.add(off), 32) };
+            if seen_rec != rec {
+                seen_rec.copy_from_slice(&rec);
+                bits[i / 64] |= 1u64 << (i % 64);
+            }
+        }
+        return true;
+    }
+    ensure_not_tripwired(title, total_bytes);
     // SAFETY: a fault reading title memory leaves through the failing exit
     // ([`failing_exit`]); the rest is the caller's.
     unsafe { victory_safe_changed(title, seen, records, bits.as_mut_ptr()) != 0 }
@@ -465,8 +540,19 @@ pub(crate) fn on() -> bool {
 /// Of the two ranges, what is not title memory must be valid, and no Rust
 /// reference may cover the destination. [`on`] must have been asked.
 pub(crate) unsafe fn copy(dst: *mut u8, src: *const u8, len: usize) -> bool {
-    ensure_not_tripwired(src, len);
+    if len == 0 {
+        return true;
+    }
+    // Writes to guest memory must still legitimately disarm any tripwire on `dst`.
     ensure_not_tripwired(dst.cast_const(), len);
+    // Spec-Trap #4: satisfy reads overlapping active shadow Mode-1/Mode-2 tripwires
+    // from host-side `shadow.data` WITHOUT disarming `watch::tripwire_touch` and
+    // WITHOUT faulting `PAGE_NOACCESS`.
+    if crate::shadow::is_tripwired(src as usize, len) {
+        // SAFETY: caller's contract.
+        return unsafe { copy_bypassing_tripwire(dst, src, len) };
+    }
+    ensure_not_tripwired(src, len);
     // SAFETY: a fault on either side leaves through the failing exit
     // ([`failing_exit`]); the rest is the caller's.
     unsafe { victory_safe_copy(dst, src, len) != 0 }
@@ -483,8 +569,34 @@ pub(crate) unsafe fn probe_readable(addr: *const u8, len: usize, stride: usize) 
     if len == 0 {
         return true;
     }
-    ensure_not_tripwired(addr, len);
     let stride = stride.max(1);
+    // Spec-Trap #4: active shadow tripwires are armed strictly on committed pages;
+    // bypass them without touching `PAGE_NOACCESS` or disarming via `tripwire_touch`.
+    if crate::shadow::is_tripwired(addr as usize, len) {
+        let start = addr as usize;
+        let end = start.saturating_add(len);
+        let runs = crate::shadow::tripwired_overlap_runs(start, len);
+        let mut pos = start;
+        for (run_start, run_end) in runs {
+            if pos < run_start {
+                let gap = run_start - pos;
+                ensure_not_tripwired(pos as *const u8, gap);
+                // SAFETY: caller's contract.
+                if unsafe { victory_safe_probe_readable(pos as *const u8, gap, stride) } == 0 {
+                    return false;
+                }
+            }
+            pos = run_end;
+        }
+        if pos < end {
+            let tail = end - pos;
+            ensure_not_tripwired(pos as *const u8, tail);
+            // SAFETY: caller's contract.
+            return unsafe { victory_safe_probe_readable(pos as *const u8, tail, stride) != 0 };
+        }
+        return true;
+    }
+    ensure_not_tripwired(addr, len);
     // SAFETY: a fault reading `addr` leaves through the failing exit
     // ([`failing_exit`]); `stride >= 1` guarantees termination.
     unsafe { victory_safe_probe_readable(addr, len, stride) != 0 }

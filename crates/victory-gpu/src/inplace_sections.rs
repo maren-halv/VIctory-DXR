@@ -209,7 +209,15 @@ pub(crate) fn place_section(device: &ID3D12Device, start: u64, len: u64) -> Resu
     let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
     STATS[2].fetch_add(1, Ordering::Relaxed);
     STATS[3].fetch_add(len, Ordering::Relaxed);
-    Ok(Placed { buffer, heap, view: None, gpu, bias: start - at, pinned: 0 })
+    Ok(Placed {
+        buffer,
+        heap,
+        view: None,
+        gpu,
+        bias: start - at,
+        pinned: 0,
+        private_guard: None,
+    })
 }
 
 /// High-level entry point for [`crate::inplace::place_for`] and [`crate::port::place_for`]:

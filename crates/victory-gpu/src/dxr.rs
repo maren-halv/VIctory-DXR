@@ -76,8 +76,25 @@ const MAX_POOLED_HOST_INSTANCES_BYTES: u64 = 2 << 20;
 const IDLE_STAGING_TRIM_SUBS: u64 = 60;
 /// Evict BLASes unreachable from any scanned TLAS for more than this many TLAS epochs (`ARCH-10`).
 const BLAS_GC_UNREACHABLE_EPOCHS: u64 = 300;
+/// Evict BLASes whose GPU `blas_last_epoch` is older than `readback_epoch - 600` (`R2-F`).
+const BLAS_GC_GPU_UNREACHABLE_EPOCHS: u64 = 600;
 /// Minimum TLAS epochs between periodic `AS_MAP` reachability GC sweeps.
 const BLAS_GC_SWEEP_INTERVAL_EPOCHS: u64 = 60;
+/// Dense per-BLAS liveness slots in `blas_last_epoch` (`16,384 × u32 = 64 KiB`, `R2-F`).
+const BLAS_EPOCH_SLOTS: usize = 16_384;
+/// Per-TLAS `TRIANGLE_CULL_DISABLE` observation slots appended to `blas_last_epoch` (`64 × u32 = 256 B`).
+const TLAS_CULL_SLOTS: usize = 64;
+/// Total `u32` words in the GPU `blas_last_epoch` UAV buffer (`65,792` bytes, 256B-aligned).
+const BLAS_EPOCH_TOTAL_WORDS: usize = BLAS_EPOCH_SLOTS + TLAS_CULL_SLOTS;
+const BLAS_EPOCH_BYTES: u64 = (BLAS_EPOCH_TOTAL_WORDS * 4) as u64;
+/// TLAS epochs between full `64 KiB` async `blas_last_epoch` readbacks (`~10 s`).
+const BLAS_EPOCH_READBACK_INTERVAL: u64 = 300;
+/// TLAS epochs between `256 B` async per-TLAS `cull_disable` readbacks (`~1 s`).
+const TLAS_CULL_READBACK_INTERVAL: u64 = 30;
+/// Minimum observed TLAS epochs with zero `cull_disable` instances before gating off a Mirror TLAS.
+const TLAS_CULL_CONFIRM_MIN_EPOCH: u64 = 16;
+/// Hard per-frame cap on periodic full dynamic BLAS rebuilds (`R2-F`).
+const MAX_DYNAMIC_FULL_REBUILDS_PER_FRAME: u32 = 4;
 /// Dynamic `dxr_room_kept()` steady-state Local VRAM headroom reserve (128 MiB).
 const DXR_STEADY_RESERVE_BYTES: u64 = 128 << 20;
 /// Dynamic `dxr_room_kept()` streaming Local VRAM headroom reserve (256 MiB).
@@ -233,6 +250,24 @@ pub(crate) fn mirror_tlas_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
         std::env::var_os("VICTORY_NATIVE_RT_MIRROR_TLAS").is_none_or(|v| v != "0")
+    })
+}
+
+/// Whether per-TLAS `needs_mirror` gating skips Mirror TLAS builds for TLASes confirmed
+/// to have zero `TRIANGLE_CULL_DISABLE` instances (`VICTORY_NATIVE_RT_MIRROR_GATE=0` disables; default ON).
+fn mirror_gate_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_NATIVE_RT_MIRROR_GATE").is_none_or(|v| v != "0")
+    })
+}
+
+/// Whether CPU-only dynamic BLAS refits whose source vertex/index/transform write epochs
+/// have not changed since last build are skipped (`VICTORY_NATIVE_RT_SKIP_NOOP_REFIT=0` disables; default ON).
+fn skip_noop_dynamic_refit() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_NATIVE_RT_SKIP_NOOP_REFIT").is_none_or(|v| v != "0")
     })
 }
 
@@ -668,6 +703,8 @@ struct HostAs {
     last_seen_tlas_epoch: AtomicU64,
     /// Fingerprint of resolved dynamic BLAS VB/IB/transform GPU VAs & strides for safe `BUILD_NORMALS` skip.
     geom_va_hash: u64,
+    /// Fingerprint of CPU-watched source buffer IDs & write epochs at last dynamic build/refit (`0` = unskippable).
+    last_built_source_epoch: u64,
     /// Word slice in `dxr_normals` Region 1 (per-geometry offsets; `0` = none).
     normals_geom_off: u32,
     normals_geom_len: u32,
@@ -1411,6 +1448,12 @@ pub(crate) struct DxrSubmission {
     compact_info_uav: Option<(AuxVramBuf, u64)>,
     compact_info_rb: Option<(ID3D12Resource, u64, u64)>,
     compact_queries: Vec<CompactQueryRecord>,
+    /// Pooled `64 KiB` `READBACK` buffer receiving periodic async `blas_last_epoch` + TLAS cull-flag copies.
+    blas_epoch_rb: Option<(ID3D12Resource, u64)>,
+    /// Non-zero when this submission scheduled an async `blas_last_epoch` readback at this `tlas_build_epoch`.
+    blas_epoch_readback_epoch: u64,
+    /// `true` for a full `BLAS_EPOCH_BYTES` readback; `false` for the 256-byte TLAS cull-flag tail only.
+    blas_epoch_readback_full: bool,
     kept: Vec<ID3D12Resource>,
     /// Keeps full `Shadow` objects (including any backing `ID3D12Heap` for placed
     /// in-place buffers) alive until this submission's GPU fence completes.
@@ -1454,6 +1497,9 @@ impl DxrSubmission {
             compact_info_uav: None,
             compact_info_rb: None,
             compact_queries: Vec::new(),
+            blas_epoch_rb: None,
+            blas_epoch_readback_epoch: 0,
+            blas_epoch_readback_full: false,
             kept: Vec::new(),
             kept_shadows: Vec::new(),
             sub_seq: 0,
@@ -1785,6 +1831,18 @@ impl DxrSubmission {
         Some((uav.buf.clone(), uav_gpu, rb.clone()))
     }
 
+    fn ensure_blas_epoch_rb(&mut self, host: &Host) -> Option<ID3D12Resource> {
+        let now_sub = CURRENT_SUB_SEQ.load(Ordering::Relaxed);
+        if self.blas_epoch_rb.is_none() {
+            let buf = host.read_back_buffer(BLAS_EPOCH_BYTES)?;
+            name(&buf, || "victory dxr blas epoch readback".into());
+            self.blas_epoch_rb = Some((buf, now_sub));
+        } else if let Some((_, last)) = self.blas_epoch_rb.as_mut() {
+            *last = now_sub;
+        }
+        self.blas_epoch_rb.as_ref().map(|(b, _)| b.clone())
+    }
+
     /// Drops oversized buffers and static staging buffers idle for `>= IDLE_STAGING_TRIM_SUBS`
     /// submissions asynchronously via `crate::host::retire_com_async` (`ARCH-10`).
     fn trim_pooled(&mut self, completed_sub_seq: u64) {
@@ -1868,6 +1926,14 @@ impl DxrSubmission {
             .as_ref()
             .is_some_and(|(_, _, last)| is_idle(*last))
             && let Some((old, _, _)) = self.compact_info_rb.take()
+        {
+            drop_res.push(old);
+        }
+        if self
+            .blas_epoch_rb
+            .as_ref()
+            .is_some_and(|(_, last)| is_idle(*last))
+            && let Some((old, _)) = self.blas_epoch_rb.take()
         {
             drop_res.push(old);
         }
@@ -1974,11 +2040,41 @@ impl HashDirtyTracker {
 
 struct DxrState {
     slabs: TieredSlabAllocator,
-    /// Open-addressed CPU mirror of `(guest_blas_va >> 8 -> (host_blas_va, normals_geom_off))`.
-    /// Each 32-byte slot is `[key_lo, key_hi, val_lo, val_hi, geom_off, 0, 0, 0]`.
+    /// Open-addressed CPU mirror of `(guest_blas_va >> 8 -> (host_blas_va, normals_geom_off, epoch_slot_plus1))`.
+    /// Each 32-byte slot is `[key_lo, key_hi, val_lo, val_hi, geom_off, epoch_slot_plus1, 0, 0]`.
     blas_table: Vec<[u32; 8]>,
     hash_dirty: HashDirtyTracker,
     hash_gpu: Option<AuxVramBuf>,
+    /// Shared `64 KiB` (`16,384` BLAS epochs + `64` TLAS cull-disable epochs) default-heap UAV
+    /// written by `PATCH_INSTANCES_HLSL` (`u3`) for GPU-side liveness & mirror gating (`R2-F`).
+    blas_epoch_gpu: Option<(AuxVramBuf, u64)>,
+    /// Dense BLAS `guest_key -> slot_id` (`0..BLAS_EPOCH_SLOTS`) mapping for `blas_last_epoch`.
+    blas_key_to_slot: HashMap<u64, u32>,
+    /// Reverse `slot_id -> guest_key` table (`0` = unused).
+    blas_slot_to_key: Vec<u64>,
+    /// Recycled `slot_id`s eligible for reuse after GPU retirement fences pass.
+    blas_slot_free: Vec<u32>,
+    /// Next never-allocated `slot_id` (`0..BLAS_EPOCH_SLOTS`).
+    blas_slot_next: u32,
+    /// Deferred `slot_id` retirements `(release_tlas_epoch, release_sub_seq, release_dxr_fence, slot_id)`.
+    retired_epoch_slots: VecDeque<(u64, u64, u64, u32)>,
+    /// Last `tlas_build_epoch` on which a full `64 KiB` `blas_last_epoch` readback was scheduled.
+    last_epoch_readback_scheduled: u64,
+    /// Last `tlas_build_epoch` on which a `256 B` per-TLAS cull-flag readback was scheduled.
+    last_cull_readback_scheduled: u64,
+    /// Highest `tlas_build_epoch` whose full GPU `blas_last_epoch` readback completed and merged.
+    last_gpu_liveness_epoch: u64,
+    /// Per-TLAS `cull_disable` slot registry (`guest_key` for slots `0..TLAS_CULL_SLOTS`).
+    tlas_cull_keys: [u64; TLAS_CULL_SLOTS],
+    /// Last `tlas_build_epoch` on which `TRIANGLE_CULL_DISABLE` was observed for each TLAS slot (`0` = never).
+    tlas_cull_seen_epoch: [u64; TLAS_CULL_SLOTS],
+    /// First `tlas_build_epoch` on which each TLAS slot was registered.
+    tlas_first_seen_epoch: [u64; TLAS_CULL_SLOTS],
+    /// Highest `tlas_build_epoch` whose TLAS cull-flag readback completed and merged.
+    last_tlas_cull_readback_epoch: u64,
+    /// Frame number and count tracking the hard `<= 4` periodic full dynamic BLAS rebuild cap/frame.
+    dyn_full_rebuilds_frame: u64,
+    dyn_full_rebuilds_count: u32,
     /// Shared 64 MiB default-heap `SLOT_DXR_NORMALS` lookup table (`t251` in `ROOT_CBV_SPACE`).
     normals_gpu: Option<(AuxVramBuf, u64)>,
     normals_init_needed: bool,
@@ -2034,6 +2130,21 @@ impl DxrState {
             blas_table: vec![[0u32; 8]; HASH_CAPACITY],
             hash_dirty: HashDirtyTracker::full(),
             hash_gpu: None,
+            blas_epoch_gpu: None,
+            blas_key_to_slot: HashMap::new(),
+            blas_slot_to_key: vec![0u64; BLAS_EPOCH_SLOTS],
+            blas_slot_free: Vec::new(),
+            blas_slot_next: 0,
+            retired_epoch_slots: VecDeque::new(),
+            last_epoch_readback_scheduled: 0,
+            last_cull_readback_scheduled: 0,
+            last_gpu_liveness_epoch: 0,
+            tlas_cull_keys: [0u64; TLAS_CULL_SLOTS],
+            tlas_cull_seen_epoch: [0u64; TLAS_CULL_SLOTS],
+            tlas_first_seen_epoch: [0u64; TLAS_CULL_SLOTS],
+            last_tlas_cull_readback_epoch: 0,
+            dyn_full_rebuilds_frame: u64::MAX,
+            dyn_full_rebuilds_count: 0,
             normals_gpu: None,
             normals_init_needed: true,
             geom_pool: WordPool::new(
@@ -2111,20 +2222,145 @@ impl DxrState {
         }
     }
 
+    fn get_or_alloc_blas_slot(&mut self, guest_va: u64) -> u32 {
+        let key = guest_va & !0xFF;
+        if key == 0 {
+            return u32::MAX;
+        }
+        if let Some(&slot) = self.blas_key_to_slot.get(&key) {
+            return slot;
+        }
+        let slot = if let Some(recycled) = self.blas_slot_free.pop() {
+            recycled
+        } else if (self.blas_slot_next as usize) < BLAS_EPOCH_SLOTS {
+            let s = self.blas_slot_next;
+            self.blas_slot_next += 1;
+            s
+        } else {
+            return u32::MAX;
+        };
+        self.blas_key_to_slot.insert(key, slot);
+        self.blas_slot_to_key[slot as usize] = key;
+        slot
+    }
+
+    fn drain_retired_epoch_slots(
+        &mut self,
+        completed_tlas_epoch: u64,
+        completed_sub_seq: u64,
+        completed_dxr_fence: u64,
+    ) {
+        let mut i = 0;
+        while i < self.retired_epoch_slots.len() {
+            let (t_ep, s_seq, d_fence, slot) = self.retired_epoch_slots[i];
+            if completed_tlas_epoch >= t_ep
+                && completed_sub_seq >= s_seq
+                && completed_dxr_fence >= d_fence
+            {
+                self.retired_epoch_slots.swap_remove_back(i);
+                self.blas_slot_free.push(slot);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    fn tlas_cull_slot(&mut self, guest_key: u64) -> Option<usize> {
+        let key = guest_key & !0xFF;
+        if key == 0 || key == EMPTY_TLAS_KEY {
+            return None;
+        }
+        if let Some(idx) = self.tlas_cull_keys.iter().position(|&k| k == key) {
+            return Some(idx);
+        }
+        if let Some(empty) = self.tlas_cull_keys.iter().position(|&k| k == 0) {
+            self.tlas_cull_keys[empty] = key;
+            self.tlas_first_seen_epoch[empty] = self.tlas_build_epoch;
+            self.tlas_cull_seen_epoch[empty] = 0;
+            return Some(empty);
+        }
+        None
+    }
+
+    fn note_tlas_cull_disable(&mut self, guest_key: u64, epoch: u64) {
+        if let Some(slot) = self.tlas_cull_slot(guest_key) {
+            self.tlas_cull_seen_epoch[slot] = self.tlas_cull_seen_epoch[slot].max(epoch.max(1));
+        }
+    }
+
+    /// Returns `true` if `guest_key` needs a separate cull-enabled Mirror TLAS.
+    /// Conservative default: returns `true` until at least `TLAS_CULL_CONFIRM_MIN_EPOCH`
+    /// epochs of GPU/CPU readback after first seeing this TLAS confirm zero `cull_disable`
+    /// instances (so a `FrontBackTrack` shader never misses a needed Mirror TLAS).
+    fn tlas_needs_mirror(&mut self, guest_key: u64) -> bool {
+        self.tlas_needs_mirror_with(guest_key, mirror_tlas_enabled(), mirror_gate_enabled())
+    }
+
+    fn tlas_needs_mirror_with(&mut self, guest_key: u64, mirror_on: bool, gate_on: bool) -> bool {
+        let key = guest_key & !0xFF;
+        if !mirror_on || key == 0 || key == EMPTY_TLAS_KEY {
+            return false;
+        }
+        if !gate_on {
+            return true;
+        }
+        let Some(slot) = self.tlas_cull_slot(key) else {
+            return true;
+        };
+        if self.tlas_cull_seen_epoch[slot] != 0 {
+            return true;
+        }
+        if self.last_tlas_cull_readback_epoch < TLAS_CULL_CONFIRM_MIN_EPOCH
+            || self
+                .last_tlas_cull_readback_epoch
+                .saturating_sub(self.tlas_first_seen_epoch[slot])
+                < TLAS_CULL_CONFIRM_MIN_EPOCH
+        {
+            return true;
+        }
+        false
+    }
+
     fn insert_blas_hash(&mut self, guest_va: u64, host_va: u64, normals_geom_off: u32) {
+        let slot = self.get_or_alloc_blas_slot(guest_va);
+        let slot_plus1 = if slot != u32::MAX { slot + 1 } else { 0 };
         insert_blas_hash_in(
             &mut self.blas_table,
             &mut self.hash_dirty,
             guest_va,
             host_va,
             normals_geom_off,
+            slot_plus1,
         );
     }
 
     /// Shift-deletes `guest_va` from the open-addressed 64-probe `blas_table` chain,
-    /// preserving all subsequent probe chains without leaving empty-slot breaks (`ARCH-10`).
+    /// preserving all subsequent probe chains without leaving empty-slot breaks (`ARCH-10`),
+    /// and defers recycling its `blas_last_epoch` slot behind GPU retirement fences (`R2-F`).
     fn remove_blas_hash(&mut self, guest_va: u64) -> bool {
+        let key = guest_va & !0xFF;
+        if let Some(slot) = self.blas_key_to_slot.remove(&key) {
+            self.blas_slot_to_key[slot as usize] = 0;
+            self.retired_epoch_slots.push_back((
+                self.tlas_build_epoch.saturating_add(2),
+                self.sub_seq.saturating_add(2),
+                retire_dxr_fence_target(),
+                slot,
+            ));
+        }
         shift_delete_blas_hash(&mut self.blas_table, &mut self.hash_dirty, guest_va)
+    }
+
+    fn ensure_blas_epoch_gpu(&mut self, host: &Host) -> Option<(ID3D12Resource, u64)> {
+        if self.blas_epoch_gpu.is_none() {
+            let buf = host.uav_buffer(BLAS_EPOCH_BYTES)?;
+            // SAFETY: live default-heap UAV buffer (zero-initialized by D3D12).
+            let gpu = unsafe { buf.GetGPUVirtualAddress() };
+            name(&buf, || "victory dxr blas last epoch (64 KiB)".into());
+            self.blas_epoch_gpu = Some((AuxVramBuf::new(buf, BLAS_EPOCH_BYTES), gpu));
+        }
+        let (aux, gpu) = self.blas_epoch_gpu.as_ref()?;
+        Some((aux.buf.clone(), *gpu))
     }
 
     fn ensure_normals_gpu(&mut self, host: &Host) -> Option<(ID3D12Resource, u64)> {
@@ -2256,6 +2492,7 @@ fn insert_blas_hash_in(
     guest_va: u64,
     host_va: u64,
     normals_geom_off: u32,
+    slot_plus1: u32,
 ) {
     let key = guest_va >> 8;
     if key == 0 {
@@ -2265,7 +2502,7 @@ fn insert_blas_hash_in(
     let key_hi = (key >> 32) as u32;
     let val_lo = host_va as u32;
     let val_hi = (host_va >> 32) as u32;
-    let new_entry = [key_lo, key_hi, val_lo, val_hi, normals_geom_off, 0, 0, 0];
+    let new_entry = [key_lo, key_hi, val_lo, val_hi, normals_geom_off, slot_plus1, 0, 0];
     let start = hash_key(key_lo, key_hi) & HASH_MASK;
     for step in 0..64u32 {
         let idx = ((start + step) & HASH_MASK) as usize;
@@ -2402,35 +2639,87 @@ pub(crate) fn evict_range(start: u64, len: u64) {
     }
 }
 
+/// Merges an async GPU `blas_last_epoch` readback (`16,384 × u32`) into `AS_MAP`'s
+/// per-BLAS `last_seen_tlas_epoch` atomics and advances `state.last_gpu_liveness_epoch` (`R2-F`).
+fn merge_gpu_blas_epochs_in(
+    state: &mut DxrState,
+    map: &HashMap<u64, HostAs>,
+    readback_epoch: u64,
+    epochs: &[u32],
+) {
+    let limit = epochs.len().min(state.blas_slot_to_key.len());
+    for (slot_id, &gpu_ep) in epochs[..limit].iter().enumerate() {
+        if gpu_ep == 0 {
+            continue;
+        }
+        let key = state.blas_slot_to_key[slot_id];
+        if key != 0
+            && let Some(entry) = map.get(&key)
+            && entry.kind == AsKind::Blas
+        {
+            entry
+                .last_seen_tlas_epoch
+                .fetch_max(u64::from(gpu_ep), Ordering::Relaxed);
+        }
+    }
+    state.last_gpu_liveness_epoch = state.last_gpu_liveness_epoch.max(readback_epoch);
+}
+
+/// Merges the per-TLAS `TRIANGLE_CULL_DISABLE` observation epochs (`64 × u32`) read back
+/// from the tail of `blas_last_epoch` (`R2-F`).
+fn merge_gpu_tlas_cull_epochs(state: &mut DxrState, readback_epoch: u64, cull_epochs: &[u32]) {
+    let limit = cull_epochs.len().min(TLAS_CULL_SLOTS);
+    for (slot, &gpu_ep) in cull_epochs[..limit].iter().enumerate() {
+        if gpu_ep != 0 {
+            state.tlas_cull_seen_epoch[slot] =
+                state.tlas_cull_seen_epoch[slot].max(u64::from(gpu_ep));
+        }
+    }
+    state.last_tlas_cull_readback_epoch =
+        state.last_tlas_cull_readback_epoch.max(readback_epoch);
+}
+
 /// Periodic TLAS-reachability liveness sweep: evicts BLASes unreachable from any scanned
-/// TLAS for more than [`BLAS_GC_UNREACHABLE_EPOCHS`] (`300`) TLAS epochs, shift-deleting
-/// them from `blas_table` and retiring AS + `dxr_normals` slices behind `tlas_build_epoch + 2 && sub_seq + 2`.
-fn sweep_unreachable_blases(state: &mut DxrState) -> usize {
+/// TLAS, shift-deleting them from `blas_table` and retiring AS + `dxr_normals` slices
+/// behind `tlas_build_epoch + 2 && sub_seq + 2`.
+///
+/// Prefers GPU-side `blas_last_epoch` liveness (`last_seen_epoch + 600 < readback_epoch`),
+/// which works even when `guest_shadow.written() == true` (GPU-written TLAS instance buffers).
+/// Falls back to CPU-readable TLAS scanning before the first GPU readback completes.
+fn sweep_unreachable_blases_in(state: &mut DxrState, map: &mut HashMap<u64, HostAs>) -> usize {
     let epoch = state.tlas_build_epoch;
-    if epoch <= BLAS_GC_UNREACHABLE_EPOCHS
-        || epoch.saturating_sub(state.last_gc_tlas_epoch) < BLAS_GC_SWEEP_INTERVAL_EPOCHS
-    {
+    if epoch.saturating_sub(state.last_gc_tlas_epoch) < BLAS_GC_SWEEP_INTERVAL_EPOCHS {
         return 0;
     }
-    // Require a recent CPU-readable TLAS scan and no recent unreadable GPU-written TLAS so
-    // we never falsely evict a live BLAS referenced only by a GPU-written TLAS.
-    if state.last_readable_tlas_scan_epoch == 0
-        || epoch.saturating_sub(state.last_readable_tlas_scan_epoch) >= BLAS_GC_UNREACHABLE_EPOCHS
-        || (state.last_unreadable_tlas_epoch > 0
-            && epoch.saturating_sub(state.last_unreadable_tlas_epoch) <= BLAS_GC_UNREACHABLE_EPOCHS)
-    {
-        return 0;
-    }
+    let use_gpu_liveness = state.last_gpu_liveness_epoch > BLAS_GC_GPU_UNREACHABLE_EPOCHS;
+    let cutoff = if use_gpu_liveness {
+        state
+            .last_gpu_liveness_epoch
+            .saturating_sub(BLAS_GC_GPU_UNREACHABLE_EPOCHS)
+    } else {
+        if epoch <= BLAS_GC_UNREACHABLE_EPOCHS
+            || state.last_readable_tlas_scan_epoch == 0
+            || epoch.saturating_sub(state.last_readable_tlas_scan_epoch) >= BLAS_GC_UNREACHABLE_EPOCHS
+            || (state.last_unreadable_tlas_epoch > 0
+                && epoch.saturating_sub(state.last_unreadable_tlas_epoch) <= BLAS_GC_UNREACHABLE_EPOCHS)
+        {
+            return 0;
+        }
+        epoch.saturating_sub(BLAS_GC_UNREACHABLE_EPOCHS)
+    };
     state.last_gc_tlas_epoch = epoch;
-    let cutoff = epoch.saturating_sub(BLAS_GC_UNREACHABLE_EPOCHS);
-    let mut map = as_map().write().unwrap_or_else(|e| e.into_inner());
     let dead_keys: Vec<u64> = map
         .iter()
         .filter_map(|(&k, e)| {
-            (e.kind == AsKind::Blas
-                && e.built
-                && e.last_seen_tlas_epoch.load(Ordering::Relaxed) < cutoff)
-                .then_some(k)
+            if e.kind != AsKind::Blas || !e.built {
+                return None;
+            }
+            // When sweeping via GPU liveness, only evict BLASes tracked by a valid dense slot
+            // so overflow BLASes (beyond 16,384 slots) are never falsely evicted.
+            if use_gpu_liveness && !state.blas_key_to_slot.contains_key(&k) {
+                return None;
+            }
+            (e.last_seen_tlas_epoch.load(Ordering::Relaxed) < cutoff).then_some(k)
         })
         .collect();
     let evicted = dead_keys.len();
@@ -2441,6 +2730,25 @@ fn sweep_unreachable_blases(state: &mut DxrState) -> usize {
         }
     }
     evicted
+}
+
+fn sweep_unreachable_blases(state: &mut DxrState) -> usize {
+    let epoch = state.tlas_build_epoch;
+    if epoch.saturating_sub(state.last_gc_tlas_epoch) < BLAS_GC_SWEEP_INTERVAL_EPOCHS {
+        return 0;
+    }
+    let has_gpu = state.last_gpu_liveness_epoch > BLAS_GC_GPU_UNREACHABLE_EPOCHS;
+    let has_cpu = !has_gpu
+        && epoch > BLAS_GC_UNREACHABLE_EPOCHS
+        && state.last_readable_tlas_scan_epoch > 0
+        && epoch.saturating_sub(state.last_readable_tlas_scan_epoch) < BLAS_GC_UNREACHABLE_EPOCHS
+        && !(state.last_unreadable_tlas_epoch > 0
+            && epoch.saturating_sub(state.last_unreadable_tlas_epoch) <= BLAS_GC_UNREACHABLE_EPOCHS);
+    if !has_gpu && !has_cpu {
+        return 0;
+    }
+    let mut map = as_map().write().unwrap_or_else(|e| e.into_inner());
+    sweep_unreachable_blases_in(state, &mut map)
 }
 
 static AS_MAP: OnceLock<RwLock<HashMap<u64, HostAs>>> = OnceLock::new();
@@ -2581,7 +2889,7 @@ pub(crate) fn ensure_tlas_slot(guest_va: u64, min_bytes: u64) -> Option<(u64, ID
         min_bytes.max(DEFAULT_TLAS_RESERVE)
     };
     let (buffer, slice, gpu_va) = state.slabs.alloc(host, SlabTier::TransientDynamicTlas, reserve)?;
-    let mirror_tlas = if mirror_tlas_enabled() && key != EMPTY_TLAS_KEY {
+    let mirror_tlas = if state.tlas_needs_mirror(key) {
         let m_reserve = min_bytes.max(DEFAULT_MIRROR_TLAS_RESERVE);
         state
             .slabs
@@ -2614,6 +2922,7 @@ pub(crate) fn ensure_tlas_slot(guest_va: u64, min_bytes: u64) -> Option<(u64, ID
             compacted_size: 0,
             last_seen_tlas_epoch: AtomicU64::new(cur_epoch),
             geom_va_hash: 0,
+            last_built_source_epoch: 0,
             normals_geom_off: 0,
             normals_geom_len: 0,
             normals_data_off: 0,
@@ -2786,7 +3095,7 @@ const PATCH_ENABLE_STATS: u32 = 0;
 /// to avoid per-thread PCIe atomics against the mapped shared buffer. When `enable_stats == 0`
 /// (release builds), all groupshared barriers and PCIe atomics are skipped.
 const PATCH_INSTANCES_HLSL: &str = r#"
-#define RS "RootConstants(num32BitConstants=7, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1), UAV(u2)"
+#define RS "RootConstants(num32BitConstants=10, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1), UAV(u2), UAV(u3)"
 cbuffer Params : register(b0) {
     uint num_instances;
     uint src_offset;
@@ -2795,12 +3104,16 @@ cbuffer Params : register(b0) {
     uint enable_stats;
     uint tlas_inst_base;
     uint mirror_offset;
+    uint cur_tlas_epoch;
+    uint blas_epoch_len;
+    uint tlas_cull_slot;
 };
 ByteAddressBuffer guest_inst : register(t0);
 ByteAddressBuffer blas_table : register(t1);
 RWByteAddressBuffer host_inst : register(u0);
 RWByteAddressBuffer stats : register(u1);
 RWByteAddressBuffer dxr_normals : register(u2);
+RWByteAddressBuffer blas_last_epoch : register(u3);
 
 groupshared uint g_stats[8];
 
@@ -2838,6 +3151,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         uint host_lo = 0u;
         uint host_hi = 0u;
         uint geom_off = 0u;
+        uint slot_plus1 = 0u;
         bool found = false;
 
         if ((blas_lo | blas_hi) != 0u) {
@@ -2851,7 +3165,9 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
                 if (e.x == key_lo && e.y == key_hi) {
                     host_lo = e.z;
                     host_hi = e.w;
-                    geom_off = blas_table.Load(entry_off + 16u);
+                    uint2 extra = blas_table.Load2(entry_off + 16u);
+                    geom_off = extra.x;
+                    slot_plus1 = extra.y;
                     found = true;
                     break;
                 }
@@ -2874,10 +3190,19 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         }
 
         if (found) {
+            if (slot_plus1 != 0u && cur_tlas_epoch != 0u) {
+                uint blas_slot = slot_plus1 - 1u;
+                if (blas_slot < blas_epoch_len) {
+                    blas_last_epoch.Store(blas_slot * 4u, cur_tlas_epoch);
+                }
+            }
             r3.z = host_lo;
             r3.w = host_hi;
             uint cur_mask = (r3.x >> 24u) & 0xFFu;
             if ((r3.y & 0x01000000u) != 0u) {
+                if (tlas_cull_slot < 64u && blas_epoch_len != 0u && cur_tlas_epoch != 0u) {
+                    blas_last_epoch.Store((blas_epoch_len + tlas_cull_slot) * 4u, cur_tlas_epoch);
+                }
                 if (enable_stats != 0u) {
                     InterlockedAdd(g_stats[4], 1u);
                     InterlockedOr(g_stats[6], cur_mask);
@@ -3485,6 +3810,20 @@ pub fn enqueue_rehydrate_batched(
     }
 }
 
+/// Reads guest bytes `[va, va + dst.len())` via host-side shadow staging when the range
+/// overlaps a Mode-1/Mode-2 `PAGE_NOACCESS` tripwire (Spec-Trap #4), or via `safecopy`
+/// (`copy_mapped_ok`) otherwise — never directly dereferencing or self-tripping tripwires.
+fn safe_read_guest_bytes(va: u64, dst: &mut [u8]) -> bool {
+    if va == 0 || dst.is_empty() {
+        return false;
+    }
+    let addr = va as usize;
+    if crate::shadow::is_tripwired(addr, dst.len()) {
+        return crate::shadow::read_tripwired_into(addr, dst);
+    }
+    crate::host::copy_mapped_ok(dst.as_mut_ptr(), va as *const u8, dst.len(), false)
+}
+
 /// Infers unpacked byte size from a console packed BVH4 header (`dw[0] & 0xFFFF == 6`,
 /// marks `0x8100`, `dw[1]` = node count minus one; matches `memory.rs::packed_len`).
 fn probe_packed_bvh_size(va: u64) -> Option<u64> {
@@ -3492,7 +3831,9 @@ fn probe_packed_bvh_size(va: u64) -> Option<u64> {
         return None;
     }
     let mut header = [0u8; 8];
-    crate::host::copy_mapped(header.as_mut_ptr(), va as *const u8, 8, false);
+    if !safe_read_guest_bytes(va, &mut header) {
+        return None;
+    }
     let words = u64::from_le_bytes(header);
     let version = words as u32;
     let marks = version >> 16;
@@ -3512,7 +3853,7 @@ fn probe_bvh_bounds(va: u64, hint_bytes: u64) -> Option<(u64, u64)> {
     // Also read the 64-byte header: if the BVH is already unpacked in guest memory,
     // `dw[3]` is exact `numElements` and `dw[13]` is `offsetToElements` in bytes.
     let mut hdr = [0u8; 64];
-    crate::host::copy_mapped(hdr.as_mut_ptr(), va as *const u8, 64, false);
+    let _ = safe_read_guest_bytes(va, &mut hdr);
     let dw = |idx: usize| u32::from_le_bytes(hdr[idx * 4..idx * 4 + 4].try_into().unwrap());
     let num_elements = u64::from(dw(3));
     let off_elements = u64::from(dw(13));
@@ -3546,18 +3887,28 @@ fn copy_guest_geometries(inputs: &GuestBuildAsInputs) -> Vec<GeometrySpec> {
     }
     let mut out = Vec::with_capacity(count);
     for i in 0..count {
-        let g = if inputs.descs_layout == D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS.0 as u32 {
-            // SAFETY: guest passes an array of `count` geometry descriptor pointers.
-            let ptr = unsafe { *(inputs.ptr_or_va as *const *const GuestGeometryDesc).add(i) };
-            if ptr.is_null() {
+        let desc_va = if inputs.descs_layout == D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS.0 as u32 {
+            let mut ptr_bytes = [0u8; 8];
+            let slot_va = inputs.ptr_or_va.wrapping_add((i * 8) as u64);
+            if !safe_read_guest_bytes(slot_va, &mut ptr_bytes) {
                 continue;
             }
-            // SAFETY: non-null guest geometry descriptor.
-            unsafe { ptr.read_unaligned() }
+            let ptr = u64::from_le_bytes(ptr_bytes);
+            if ptr == 0 {
+                continue;
+            }
+            ptr
         } else {
-            // SAFETY: guest passes a contiguous array of `count` geometry descriptors.
-            unsafe { (inputs.ptr_or_va as *const GuestGeometryDesc).add(i).read_unaligned() }
+            inputs
+                .ptr_or_va
+                .wrapping_add((i * size_of::<GuestGeometryDesc>()) as u64)
         };
+        let mut raw = [0u8; size_of::<GuestGeometryDesc>()];
+        if !safe_read_guest_bytes(desc_va, &mut raw) {
+            continue;
+        }
+        // SAFETY: `GuestGeometryDesc` is `#[repr(C)]` plain-old-data of exact `raw.len()` bytes.
+        let g: GuestGeometryDesc = unsafe { std::ptr::read_unaligned(raw.as_ptr().cast()) };
         let kind = match g.kind {
             0 => {
                 // SAFETY: `kind == 0` selects `triangles`.
@@ -4017,6 +4368,8 @@ pub(crate) fn record_submission(
         sub.readback_used = 0;
         sub.readback_cap = 0;
         sub.compact_queries.clear();
+        sub.blas_epoch_readback_epoch = 0;
+        sub.blas_epoch_readback_full = false;
         sub.kept.clear();
         sub.kept_shadows.clear();
         sub.sub_seq = 0;
@@ -4375,10 +4728,47 @@ pub(crate) fn finish_submission(mut sub: DxrSubmission) {
     sub.readback_used = 0;
     sub.readback_cap = 0;
     let compact_queries = std::mem::take(&mut sub.compact_queries);
+    let blas_epoch_rb_epoch = sub.blas_epoch_readback_epoch;
+    let blas_epoch_rb_full = sub.blas_epoch_readback_full;
+    sub.blas_epoch_readback_epoch = 0;
+    sub.blas_epoch_readback_full = false;
     let completed_sub_seq = sub.sub_seq;
     let completed_tlas_epoch = sub.tlas_epoch;
     sub.sub_seq = 0;
     sub.tlas_epoch = 0;
+
+    let mut gpu_blas_epochs: Option<Vec<u32>> = None;
+    let mut gpu_cull_epochs: Option<Vec<u32>> = None;
+    if blas_epoch_rb_epoch > 0
+        && let Some((rb_buf, _)) = sub.blas_epoch_rb.as_ref()
+    {
+        let (begin, end) = if blas_epoch_rb_full {
+            (0usize, BLAS_EPOCH_BYTES as usize)
+        } else {
+            (BLAS_EPOCH_SLOTS * 4, BLAS_EPOCH_BYTES as usize)
+        };
+        let mut ptr = std::ptr::null_mut();
+        let read_range = D3D12_RANGE { Begin: begin, End: end };
+        // SAFETY: submission GPU fence has completed; readback buffer is idle.
+        let mapped = unsafe { rb_buf.Map(0, Some(&read_range), Some(&mut ptr)) };
+        if mapped.is_ok() && !ptr.is_null() {
+            if blas_epoch_rb_full {
+                // SAFETY: `ptr` is mapped for `BLAS_EPOCH_BYTES` (`BLAS_EPOCH_TOTAL_WORDS` u32s).
+                let all = unsafe { std::slice::from_raw_parts(ptr.cast::<u32>(), BLAS_EPOCH_TOTAL_WORDS) };
+                gpu_blas_epochs = Some(all[..BLAS_EPOCH_SLOTS].to_vec());
+                gpu_cull_epochs = Some(all[BLAS_EPOCH_SLOTS..BLAS_EPOCH_TOTAL_WORDS].to_vec());
+            } else {
+                // SAFETY: `ptr` + `BLAS_EPOCH_SLOTS` covers `TLAS_CULL_SLOTS` u32s.
+                let tail = unsafe {
+                    std::slice::from_raw_parts(ptr.cast::<u32>().add(BLAS_EPOCH_SLOTS), TLAS_CULL_SLOTS)
+                };
+                gpu_cull_epochs = Some(tail.to_vec());
+            }
+            let written_none = D3D12_RANGE { Begin: 0, End: 0 };
+            // SAFETY: matches successful `Map(0, ...)`.
+            unsafe { rb_buf.Unmap(0, Some(&written_none)) };
+        }
+    }
 
     let mut new_compactions: Vec<(u64, u64, u64)> = Vec::new();
     if !compact_queries.is_empty()
@@ -4492,6 +4882,18 @@ pub(crate) fn finish_submission(mut sub: DxrSubmission) {
         state.completed_sub_seq,
         completed_dxr_fence,
     );
+    state.drain_retired_epoch_slots(
+        state.completed_tlas_epoch,
+        state.completed_sub_seq,
+        completed_dxr_fence,
+    );
+    if let Some(cull_epochs) = gpu_cull_epochs {
+        merge_gpu_tlas_cull_epochs(state, blas_epoch_rb_epoch, &cull_epochs);
+    }
+    if let Some(blas_epochs) = gpu_blas_epochs {
+        let map = as_map().read().unwrap_or_else(|e| e.into_inner());
+        merge_gpu_blas_epochs_in(state, &map, blas_epoch_rb_epoch, &blas_epochs);
+    }
     sweep_unreachable_blases(state);
     for item in new_compactions {
         if state.pending_compactions.len() < MAX_PENDING_COMPACTIONS {
@@ -4700,6 +5102,7 @@ fn record_static_upgrades(
                 compacted_size: 0,
                 last_seen_tlas_epoch: AtomicU64::new(cur_epoch),
                 geom_va_hash: 0,
+                last_built_source_epoch: 0,
                 normals_geom_off: ng_off,
                 normals_geom_len: ng_len,
                 normals_data_off: nd_off,
@@ -5098,6 +5501,7 @@ fn record_static_compactions(
                     compacted_size: 0,
                     last_seen_tlas_epoch: AtomicU64::new(cur_epoch),
                     geom_va_hash: 0,
+                    last_built_source_epoch: 0,
                     normals_geom_off: ng_off,
                     normals_geom_len: ng_len,
                     normals_data_off: nd_off,
@@ -5679,6 +6083,8 @@ fn record_ops(
     let mut staging_in_copy_src: Option<ID3D12Resource> = None;
     let mut normals_state = D3D12_RESOURCE_STATE_COMMON;
     let normals_gpu_entry = state.ensure_normals_gpu(host);
+    let blas_epoch_gpu_entry = state.ensure_blas_epoch_gpu(host);
+    let mut blas_epoch_written = false;
     let normals_init_src = if normals_gpu_entry.is_some() && state.normals_init_needed {
         if let Some((nbuf, nptr)) = sub.ensure_normals_upload(host, 256) {
             // SAFETY: `nptr` is mapped for at least 256 bytes.
@@ -5776,6 +6182,8 @@ fn record_ops(
                         &mut host_inst_in_srv,
                         normals_gpu_entry.as_ref(),
                         &mut normals_state,
+                        blas_epoch_gpu_entry.as_ref(),
+                        &mut blas_epoch_written,
                         built_tlas,
                         use_compute,
                     ) {
@@ -5866,6 +6274,60 @@ fn record_ops(
                     use_compute,
                 );
                 normals_state = D3D12_RESOURCE_STATE_COMMON;
+            }
+            if blas_epoch_written
+                && sub.blas_epoch_readback_epoch == 0
+                && let Some((ep_buf, _)) = &blas_epoch_gpu_entry
+            {
+                let cur_ep = state.tlas_build_epoch;
+                let need_full = cur_ep >= BLAS_EPOCH_READBACK_INTERVAL
+                    && cur_ep.saturating_sub(state.last_epoch_readback_scheduled)
+                        >= BLAS_EPOCH_READBACK_INTERVAL;
+                let need_cull = !need_full
+                    && cur_ep >= TLAS_CULL_CONFIRM_MIN_EPOCH
+                    && cur_ep.saturating_sub(state.last_cull_readback_scheduled)
+                        >= TLAS_CULL_READBACK_INTERVAL;
+                if (need_full || need_cull)
+                    && let Some(rb_buf) = sub.ensure_blas_epoch_rb(host)
+                {
+                    emit_dxr_buffer_barrier(
+                        &list,
+                        list7.as_ref(),
+                        ep_buf,
+                        D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+                        D3D12_BARRIER_SYNC_COPY,
+                        D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+                        D3D12_BARRIER_ACCESS_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        use_compute,
+                    );
+                    if need_full {
+                        list.CopyBufferRegion(&rb_buf, 0, ep_buf, 0, BLAS_EPOCH_BYTES);
+                        sub.blas_epoch_readback_full = true;
+                        state.last_epoch_readback_scheduled = cur_ep;
+                        state.last_cull_readback_scheduled = cur_ep;
+                    } else {
+                        let tail_off = (BLAS_EPOCH_SLOTS * 4) as u64;
+                        let tail_len = (TLAS_CULL_SLOTS * 4) as u64;
+                        list.CopyBufferRegion(&rb_buf, tail_off, ep_buf, tail_off, tail_len);
+                        sub.blas_epoch_readback_full = false;
+                        state.last_cull_readback_scheduled = cur_ep;
+                    }
+                    sub.blas_epoch_readback_epoch = cur_ep;
+                    emit_dxr_buffer_barrier(
+                        &list,
+                        list7.as_ref(),
+                        ep_buf,
+                        D3D12_BARRIER_SYNC_COPY,
+                        D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+                        D3D12_BARRIER_ACCESS_COPY_SOURCE,
+                        D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        use_compute,
+                    );
+                }
             }
             if hash_in_srv
                 && let Some(hash_aux) = state.hash_gpu.as_ref()
@@ -5983,12 +6445,24 @@ struct BlasRefitDecision {
     in_place_update: Option<(u64, u64)>,
     next_consecutive_refits: u32,
     is_refit: bool,
+    /// `true` when this decision is a periodic full rebuild triggered by `refit_period`.
+    is_periodic_rebuild: bool,
+}
+
+/// Deterministic staggered initial `consecutive_refits` offset (`(dest_key >> 8) % period`)
+/// so dynamic BLASes created on the same frame do not stampede full rebuilds together (`R2-F`).
+fn initial_staggered_refits(dest_key: u64, refit_period: u32) -> u32 {
+    if refit_period <= 1 {
+        return 0;
+    }
+    ((dest_key >> 8) % u64::from(refit_period)) as u32
 }
 
 /// Pure dynamic BLAS refit policy shared by explicit title `PERFORM_UPDATE`
-/// calls and opt-in `VICTORY_NATIVE_RT_REFIT=1` automatic promotion.
+/// calls and `VICTORY_NATIVE_RT_REFIT=1` automatic promotion, with per-frame
+/// periodic full-rebuild budget gating (`<= 4` full rebuilds/frame, `R2-F`).
 #[allow(clippy::too_many_arguments)]
-fn decide_blas_refit(
+fn decide_blas_refit_with_budget(
     raw_flags: u32,
     dest_key: u64,
     source_va: u64,
@@ -5997,6 +6471,7 @@ fn decide_blas_refit(
     existing_src: Option<ExistingBlasRefitInfo>,
     refit_enabled: bool,
     refit_period: u32,
+    allow_periodic_rebuild: bool,
 ) -> BlasRefitDecision {
     const ALLOW_UPDATE: u32 = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE.0 as u32;
     const ALLOW_COMPACTION: u32 =
@@ -6010,9 +6485,14 @@ fn decide_blas_refit(
     const OTHER_MASK: u32 = !(ALLOW_UPDATE | PERFORM_UPDATE | PREF_MASK);
 
     // Never OR `ALLOW_UPDATE` onto `ALLOW_COMPACTION`-only BLASes: doing so bloats
-    // compacted builds by 30-50% and defeats compaction (`ARCH-10`).
+    // compacted builds by 30-50% and violates Spec-Trap #7 (`ARCH-10`).
     let compaction_only = (raw_flags & ALLOW_COMPACTION) != 0 && (raw_flags & ALLOW_UPDATE) == 0;
     let effective_refit = refit_enabled && !compaction_only;
+    let init_refits = if effective_refit {
+        initial_staggered_refits(dest_key, refit_period)
+    } else {
+        0
+    };
 
     let is_compatible = |entry: &ExistingBlasRefitInfo| -> bool {
         let pref_ok = (entry.flags & PREF_MASK) == (raw_flags & PREF_MASK)
@@ -6027,9 +6507,10 @@ fn decide_blas_refit(
             && topo_hash != 0
     };
     let full_flags = (raw_flags & !PERFORM_UPDATE) | if effective_refit { ALLOW_UPDATE } else { 0 };
-    // Periodic full rebuilds upgrade to PREFER_FAST_TRACE | ALLOW_UPDATE so the
-    // subsequent 63 refits trace a higher-quality BVH topology.
-    let periodic_full_flags = (raw_flags & !(PERFORM_UPDATE | PREFER_FAST_BUILD)) | PREFER_FAST_TRACE | ALLOW_UPDATE;
+    // Periodic full rebuilds upgrade to PREFER_FAST_TRACE | ALLOW_UPDATE (strictly stripping
+    // ALLOW_COMPACTION per Spec-Trap #7) so subsequent refits trace a higher-quality BVH topology.
+    let periodic_full_flags =
+        (raw_flags & !(PERFORM_UPDATE | PREFER_FAST_BUILD | ALLOW_COMPACTION)) | PREFER_FAST_TRACE | ALLOW_UPDATE;
 
     if raw_flags & PERFORM_UPDATE != 0 && source_va != 0 {
         let src_key = source_va & !0xFF;
@@ -6037,13 +6518,18 @@ fn decide_blas_refit(
         if let Some(src) = candidate
             && is_compatible(&src)
         {
-            if effective_refit && refit_period > 0 && src.consecutive_refits >= refit_period {
+            if effective_refit
+                && refit_period > 0
+                && src.consecutive_refits >= refit_period
+                && allow_periodic_rebuild
+            {
                 return BlasRefitDecision {
                     flags: periodic_full_flags,
                     host_src_va: 0,
                     in_place_update: None,
                     next_consecutive_refits: 0,
                     is_refit: false,
+                    is_periodic_rebuild: true,
                 };
             }
             let update_flags = if effective_refit {
@@ -6062,14 +6548,16 @@ fn decide_blas_refit(
                 in_place_update: in_place,
                 next_consecutive_refits: src.consecutive_refits.saturating_add(1),
                 is_refit: true,
+                is_periodic_rebuild: false,
             };
         }
         return BlasRefitDecision {
             flags: full_flags,
             host_src_va: 0,
             in_place_update: None,
-            next_consecutive_refits: 0,
+            next_consecutive_refits: init_refits,
             is_refit: false,
+            is_periodic_rebuild: false,
         };
     }
 
@@ -6078,13 +6566,14 @@ fn decide_blas_refit(
         && is_compatible(&dst)
         && dst.update_scratch_bytes > 0
     {
-        if refit_period > 0 && dst.consecutive_refits >= refit_period {
+        if refit_period > 0 && dst.consecutive_refits >= refit_period && allow_periodic_rebuild {
             return BlasRefitDecision {
                 flags: periodic_full_flags,
                 host_src_va: 0,
                 in_place_update: None,
                 next_consecutive_refits: 0,
                 is_refit: false,
+                is_periodic_rebuild: true,
             };
         }
         return BlasRefitDecision {
@@ -6093,6 +6582,7 @@ fn decide_blas_refit(
             in_place_update: Some((dst.gpu_va, dst.update_scratch_bytes)),
             next_consecutive_refits: dst.consecutive_refits.saturating_add(1),
             is_refit: true,
+            is_periodic_rebuild: false,
         };
     }
 
@@ -6100,9 +6590,35 @@ fn decide_blas_refit(
         flags: full_flags,
         host_src_va: 0,
         in_place_update: None,
-        next_consecutive_refits: 0,
+        next_consecutive_refits: init_refits,
         is_refit: false,
+        is_periodic_rebuild: false,
     }
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn decide_blas_refit(
+    raw_flags: u32,
+    dest_key: u64,
+    source_va: u64,
+    topo_hash: u64,
+    existing_dst: Option<ExistingBlasRefitInfo>,
+    existing_src: Option<ExistingBlasRefitInfo>,
+    refit_enabled: bool,
+    refit_period: u32,
+) -> BlasRefitDecision {
+    decide_blas_refit_with_budget(
+        raw_flags,
+        dest_key,
+        source_va,
+        topo_hash,
+        existing_dst,
+        existing_src,
+        refit_enabled,
+        refit_period,
+        true,
+    )
 }
 
 /// Records a contiguous batch of dynamic `DxrOp::BuildBlas` operations (`ARCH-14`):
@@ -6155,6 +6671,8 @@ unsafe fn record_build_blas_batch(
         total_tris: u32,
         topo_hash: u64,
         geom_va_hash: u64,
+        /// Hash of CPU-watched source buffer IDs & write epochs (`0` if any source is GPU-written or unwatched).
+        source_epoch_hash: u64,
         any_gpu_written: bool,
         any_transform: bool,
     }
@@ -6213,6 +6731,12 @@ unsafe fn record_build_blas_batch(
             let mut total_tris = 0u32;
             let mut any_gpu_written = false;
             let mut any_transform = false;
+            let mut epoch_trackable = true;
+            let mut epoch_h: u64 = 0xcbf2_9ce4_8422_2325;
+            let mix_epoch = |h: &mut u64, v: u64| {
+                *h ^= v;
+                *h = h.wrapping_mul(0x0100_0000_01b3);
+            };
             for g in geometries {
                 match g.kind {
                     GeometryKind::Triangles {
@@ -6249,6 +6773,16 @@ unsafe fn record_build_blas_batch(
                                     if gpu % vtx_align == 0 {
                                         if s.written() || s.gpu_only_skip() {
                                             any_gpu_written = true;
+                                            epoch_trackable = false;
+                                        } else if s.in_place() {
+                                            epoch_trackable = false;
+                                        } else if epoch_trackable {
+                                            let ep = crate::watch::range_write_epoch(
+                                                vertex_buffer_va as usize,
+                                                (vertex_buffer_va.saturating_add(len)) as usize,
+                                            );
+                                            mix_epoch(&mut epoch_h, s.id());
+                                            mix_epoch(&mut epoch_h, ep);
                                         }
                                         sub.kept_shadows.push(s);
                                         (gpu, vertex_count, vertex_buffer_stride)
@@ -6277,6 +6811,16 @@ unsafe fn record_build_blas_batch(
                                         if gpu % elem == 0 {
                                             if s.written() || s.gpu_only_skip() {
                                                 any_gpu_written = true;
+                                                epoch_trackable = false;
+                                            } else if s.in_place() {
+                                                epoch_trackable = false;
+                                            } else if epoch_trackable {
+                                                let ep = crate::watch::range_write_epoch(
+                                                    index_buffer as usize,
+                                                    (index_buffer.saturating_add(len)) as usize,
+                                                );
+                                                mix_epoch(&mut epoch_h, s.id());
+                                                mix_epoch(&mut epoch_h, ep);
                                             }
                                             sub.kept_shadows.push(s);
                                             (gpu, aligned_ic, DXGI_FORMAT(pc_idx_fmt as i32))
@@ -6310,6 +6854,19 @@ unsafe fn record_build_blas_batch(
                                     let gpu = s.gpu(transform3x4);
                                     if gpu % 16 == 0 {
                                         any_transform = true;
+                                        if s.written() || s.gpu_only_skip() {
+                                            any_gpu_written = true;
+                                            epoch_trackable = false;
+                                        } else if s.in_place() {
+                                            epoch_trackable = false;
+                                        } else if epoch_trackable {
+                                            let ep = crate::watch::range_write_epoch(
+                                                transform3x4 as usize,
+                                                (transform3x4.saturating_add(48)) as usize,
+                                            );
+                                            mix_epoch(&mut epoch_h, s.id());
+                                            mix_epoch(&mut epoch_h, ep);
+                                        }
                                         sub.kept_shadows.push(s);
                                         gpu
                                     } else {
@@ -6369,6 +6926,19 @@ unsafe fn record_build_blas_batch(
                                 Some(s) if s.left(aabbs_va) >= len => {
                                     let gpu = s.gpu(aabbs_va);
                                     if gpu % 8 == 0 {
+                                        if s.written() || s.gpu_only_skip() {
+                                            any_gpu_written = true;
+                                            epoch_trackable = false;
+                                        } else if s.in_place() {
+                                            epoch_trackable = false;
+                                        } else if epoch_trackable {
+                                            let ep = crate::watch::range_write_epoch(
+                                                aabbs_va as usize,
+                                                (aabbs_va.saturating_add(len)) as usize,
+                                            );
+                                            mix_epoch(&mut epoch_h, s.id());
+                                            mix_epoch(&mut epoch_h, ep);
+                                        }
                                         sub.kept_shadows.push(s);
                                         (gpu, aabb_count)
                                     } else {
@@ -6399,6 +6969,12 @@ unsafe fn record_build_blas_batch(
             }
             let topo_hash = blas_topology_hash(&host_geoms);
             let geom_va_hash = blas_geom_va_hash(&host_geoms);
+            let source_epoch_hash = if epoch_trackable && !any_gpu_written {
+                mix_epoch(&mut epoch_h, geom_va_hash);
+                if epoch_h == 0 { 1 } else { epoch_h }
+            } else {
+                0
+            };
             resolved.push(ResolvedBlas {
                 key,
                 source_va: *source_va,
@@ -6409,6 +6985,7 @@ unsafe fn record_build_blas_batch(
                 total_tris,
                 topo_hash,
                 geom_va_hash,
+                source_epoch_hash,
                 any_gpu_written,
                 any_transform,
             });
@@ -6417,6 +6994,14 @@ unsafe fn record_build_blas_batch(
         if resolved.is_empty() {
             continue;
         }
+
+        // Reset per-frame periodic full dynamic BLAS rebuild cap on frame rollover (`R2-F`).
+        let cur_frame = crate::frame::current();
+        if state.dyn_full_rebuilds_frame != cur_frame {
+            state.dyn_full_rebuilds_frame = cur_frame;
+            state.dyn_full_rebuilds_count = 0;
+        }
+        let skip_noop_on = skip_noop_dynamic_refit();
 
         // Phase 2: Acquire `AS_MAP` write lock ONCE for the entire sub-batch (instead of 3×/BLAS!).
         let mut planned: Vec<PlannedBlas> = Vec::with_capacity(resolved.len());
@@ -6434,7 +7019,9 @@ unsafe fn record_build_blas_batch(
                 } else {
                     None
                 };
-                let decision = decide_blas_refit(
+                let allow_periodic =
+                    state.dyn_full_rebuilds_count < MAX_DYNAMIC_FULL_REBUILDS_PER_FRAME;
+                let decision = decide_blas_refit_with_budget(
                     item.raw_flags,
                     item.key,
                     item.source_va,
@@ -6443,7 +7030,29 @@ unsafe fn record_build_blas_batch(
                     existing_src,
                     refit_on,
                     period,
+                    allow_periodic,
                 );
+                if decision.is_periodic_rebuild {
+                    state.dyn_full_rebuilds_count = state.dyn_full_rebuilds_count.saturating_add(1);
+                }
+
+                // Skip redundant in-place refit on CPU-only dynamic BLASes when every source
+                // buffer's shadow ID, VA/stride, and write epoch is unchanged since last build (`R2-F`).
+                if skip_noop_on
+                    && decision.is_refit
+                    && decision.in_place_update.is_some()
+                    && item.postbuild.is_empty()
+                    && item.source_epoch_hash != 0
+                    && let Some(existing) = map.get_mut(&item.key)
+                    && existing.last_built_source_epoch == item.source_epoch_hash
+                    && existing.geom_va_hash == item.geom_va_hash
+                    && existing.geom_va_hash != 0
+                {
+                    existing.last_seen_tlas_epoch.store(cur_epoch, Ordering::Relaxed);
+                    STATS[STAT_SKIPPED].fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+
                 let flags = decision.flags;
                 let host_src_va = decision.host_src_va;
 
@@ -6499,6 +7108,7 @@ unsafe fn record_build_blas_batch(
                             existing.consecutive_refits = decision.next_consecutive_refits;
                             existing.compacted_size = 0;
                             existing.last_seen_tlas_epoch.store(cur_epoch, Ordering::Relaxed);
+                            existing.last_built_source_epoch = item.source_epoch_hash;
                             Some((existing.gpu_va, generation, existing.slice.size))
                         } else if let Some((buffer, slice, gpu_va)) =
                             state.slabs.alloc(host, SlabTier::TransientDynamicTlas, result_bytes)
@@ -6520,6 +7130,7 @@ unsafe fn record_build_blas_batch(
                                 compacted_size: 0,
                                 last_seen_tlas_epoch: AtomicU64::new(cur_epoch),
                                 geom_va_hash: 0,
+                                last_built_source_epoch: item.source_epoch_hash,
                                 normals_geom_off: 0,
                                 normals_geom_len: 0,
                                 normals_data_off: 0,
@@ -6552,6 +7163,7 @@ unsafe fn record_build_blas_batch(
                             entry.flags = flags;
                             entry.consecutive_refits = decision.next_consecutive_refits;
                             entry.last_seen_tlas_epoch.store(cur_epoch, Ordering::Relaxed);
+                            entry.last_built_source_epoch = item.source_epoch_hash;
                         }
                         let prev_va_hash = entry.geom_va_hash;
                         entry.geom_va_hash = item.geom_va_hash;
@@ -7418,6 +8030,8 @@ unsafe fn record_build_tlas_batch(
     host_inst_in_srv: &mut bool,
     normals_gpu: Option<&(ID3D12Resource, u64)>,
     normals_state: &mut D3D12_RESOURCE_STATES,
+    blas_epoch_gpu: Option<&(ID3D12Resource, u64)>,
+    blas_epoch_written: &mut bool,
     built_tlas: &mut bool,
     use_compute: bool,
 ) -> bool {
@@ -7436,6 +8050,7 @@ unsafe fn record_build_tlas_batch(
         mirror_rel_off: u32,
         num_instances: u32,
         tlas_inst_base: u32,
+        tlas_cull_slot: u32,
     }
     struct PreparedTlas {
         dest_gpu_va: u64,
@@ -7447,7 +8062,6 @@ unsafe fn record_build_tlas_batch(
         postbuild: Vec<D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC>,
     }
 
-    let want_mirror = mirror_tlas_enabled();
     let dest_keys: Vec<u64> = tlas_ops
         .iter()
         .map(|op| match *op {
@@ -7472,6 +8086,7 @@ unsafe fn record_build_tlas_batch(
         let mut total_inst_bytes = 0u64;
         let mut max_scratch = AS_ALIGN;
         let mut sum_scratch = 0u64;
+        let dispatch_epoch = state.tlas_build_epoch.saturating_add(1);
 
         for op in slice {
             let DxrOp::BuildTlas {
@@ -7498,6 +8113,10 @@ unsafe fn record_build_tlas_batch(
             let mut effective_instances = *num_instances;
             let mut patch = None;
             let flags = (*raw_flags & !(ALLOW_UPDATE | PERFORM_UPDATE | PREFER_FAST_BUILD)) | PREFER_FAST_TRACE;
+            let build_mirror = state.tlas_needs_mirror(key);
+            let cull_slot = state
+                .tlas_cull_slot(key)
+                .map_or(u32::MAX, |s| s as u32);
             let (result_bytes, scratch_bytes) = if effective_instances > 0 && *instance_descs_va != 0 {
                 let inst_bytes = u64::from(effective_instances).saturating_mul(64);
                 let guest_shadow = crate::shadow::find(*instance_descs_va, inst_bytes);
@@ -7508,7 +8127,6 @@ unsafe fn record_build_tlas_batch(
                     if rb > 0 {
                         let primary_aligned = inst_bytes.max(AS_ALIGN).next_multiple_of(AS_ALIGN);
                         let inst_off = total_inst_bytes;
-                        let build_mirror = want_mirror && key != EMPTY_TLAS_KEY;
                         let (mirror_inst_off, mirror_rel_off) = if build_mirror {
                             let m_off = inst_off.saturating_add(primary_aligned);
                             total_inst_bytes = m_off.saturating_add(primary_aligned);
@@ -7518,28 +8136,39 @@ unsafe fn record_build_tlas_batch(
                             (0, 0)
                         };
                         let guest_gpu = guest_shadow.gpu(*instance_descs_va);
-                        // Periodic TLAS-reachability liveness scan for deterministic `AS_MAP` GC (`ARCH-10`).
-                        let scan_epoch = state.tlas_build_epoch.saturating_add(1);
+                        // Periodic CPU-readable TLAS liveness fallback (GPU `blas_last_epoch`
+                        // handles GPU-written TLASes automatically; never touch `PAGE_NOACCESS`
+                        // tripwired buffers per Spec-Trap #4).
+                        let scan_epoch = dispatch_epoch;
                         if scan_epoch <= 16 || (scan_epoch & 7) < 2 {
-                            if guest_shadow.written() {
+                            let tripwired = crate::shadow::is_tripwired(
+                                *instance_descs_va as usize,
+                                inst_bytes as usize,
+                            );
+                            if guest_shadow.written() || tripwired {
                                 state.last_unreadable_tlas_epoch = scan_epoch;
                             } else if inst_bytes <= (4 << 20) {
                                 let len = inst_bytes as usize;
                                 state.inst_scan_buf.resize(len, 0);
-                                crate::host::copy_mapped(
-                                    state.inst_scan_buf.as_mut_ptr(),
-                                    *instance_descs_va as *const u8,
-                                    len,
-                                    false,
-                                );
-                                let map = as_map().read().unwrap_or_else(|e| e.into_inner());
-                                for chunk in state.inst_scan_buf.chunks_exact(64) {
-                                    let va = u64::from_le_bytes(chunk[56..64].try_into().unwrap());
-                                    if va != 0
-                                        && let Some(entry) = map.get(&(va & !0xFF))
-                                    {
-                                        entry.last_seen_tlas_epoch.store(scan_epoch, Ordering::Relaxed);
+                                let _ = safe_read_guest_bytes(*instance_descs_va, &mut state.inst_scan_buf);
+                                let mut saw_cull_disable = false;
+                                {
+                                    let map = as_map().read().unwrap_or_else(|e| e.into_inner());
+                                    for chunk in state.inst_scan_buf.chunks_exact(64) {
+                                        let va = u64::from_le_bytes(chunk[56..64].try_into().unwrap());
+                                        if va != 0 {
+                                            let r3_y = u32::from_le_bytes(chunk[52..56].try_into().unwrap());
+                                            if (r3_y & 0x0100_0000) != 0 {
+                                                saw_cull_disable = true;
+                                            }
+                                            if let Some(entry) = map.get(&(va & !0xFF)) {
+                                                entry.last_seen_tlas_epoch.store(scan_epoch, Ordering::Relaxed);
+                                            }
+                                        }
                                     }
+                                }
+                                if saw_cull_disable {
+                                    state.note_tlas_cull_disable(key, scan_epoch);
                                 }
                                 state.last_readable_tlas_scan_epoch = scan_epoch;
                             }
@@ -7553,6 +8182,7 @@ unsafe fn record_build_tlas_batch(
                             mirror_rel_off,
                             num_instances: effective_instances,
                             tlas_inst_base: if normals_gpu.is_some() { tlas_meta_base(key) } else { 0 },
+                            tlas_cull_slot: cull_slot,
                         });
                     }
                     (rb, sb)
@@ -7585,7 +8215,11 @@ unsafe fn record_build_tlas_batch(
                 STATS[STAT_SKIPPED].fetch_add(1, Ordering::Relaxed);
                 continue;
             };
-            let mirror_dest_gpu_va = host_dst.mirror_gpu_va;
+            let mirror_dest_gpu_va = if build_mirror {
+                host_dst.mirror_gpu_va
+            } else {
+                None
+            };
             if mirror_dest_gpu_va.is_none()
                 && let Some(p) = patch.as_mut()
             {
@@ -7691,6 +8325,11 @@ unsafe fn record_build_tlas_batch(
                 *inst_gpu
             };
             let u2_gpu = normals_gpu.map_or(*inst_gpu, |(_, g)| *g);
+            let (u3_gpu, epoch_buf_len) = match blas_epoch_gpu {
+                Some((_, g)) => (*g, BLAS_EPOCH_SLOTS as u32),
+                None => (*inst_gpu, 0u32),
+            };
+            let cur_epoch_u32 = dispatch_epoch.min(u64::from(u32::MAX)) as u32;
             // SAFETY: open list; all root views and buffers live through submission.
             unsafe {
                 if let Some((n_buf, _)) = normals_gpu
@@ -7740,6 +8379,7 @@ unsafe fn record_build_tlas_batch(
                 list.SetComputeRootShaderResourceView(2, hash_gpu_buf.GetGPUVirtualAddress());
                 list.SetComputeRootUnorderedAccessView(4, u1_gpu);
                 list.SetComputeRootUnorderedAccessView(5, u2_gpu);
+                list.SetComputeRootUnorderedAccessView(6, u3_gpu);
                 for item in &prepared {
                     if let Some(p) = &item.patch {
                         let constants = [
@@ -7750,11 +8390,17 @@ unsafe fn record_build_tlas_batch(
                             PATCH_ENABLE_STATS,
                             p.tlas_inst_base,
                             p.mirror_rel_off,
+                            cur_epoch_u32,
+                            epoch_buf_len,
+                            p.tlas_cull_slot,
                         ];
-                        list.SetComputeRoot32BitConstants(0, 7, constants.as_ptr().cast(), 0);
+                        list.SetComputeRoot32BitConstants(0, 10, constants.as_ptr().cast(), 0);
                         list.SetComputeRootShaderResourceView(1, p.aligned_base);
                         list.SetComputeRootUnorderedAccessView(3, *inst_gpu + p.inst_off);
                         list.Dispatch(p.num_instances.div_ceil(64), 1, 1);
+                        if epoch_buf_len > 0 {
+                            *blas_epoch_written = true;
+                        }
                     }
                 }
                 emit_dxr_buffer_barrier(
@@ -7902,7 +8548,7 @@ fn allocate_fresh_as(
         min_bytes
     };
     let (buffer, slice, gpu_va) = state.slabs.alloc(host, tier, alloc_bytes)?;
-    let mirror_tlas = if kind == AsKind::Tlas && mirror_tlas_enabled() && guest_key != EMPTY_TLAS_KEY {
+    let mirror_tlas = if kind == AsKind::Tlas && state.tlas_needs_mirror(guest_key) {
         let m_bytes = min_bytes.max(DEFAULT_MIRROR_TLAS_RESERVE);
         state
             .slabs
@@ -7938,6 +8584,7 @@ fn allocate_fresh_as(
         compacted_size: 0,
         last_seen_tlas_epoch: AtomicU64::new(cur_epoch),
         geom_va_hash: 0,
+        last_built_source_epoch: 0,
         normals_geom_off: 0,
         normals_geom_len: 0,
         normals_data_off: 0,
@@ -7970,7 +8617,7 @@ fn allocate_or_reuse_as(
 ) -> Option<AllocatedAs> {
     let generation = state.bump_gen();
     let cur_epoch = state.tlas_build_epoch;
-    let want_mirror = kind == AsKind::Tlas && mirror_tlas_enabled() && guest_key != EMPTY_TLAS_KEY;
+    let want_mirror = kind == AsKind::Tlas && state.tlas_needs_mirror(guest_key);
     let mut map = as_map().write().unwrap_or_else(|e| e.into_inner());
     if let Some(existing) = map.get_mut(&guest_key)
         && existing.kind == kind
@@ -8002,6 +8649,18 @@ fn allocate_or_reuse_as(
                 }
                 mirror_replaced = true;
             }
+        } else if !want_mirror
+            && let Some(old_m) = existing.mirror_tlas.take()
+        {
+            // TLAS confirmed zero `cull_disable` instances: retire Mirror TLAS slice behind
+            // GPU fences and bump view cache epoch so `HostHeap` twin slots rebind to Primary TLAS.
+            state.slabs.retire(
+                old_m.slice,
+                state.tlas_build_epoch.saturating_add(2),
+                state.sub_seq.saturating_add(2),
+                retire_dxr_fence_target(),
+            );
+            mirror_replaced = true;
         }
         existing.flags = flags;
         existing.num_instances = num_instances;
@@ -8066,6 +8725,7 @@ fn allocate_or_reuse_as(
         compacted_size: 0,
         last_seen_tlas_epoch: AtomicU64::new(cur_epoch),
         geom_va_hash: 0,
+        last_built_source_epoch: 0,
         normals_geom_off: 0,
         normals_geom_len: 0,
         normals_data_off: 0,
@@ -8763,13 +9423,16 @@ mod tests {
         assert_eq!(d_off.in_place_update, None);
         assert!(!d_off.is_refit);
 
-        // Refit ON, first build (no existing): adds ALLOW_UPDATE and does full build.
+        // Refit ON, first build (no existing): adds ALLOW_UPDATE, does full build,
+        // and staggers initial `consecutive_refits` by `(dest_key >> 8) % refit_period`.
         let d_first = decide_blas_refit(fast_build, 0x1000, 0, 0x1234_5678, None, None, true, 64);
         assert_eq!(d_first.flags, fast_build | allow_upd);
         assert_eq!(d_first.host_src_va, 0);
         assert_eq!(d_first.in_place_update, None);
-        assert_eq!(d_first.next_consecutive_refits, 0);
+        assert_eq!(d_first.next_consecutive_refits, initial_staggered_refits(0x1000, 64));
+        assert_eq!(d_first.next_consecutive_refits, 16);
         assert!(!d_first.is_refit);
+        assert!(!d_first.is_periodic_rebuild);
 
         // Refit ON, matching existing below period: auto-promotes to in-place PERFORM_UPDATE.
         let d_auto = decide_blas_refit(fast_build, 0x1000, 0, 0x1234_5678, Some(existing), None, true, 64);
@@ -9002,8 +9665,8 @@ mod tests {
             (next_bucket[1], 0xB100, 21),
             (colliding[3], 0xA300, 13),
         ];
-        for &(va, host_va, goff) in &items {
-            insert_blas_hash_in(&mut table, &mut dirty, va, host_va, goff);
+        for (slot_i, &(va, host_va, goff)) in items.iter().enumerate() {
+            insert_blas_hash_in(&mut table, &mut dirty, va, host_va, goff, (slot_i + 1) as u32);
         }
         let _ = dirty.take_ranges();
 
@@ -9202,5 +9865,221 @@ mod tests {
             D3D12_BARRIER_SYNC_BUILD_RAYTRACING_ACCELERATION_STRUCTURE
                 | D3D12_BARRIER_SYNC_COMPUTE_SHADING
         );
+    }
+
+    #[test]
+    fn gpu_liveness_sweep_evicts_dead_blases_while_tlas_is_gpu_written() {
+        let Some(host) = host() else {
+            return;
+        };
+        let mut state = DxrState::new();
+        let mut map: HashMap<u64, HostAs> = HashMap::new();
+
+        // Simulate 3 resident BLASes created at epoch 10, registered in `blas_table` + dense slots.
+        state.tlas_build_epoch = 10;
+        let keys = [0x1_0001_0000u64, 0x1_0002_0000, 0x1_0003_0000];
+        let mut slots = [0u32; 3];
+        for (i, &k) in keys.iter().enumerate() {
+            let (buffer, slice, gpu_va) = state
+                .slabs
+                .alloc(host, SlabTier::TransientDynamicTlas, 4096)
+                .expect("alloc test BLAS slice");
+            state.insert_blas_hash(k, gpu_va, 0);
+            slots[i] = *state.blas_key_to_slot.get(&k).expect("dense slot allocated");
+            map.insert(
+                k,
+                HostAs {
+                    buffer,
+                    slice,
+                    gpu_va,
+                    mirror_tlas: None,
+                    kind: AsKind::Blas,
+                    flags: 0,
+                    num_instances: 0,
+                    built: true,
+                    generation: (i + 1) as u64,
+                    topo_hash: 0,
+                    update_scratch_bytes: 0,
+                    consecutive_refits: 0,
+                    compacted_size: 0,
+                    last_seen_tlas_epoch: AtomicU64::new(10),
+                    geom_va_hash: 0,
+                    last_built_source_epoch: 0,
+                    normals_geom_off: 0,
+                    normals_geom_len: 0,
+                    normals_data_off: 0,
+                    normals_data_len: 0,
+                },
+            );
+        }
+
+        // Advance to epoch 1000 while `guest_shadow.written() == true` EVERY frame
+        // (`last_unreadable_tlas_epoch == tlas_build_epoch`, which previously broke GC permanently!).
+        state.tlas_build_epoch = 1000;
+        state.last_unreadable_tlas_epoch = 1000;
+        state.last_readable_tlas_scan_epoch = 0;
+
+        // Before any GPU readback completes, sweep stays conservative (0 evicted).
+        assert_eq!(sweep_unreachable_blases_in(&mut state, &mut map), 0);
+
+        // GPU async readback at epoch 900 reports BLAS 0 was touched at epoch 880,
+        // BLAS 1 was last touched at epoch 200 (< 900 - 600 = 300), and BLAS 2 was never touched again (0).
+        let mut gpu_epochs = vec![0u32; BLAS_EPOCH_SLOTS];
+        gpu_epochs[slots[0] as usize] = 880;
+        gpu_epochs[slots[1] as usize] = 200;
+        merge_gpu_blas_epochs_in(&mut state, &map, 900, &gpu_epochs);
+        assert_eq!(state.last_gpu_liveness_epoch, 900);
+
+        // Sweep MUST evict BLAS 1 and BLAS 2 even while `last_unreadable_tlas_epoch == 1000`!
+        let evicted = sweep_unreachable_blases_in(&mut state, &mut map);
+        assert_eq!(evicted, 2);
+        assert!(map.contains_key(&keys[0]), "live BLAS touched at GPU epoch 880 must survive");
+        assert!(!map.contains_key(&keys[1]), "stale BLAS last touched at epoch 200 must be evicted");
+        assert!(!map.contains_key(&keys[2]), "dead BLAS untouched since epoch 10 must be evicted");
+        assert!(lookup_blas_hash_in(&state.blas_table, keys[0]).is_some());
+        assert_eq!(lookup_blas_hash_in(&state.blas_table, keys[1]), None);
+        assert_eq!(lookup_blas_hash_in(&state.blas_table, keys[2]), None);
+        // Retired slots are deferred until GPU fences pass, then recycled cleanly.
+        assert_eq!(state.retired_epoch_slots.len(), 2);
+        state.drain_retired_epoch_slots(1001, 100, u64::MAX);
+        assert!(state.blas_slot_free.is_empty());
+        state.drain_retired_epoch_slots(1002, 100, u64::MAX);
+        assert_eq!(state.blas_slot_free.len(), 2);
+    }
+
+    #[test]
+    fn staggered_dynamic_blas_rebuilds_never_exceed_four_per_frame_and_preserve_spec_trap_7() {
+        let allow_upd = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE.0 as u32;
+        let allow_cmp = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_COMPACTION.0 as u32;
+        let fast_build = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD.0 as u32;
+        let fast_trace = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE.0 as u32;
+
+        // Simulate 59 dynamic BLASes created on frame 0 and updated every frame for 128 frames.
+        let mut blases: Vec<(u64, ExistingBlasRefitInfo)> = (0..59u64)
+            .map(|i| {
+                let key = (0x2_0000 + i) << 8;
+                let init = decide_blas_refit_with_budget(
+                    fast_build,
+                    key,
+                    0,
+                    0xABCD,
+                    None,
+                    None,
+                    true,
+                    DEFAULT_REFIT_PERIOD,
+                    true,
+                );
+                (
+                    key,
+                    ExistingBlasRefitInfo {
+                        gpu_va: 0x1000_0000 + (i << 12),
+                        flags: init.flags,
+                        built: true,
+                        topo_hash: 0xABCD,
+                        update_scratch_bytes: 4096,
+                        consecutive_refits: init.next_consecutive_refits,
+                    },
+                )
+            })
+            .collect();
+
+        // Verify initial offsets are staggered across `[0, 64)` rather than all starting at 0.
+        assert!(blases.iter().any(|(_, b)| b.consecutive_refits != 0));
+
+        let mut total_periodic = 0u32;
+        for _frame in 1..=128 {
+            let mut full_this_frame = 0u32;
+            for (key, info) in &mut blases {
+                let allow = full_this_frame < MAX_DYNAMIC_FULL_REBUILDS_PER_FRAME;
+                let d = decide_blas_refit_with_budget(
+                    fast_build,
+                    *key,
+                    0,
+                    0xABCD,
+                    Some(*info),
+                    None,
+                    true,
+                    DEFAULT_REFIT_PERIOD,
+                    allow,
+                );
+                if d.is_periodic_rebuild {
+                    full_this_frame += 1;
+                    total_periodic += 1;
+                    // Spec-Trap #7: periodic dynamic full rebuild must NEVER combine ALLOW_COMPACTION | ALLOW_UPDATE.
+                    assert_eq!(d.flags & allow_cmp, 0);
+                    assert_eq!(d.flags & (fast_trace | allow_upd), fast_trace | allow_upd);
+                }
+                info.flags = d.flags;
+                info.consecutive_refits = d.next_consecutive_refits;
+            }
+            assert!(
+                full_this_frame <= MAX_DYNAMIC_FULL_REBUILDS_PER_FRAME,
+                "frame exceeded hard cap of 4 periodic full rebuilds: {full_this_frame}"
+            );
+        }
+        // All 59 BLASes still get rebuilt periodically over 128 frames (~2 rebuilds each).
+        assert!(total_periodic >= 59, "expected periodic rebuilds across 128 frames, got {total_periodic}");
+
+        // Even if a guest originally passed ALLOW_COMPACTION | ALLOW_UPDATE, periodic rebuild strips ALLOW_COMPACTION.
+        let both_info = ExistingBlasRefitInfo {
+            gpu_va: 0x3000_0000,
+            flags: fast_build | allow_cmp | allow_upd,
+            built: true,
+            topo_hash: 0x5555,
+            update_scratch_bytes: 4096,
+            consecutive_refits: DEFAULT_REFIT_PERIOD,
+        };
+        let d_strip = decide_blas_refit_with_budget(
+            fast_build | allow_cmp | allow_upd,
+            0x4000,
+            0,
+            0x5555,
+            Some(both_info),
+            None,
+            true,
+            DEFAULT_REFIT_PERIOD,
+            true,
+        );
+        assert!(d_strip.is_periodic_rebuild);
+        assert_eq!(d_strip.flags & allow_cmp, 0);
+        assert_ne!(d_strip.flags & allow_upd, 0);
+    }
+
+    #[test]
+    fn per_tlas_mirror_gating_is_conservative_and_gates_only_confirmed_zero_cull_disable() {
+        let mut state = DxrState::new();
+        let tlas_a = 0x5_0000_0000u64;
+        let tlas_b = 0x6_0000_0000u64;
+
+        // Before any readback confirms zero `cull_disable`, both TLASes conservatively build mirrors.
+        state.tlas_build_epoch = 1;
+        assert!(state.tlas_needs_mirror_with(tlas_a, true, true));
+        assert!(state.tlas_needs_mirror_with(tlas_b, true, true));
+        assert!(!state.tlas_needs_mirror_with(EMPTY_TLAS_KEY, true, true));
+
+        let slot_a = state.tlas_cull_slot(tlas_a).unwrap();
+        let slot_b = state.tlas_cull_slot(tlas_b).unwrap();
+        assert_ne!(slot_a, slot_b);
+
+        // GPU readback at epoch 20 observes `cull_disable` on `tlas_a` (epoch 18) and zero on `tlas_b`.
+        let mut cull_epochs = vec![0u32; TLAS_CULL_SLOTS];
+        cull_epochs[slot_a] = 18;
+        merge_gpu_tlas_cull_epochs(&mut state, 20, &cull_epochs);
+
+        assert!(
+            state.tlas_needs_mirror_with(tlas_a, true, true),
+            "TLAS with observed cull_disable MUST keep building Mirror TLAS"
+        );
+        assert!(
+            !state.tlas_needs_mirror_with(tlas_b, true, true),
+            "TLAS confirmed zero cull_disable after >= 16 epochs skips Mirror TLAS"
+        );
+        // Kill-switch (`gate_on == false`) keeps building mirror for all TLASes.
+        assert!(state.tlas_needs_mirror_with(tlas_b, true, false));
+
+        // If `tlas_b` later gains a `cull_disable` instance, mirror immediately re-enables!
+        cull_epochs[slot_b] = 45;
+        merge_gpu_tlas_cull_epochs(&mut state, 45, &cull_epochs);
+        assert!(state.tlas_needs_mirror_with(tlas_b, true, true));
     }
 }

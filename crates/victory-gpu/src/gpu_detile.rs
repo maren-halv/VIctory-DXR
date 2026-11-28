@@ -121,6 +121,14 @@ fn log_startup_once(host: &Host) {
     });
 }
 
+/// Snapshot of telemetry counters:
+/// `[0]` batches, `[1]` textures, `[2]` dispatches, `[3]` linear bytes,
+/// `[4]` compute-queue batches, `[5]` ring wraps, `[6]` ring stalls, `[7]` oversized.
+#[cfg(test)]
+pub(crate) fn telemetry_snapshot() -> [u64; 8] {
+    std::array::from_fn(|i| TELEMETRY[i].load(Ordering::Relaxed))
+}
+
 fn record_telemetry(
     textures: u64,
     dispatches: u64,
@@ -325,6 +333,74 @@ pub(crate) struct BatchItem<'a> {
     pub indices: &'a [usize],
     pub linear_bytes: u64,
     pub need_aliasing: bool,
+}
+
+/// Owned `COMMON`-state texture detile entry accumulated across lists in a
+/// submission for [`ComputeBatch`], keeping both source staging and destination
+/// texture alive until the compute-queue `tex_fence` completes.
+pub(crate) struct ComputeBatchEntry {
+    pub staging: std::sync::Arc<crate::texture::Staging>,
+    pub dst_texture: ID3D12Resource,
+    pub src_gpu_va: u64,
+    pub src_len: u64,
+    pub sub_offset: u32,
+    pub jobs: Vec<SubresourceJob>,
+    pub indices: Vec<usize>,
+    pub linear_bytes: u64,
+    pub need_aliasing: bool,
+}
+
+// SAFETY: `Staging` is `Send + Sync` and `ID3D12Resource` is free-threaded.
+unsafe impl Send for ComputeBatchEntry {}
+
+impl ComputeBatchEntry {
+    fn as_item(&self) -> BatchItem<'_> {
+        let (layout, footprints) = self.staging.detile_parts();
+        BatchItem {
+            layout,
+            src_gpu_va: self.src_gpu_va,
+            src_len: self.src_len,
+            dst_texture: &self.dst_texture,
+            sub_offset: self.sub_offset,
+            footprints,
+            jobs: &self.jobs,
+            indices: &self.indices,
+            linear_bytes: self.linear_bytes,
+            need_aliasing: self.need_aliasing,
+        }
+    }
+}
+
+/// Per-submission accumulator of `COMMON`-state tiled texture uploads flushed
+/// together onto the dedicated `COMPUTE` queue (1 dispatch pass -> 1 buffer
+/// barrier -> all `CopyTextureRegion`s -> 1 `tex_fence` signal).
+#[derive(Default)]
+pub(crate) struct ComputeBatch {
+    items: Vec<ComputeBatchEntry>,
+    needs_direct_tile_sync: bool,
+}
+
+impl ComputeBatch {
+    pub(crate) fn push(&mut self, entry: ComputeBatchEntry, needs_direct_tile_sync: bool) {
+        self.items.push(entry);
+        self.needs_direct_tile_sync |= needs_direct_tile_sync;
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// Submits all queued `COMMON`-state uploads on the dedicated `COMPUTE`
+    /// queue asynchronously and returns the `tex_fence` value that `DirectQ`
+    /// must `Wait` on before sampling any uploaded texture.
+    pub(crate) fn flush(&mut self, host: &Host) -> Option<u64> {
+        if self.items.is_empty() {
+            return Some(0);
+        }
+        let items = std::mem::take(&mut self.items);
+        let needs_tile_sync = std::mem::replace(&mut self.needs_direct_tile_sync, false);
+        execute_compute_batch_owned(host, items, needs_tile_sync, false)
+    }
 }
 
 /// Packs the per-axis address-bit scatter positions into three `u32` shift words
@@ -897,8 +973,12 @@ fn alloc_prelude_slice(
             ring.last_list_raw = list_raw;
             Some((ring.buffer.clone(), offset, false, same_list))
         }
-        RingAlloc::Full | RingAlloc::Oversized => {
-            TELEMETRY[7].fetch_add(1, Ordering::Relaxed);
+        alloc_res @ (RingAlloc::Full | RingAlloc::Oversized) => {
+            if matches!(alloc_res, RingAlloc::Oversized) {
+                TELEMETRY[7].fetch_add(1, Ordering::Relaxed);
+            } else {
+                TELEMETRY[6].fetch_add(1, Ordering::Relaxed);
+            }
             let alloc_size = size.max(4).next_multiple_of(RING_ALIGN);
             // Reuse the smallest completed overflow buffer that fits.
             let best_idx = ring
@@ -1180,6 +1260,10 @@ struct ComputeSlot {
     fence_val: u64,
     /// Transient oversized scratch buffers held alive until `fence_val` lands.
     transient_buffers: Vec<ID3D12Resource>,
+    /// Owned staging buffers kept alive until `fence_val` lands on `ComputeQ`.
+    keep_alive_stagings: Vec<std::sync::Arc<crate::texture::Staging>>,
+    /// Owned destination textures kept alive until `fence_val` lands on `ComputeQ`.
+    keep_alive_textures: Vec<ID3D12Resource>,
 }
 
 struct ComputeDetiler {
@@ -1187,10 +1271,19 @@ struct ComputeDetiler {
     fence: ID3D12Fence,
     event: HANDLE,
     next_fence: u64,
+    /// Cross-queue fence used when a batch includes Tier-2 `on_demand` textures
+    /// whose `UpdateTileMappings` ran on `DirectQ` (`host.queue()`).
+    tile_sync_fence: ID3D12Fence,
+    tile_sync_val: u64,
+    /// Highest async residency fence value already waited on by `self.queue`.
+    waited_residency_fence: AtomicU64,
     slots: Vec<ComputeSlot>,
     next_slot: usize,
     ring_buffer: ID3D12Resource,
     ring: RingAllocator,
+    /// Reusable overflow scratch pool for rare single textures > ring capacity.
+    overflow_pool: Vec<(u64, u64, ID3D12Resource)>,
+    overflow_bytes: u64,
     enhanced: bool,
 }
 
@@ -1227,6 +1320,8 @@ impl ComputeDetiler {
             crate::host::name(&queue, || "gpu detile compute queue".into());
             let fence: ID3D12Fence = host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
             crate::host::name(&fence, || "gpu detile tex_fence".into());
+            let tile_sync_fence: ID3D12Fence = host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
+            crate::host::name(&tile_sync_fence, || "gpu detile tile_sync_fence".into());
             let event = CreateEventW(None, false, false, None).ok()?;
             let mut slots = Vec::with_capacity(COMPUTE_SLOTS);
             for idx in 0..COMPUTE_SLOTS {
@@ -1247,6 +1342,8 @@ impl ComputeDetiler {
                     list7,
                     fence_val: 0,
                     transient_buffers: Vec::new(),
+                    keep_alive_stagings: Vec::new(),
+                    keep_alive_textures: Vec::new(),
                 });
             }
             log_startup_once(host);
@@ -1255,13 +1352,63 @@ impl ComputeDetiler {
                 fence,
                 event,
                 next_fence: 0,
+                tile_sync_fence,
+                tile_sync_val: 0,
+                waited_residency_fence: AtomicU64::new(0),
                 slots,
                 next_slot: 0,
                 ring_buffer,
                 ring: RingAllocator::new(cap),
+                overflow_pool: Vec::new(),
+                overflow_bytes: 0,
                 enhanced,
             })
         }
+    }
+
+    fn alloc_oversized(&mut self, host: &Host, need: u64) -> Option<(ID3D12Resource, bool)> {
+        let alloc_size = need.next_multiple_of(RING_ALIGN);
+        // SAFETY: live fence.
+        let completed = unsafe { self.fence.GetCompletedValue() };
+        let completed = if completed == u64::MAX { 0 } else { completed };
+        let next_fence = self.next_fence.saturating_add(1);
+        let best_idx = self
+            .overflow_pool
+            .iter()
+            .enumerate()
+            .filter(|(_, (fence, cap, _))| *fence <= completed && *cap >= alloc_size)
+            .min_by_key(|(_, (_, cap, _))| *cap)
+            .map(|(i, _)| i);
+        if let Some(idx) = best_idx {
+            self.overflow_pool[idx].0 = next_fence;
+            return Some((self.overflow_pool[idx].2.clone(), false));
+        }
+        let class = alloc_size
+            .max(64 << 10)
+            .checked_next_power_of_two()
+            .unwrap_or(alloc_size);
+        let buf = host.internal_uav_buffer(class)?;
+        crate::host::name(&buf, || format!("gpu detile compute oversized {class:#x}"));
+        if class <= OVERFLOW_POOL_MAX_BYTES {
+            while self.overflow_bytes + class > OVERFLOW_POOL_MAX_BYTES {
+                let Some(evict) = self
+                    .overflow_pool
+                    .iter()
+                    .position(|(fence, _, _)| *fence <= completed)
+                else {
+                    break;
+                };
+                let (_, cap, old) = self.overflow_pool.swap_remove(evict);
+                self.overflow_bytes = self.overflow_bytes.saturating_sub(cap);
+                crate::host::retire(old);
+            }
+            if self.overflow_bytes + class <= OVERFLOW_POOL_MAX_BYTES {
+                self.overflow_bytes += class;
+                self.overflow_pool.push((next_fence, class, buf.clone()));
+                return Some((buf, false));
+            }
+        }
+        Some((buf, true))
     }
 
     fn wait_fence(&self, target: u64) -> bool {
@@ -1284,10 +1431,21 @@ impl ComputeDetiler {
     fn reclaim_completed(&mut self) {
         // SAFETY: live fence.
         let completed = unsafe { self.fence.GetCompletedValue() };
+        if completed == u64::MAX {
+            return;
+        }
         self.ring.reclaim(completed);
         for slot in &mut self.slots {
-            if slot.fence_val <= completed && !slot.transient_buffers.is_empty() {
-                slot.transient_buffers.clear();
+            if slot.fence_val <= completed {
+                if !slot.transient_buffers.is_empty() {
+                    slot.transient_buffers.clear();
+                }
+                if !slot.keep_alive_stagings.is_empty() {
+                    slot.keep_alive_stagings.clear();
+                }
+                if !slot.keep_alive_textures.is_empty() {
+                    slot.keep_alive_textures.clear();
+                }
             }
         }
     }
@@ -1295,10 +1453,15 @@ impl ComputeDetiler {
     /// Executes one chunk of items on the dedicated `COMPUTE` queue:
     /// **1 compute dispatch batch -> 1 scoped buffer barrier -> all `CopyTextureRegion`s**
     /// with every destination texture entering and exiting in `COMMON`.
+    #[allow(clippy::too_many_arguments)]
     fn submit_chunk(
         &mut self,
+        host: &Host,
         pass: &Pass,
-        chunk: &[(&BatchItem<'_>, Option<u64>, Option<ID3D12Resource>)],
+        chunk: &[(&BatchItem<'_>, Option<u64>, Option<(ID3D12Resource, bool)>)],
+        wait_direct_tile_sync: bool,
+        keep_stagings: Vec<std::sync::Arc<crate::texture::Staging>>,
+        keep_textures: Vec<ID3D12Resource>,
     ) -> Option<u64> {
         if chunk.is_empty() {
             return Some(self.next_fence);
@@ -1313,14 +1476,20 @@ impl ComputeDetiler {
 
         let slot = &mut self.slots[slot_idx];
         slot.transient_buffers.clear();
+        slot.keep_alive_stagings.clear();
+        slot.keep_alive_textures.clear();
         let mut uses_ring = false;
-        let mut transients: Vec<ID3D12Resource> = Vec::new();
-        for &(_, ring_off, ref transient) in chunk {
+        let mut overflow_bufs: Vec<ID3D12Resource> = Vec::new();
+        let mut transient_bufs: Vec<ID3D12Resource> = Vec::new();
+        for &(_, ring_off, ref overflow) in chunk {
             if ring_off.is_some() {
                 uses_ring = true;
             }
-            if let Some(buf) = transient {
-                transients.push(buf.clone());
+            if let Some((buf, is_transient)) = overflow {
+                overflow_bufs.push(buf.clone());
+                if *is_transient {
+                    transient_bufs.push(buf.clone());
+                }
             }
         }
 
@@ -1334,7 +1503,7 @@ impl ComputeDetiler {
 
             // Pre-dispatch transition (legacy only; Enhanced mode needs none on fresh list).
             if !use_enhanced {
-                let mut pre = Vec::with_capacity(1 + transients.len());
+                let mut pre = Vec::with_capacity(1 + overflow_bufs.len());
                 if uses_ring {
                     pre.push(crate::host::transition(
                         &self.ring_buffer,
@@ -1342,7 +1511,7 @@ impl ComputeDetiler {
                         D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                     ));
                 }
-                for buf in &transients {
+                for buf in &overflow_bufs {
                     pre.push(crate::host::transition(
                         buf,
                         D3D12_RESOURCE_STATE_COMMON,
@@ -1367,10 +1536,10 @@ impl ComputeDetiler {
             let mut total_dispatches = 0u64;
             let mut total_bytes = 0u64;
             let mut ok_flags = vec![false; chunk.len()];
-            for (idx, &(item, ring_off, ref transient)) in chunk.iter().enumerate() {
+            for (idx, &(item, ring_off, ref overflow)) in chunk.iter().enumerate() {
                 let (dst_buf, base_off) = if let Some(off) = ring_off {
                     (&self.ring_buffer, off)
-                } else if let Some(buf) = transient {
+                } else if let Some((buf, _)) = overflow {
                     (buf, 0)
                 } else {
                     continue;
@@ -1400,7 +1569,7 @@ impl ComputeDetiler {
             // Phase 2: 1 scoped buffer barrier (UAV -> COPY_SOURCE) + batched
             // destination texture transitions (COMMON -> COPY_DEST + ALIASING).
             if use_enhanced {
-                let mut buf_barriers = Vec::with_capacity(1 + transients.len());
+                let mut buf_barriers = Vec::with_capacity(1 + overflow_bufs.len());
                 if uses_ring {
                     buf_barriers.push(enhanced_buf_barrier(
                         &self.ring_buffer,
@@ -1410,7 +1579,7 @@ impl ComputeDetiler {
                         D3D12_BARRIER_ACCESS_COPY_SOURCE,
                     ));
                 }
-                for buf in &transients {
+                for buf in &overflow_bufs {
                     buf_barriers.push(enhanced_buf_barrier(
                         buf,
                         D3D12_BARRIER_SYNC_COMPUTE_SHADING,
@@ -1424,7 +1593,7 @@ impl ComputeDetiler {
                 }
             }
 
-            let mut tex_pre = Vec::with_capacity(chunk.len() * 2 + 1 + transients.len());
+            let mut tex_pre = Vec::with_capacity(chunk.len() * 2 + 1 + overflow_bufs.len());
             if !use_enhanced {
                 if uses_ring {
                     tex_pre.push(crate::host::transition(
@@ -1433,7 +1602,7 @@ impl ComputeDetiler {
                         D3D12_RESOURCE_STATE_COPY_SOURCE,
                     ));
                 }
-                for buf in &transients {
+                for buf in &overflow_bufs {
                     tex_pre.push(crate::host::transition(
                         buf,
                         D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -1459,13 +1628,13 @@ impl ComputeDetiler {
             }
 
             // Phase 3: ALL CopyTextureRegions across every texture in the chunk.
-            for (idx, &(item, ring_off, ref transient)) in chunk.iter().enumerate() {
+            for (idx, &(item, ring_off, ref overflow)) in chunk.iter().enumerate() {
                 if !ok_flags[idx] {
                     continue;
                 }
                 let (src_buf, base_off) = if let Some(off) = ring_off {
                     (&self.ring_buffer, off)
-                } else if let Some(buf) = transient {
+                } else if let Some((buf, _)) = overflow {
                     (buf, 0)
                 } else {
                     continue;
@@ -1495,7 +1664,7 @@ impl ComputeDetiler {
 
             // Phase 4: Restore EVERY destination texture to COMMON (mandatory
             // cross-queue D3D12 invariant) and scratch buffers to COMMON in legacy mode.
-            let mut post = Vec::with_capacity(chunk.len() + 1 + transients.len());
+            let mut post = Vec::with_capacity(chunk.len() + 1 + overflow_bufs.len());
             for (idx, &(item, _, _)) in chunk.iter().enumerate() {
                 if !ok_flags[idx] {
                     continue;
@@ -1514,7 +1683,7 @@ impl ComputeDetiler {
                         D3D12_RESOURCE_STATE_COMMON,
                     ));
                 }
-                for buf in &transients {
+                for buf in &overflow_bufs {
                     post.push(crate::host::transition(
                         buf,
                         D3D12_RESOURCE_STATE_COPY_SOURCE,
@@ -1528,12 +1697,24 @@ impl ComputeDetiler {
 
             l.Close().ok()?;
             let cmd: ID3D12CommandList = l.cast().ok()?;
+            // Ensure any async `EnqueueMakeResident` paging for newly allocated
+            // destination textures/heaps completes before ComputeQ accesses them.
+            crate::residency::wait_on_queue(&host.device, &self.queue, &self.waited_residency_fence);
+            if wait_direct_tile_sync {
+                self.tile_sync_val += 1;
+                let tv = self.tile_sync_val;
+                if host.queue().Signal(&self.tile_sync_fence, tv).is_ok() {
+                    let _ = self.queue.Wait(&self.tile_sync_fence, tv);
+                }
+            }
             self.queue.ExecuteCommandLists(&[Some(cmd)]);
             self.next_fence += 1;
             let fence_val = self.next_fence;
             self.queue.Signal(&self.fence, fence_val).ok()?;
             slot.fence_val = fence_val;
-            slot.transient_buffers = transients;
+            slot.transient_buffers = transient_bufs;
+            slot.keep_alive_stagings = keep_stagings;
+            slot.keep_alive_textures = keep_textures;
             self.ring.commit_batch(fence_val);
 
             let ok_textures = ok_flags.iter().filter(|&&b| b).count() as u64;
@@ -1570,6 +1751,121 @@ fn compute_runtime(host: &Host) -> Option<&'static ComputeRuntime> {
     .as_ref()
 }
 
+/// Whether the dedicated `COMPUTE` queue detiler is enabled and ready on `host`.
+pub(crate) fn compute_ready(host: &Host) -> bool {
+    compute_queue_enabled() && pass().is_some() && compute_runtime(host).is_some()
+}
+
+/// Executes a batch of owned `COMMON`-state texture detiles on the dedicated
+/// `COMPUTE` queue, retaining staging and destination COM references in each
+/// compute slot until `tex_fence` lands.
+fn execute_compute_batch_owned(
+    host: &Host,
+    entries: Vec<ComputeBatchEntry>,
+    needs_direct_tile_sync: bool,
+    wait_cpu: bool,
+) -> Option<u64> {
+    if entries.is_empty() {
+        return Some(0);
+    }
+    let pass = pass()?;
+    let rt = compute_runtime(host)?;
+    let mut detiler = rt.detiler.lock().unwrap_or_else(|e| e.into_inner());
+    detiler.reclaim_completed();
+
+    let items: Vec<BatchItem<'_>> = entries.iter().map(ComputeBatchEntry::as_item).collect();
+    let mut chunk: Vec<(&BatchItem<'_>, Option<u64>, Option<(ID3D12Resource, bool)>)> =
+        Vec::with_capacity(items.len());
+    let mut chunk_stagings: Vec<std::sync::Arc<crate::texture::Staging>> =
+        Vec::with_capacity(items.len());
+    let mut chunk_textures: Vec<ID3D12Resource> = Vec::with_capacity(items.len());
+    let mut last_fence = 0u64;
+    let mut pending_tile_sync = needs_direct_tile_sync;
+
+    for (entry, item) in entries.iter().zip(items.iter()) {
+        if item.jobs.is_empty() {
+            continue;
+        }
+        // D3D12 Debug Layer invariant: never emit two COMMON -> COPY_DEST
+        // barriers for the same texture in one command list / barrier batch.
+        let dst_raw = item.dst_texture.as_raw();
+        if chunk.iter().any(|&(prev, _, _)| prev.dst_texture.as_raw() == dst_raw) {
+            last_fence = detiler.submit_chunk(
+                host,
+                pass,
+                &chunk,
+                pending_tile_sync,
+                std::mem::take(&mut chunk_stagings),
+                std::mem::take(&mut chunk_textures),
+            )?;
+            pending_tile_sync = false;
+            chunk.clear();
+        }
+
+        let need = item.linear_bytes.next_multiple_of(4).max(4);
+        loop {
+            match detiler.ring.alloc(need, RING_ALIGN) {
+                RingAlloc::Slice { offset, wrapped, .. } => {
+                    if wrapped {
+                        TELEMETRY[5].fetch_add(1, Ordering::Relaxed);
+                    }
+                    chunk.push((item, Some(offset), None));
+                    chunk_stagings.push(entry.staging.clone());
+                    chunk_textures.push(entry.dst_texture.clone());
+                    break;
+                }
+                RingAlloc::Oversized => {
+                    TELEMETRY[7].fetch_add(1, Ordering::Relaxed);
+                    let overflow = detiler.alloc_oversized(host, need)?;
+                    chunk.push((item, None, Some(overflow)));
+                    chunk_stagings.push(entry.staging.clone());
+                    chunk_textures.push(entry.dst_texture.clone());
+                    break;
+                }
+                RingAlloc::Full => {
+                    if !chunk.is_empty() {
+                        last_fence = detiler.submit_chunk(
+                            host,
+                            pass,
+                            &chunk,
+                            pending_tile_sync,
+                            std::mem::take(&mut chunk_stagings),
+                            std::mem::take(&mut chunk_textures),
+                        )?;
+                        pending_tile_sync = false;
+                        chunk.clear();
+                    }
+                    detiler.reclaim_completed();
+                    if let Some(oldest) = detiler.ring.oldest_fence() {
+                        TELEMETRY[6].fetch_add(1, Ordering::Relaxed);
+                        if !detiler.wait_fence(oldest) {
+                            return None;
+                        }
+                        detiler.reclaim_completed();
+                    } else {
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+
+    if !chunk.is_empty() {
+        last_fence = detiler.submit_chunk(
+            host,
+            pass,
+            &chunk,
+            pending_tile_sync,
+            chunk_stagings,
+            chunk_textures,
+        )?;
+    }
+    if wait_cpu && last_fence > 0 && !detiler.wait_fence(last_fence) {
+        return None;
+    }
+    Some(last_fence)
+}
+
 /// Executes a batch of tiled texture detiles on the dedicated `COMPUTE` queue
 /// using the fence-tracked ring scratch buffer.
 ///
@@ -1591,13 +1887,18 @@ pub(crate) fn execute_compute_batch(
     let mut detiler = rt.detiler.lock().unwrap_or_else(|e| e.into_inner());
     detiler.reclaim_completed();
 
-    let mut chunk: Vec<(&BatchItem<'_>, Option<u64>, Option<ID3D12Resource>)> =
+    let mut chunk: Vec<(&BatchItem<'_>, Option<u64>, Option<(ID3D12Resource, bool)>)> =
         Vec::with_capacity(items.len());
     let mut last_fence = 0u64;
 
     for item in items {
         if item.jobs.is_empty() {
             continue;
+        }
+        let dst_raw = item.dst_texture.as_raw();
+        if chunk.iter().any(|&(prev, _, _)| prev.dst_texture.as_raw() == dst_raw) {
+            last_fence = detiler.submit_chunk(host, pass, &chunk, false, Vec::new(), Vec::new())?;
+            chunk.clear();
         }
         let need = item.linear_bytes.next_multiple_of(4).max(4);
         loop {
@@ -1611,17 +1912,16 @@ pub(crate) fn execute_compute_batch(
                 }
                 RingAlloc::Oversized => {
                     TELEMETRY[7].fetch_add(1, Ordering::Relaxed);
-                    let alloc_size = need.next_multiple_of(RING_ALIGN);
-                    let buf = host.internal_uav_buffer(alloc_size)?;
-                    crate::host::name(&buf, || format!("gpu detile compute oversized {alloc_size:#x}"));
-                    chunk.push((item, None, Some(buf)));
+                    let overflow = detiler.alloc_oversized(host, need)?;
+                    chunk.push((item, None, Some(overflow)));
                     break;
                 }
                 RingAlloc::Full => {
                     // Flush any accumulated items first so their fence can advance,
                     // then wait on the oldest in-flight ring lease.
                     if !chunk.is_empty() {
-                        last_fence = detiler.submit_chunk(pass, &chunk)?;
+                        last_fence =
+                            detiler.submit_chunk(host, pass, &chunk, false, Vec::new(), Vec::new())?;
                         chunk.clear();
                     }
                     detiler.reclaim_completed();
@@ -1641,7 +1941,7 @@ pub(crate) fn execute_compute_batch(
     }
 
     if !chunk.is_empty() {
-        last_fence = detiler.submit_chunk(pass, &chunk)?;
+        last_fence = detiler.submit_chunk(host, pass, &chunk, false, Vec::new(), Vec::new())?;
     }
     if wait_cpu && last_fence > 0 && !detiler.wait_fence(last_fence) {
         return None;
@@ -3326,6 +3626,211 @@ mod tests {
                     &expected[y * pitch..y * pitch + active],
                     "direct batch tex={idx} row={y} mismatch"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn compute_queue_sustained_128mib_streaming_batches_with_zero_oversized() {
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
+        let Some(host) = host() else {
+            return;
+        };
+
+        // Each 1024x1024 RGBA8 texture is 4 MiB linear; 36 textures across
+        // batched submissions stream 144 MiB (> 128 MiB, 3x the 48 MiB ring).
+        const W: u32 = 1024;
+        const H: u32 = 1024;
+        const POOL_TEX: usize = 12;
+        const ROUNDS: usize = 3;
+
+        let layout = Layout::new(&Desc {
+            dimension: Dimension::Tex2d,
+            width: W,
+            height: H,
+            depth: 1,
+            mips: 1,
+            element_bytes: 4,
+            block: 1,
+            samples: 1,
+            swizzle: Swizzle::SW_64KB_S,
+        })
+        .unwrap();
+        let tex_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: u64::from(W),
+            Height: H,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); 1];
+        let mut rows = vec![0u32; 1];
+        let mut total = 0u64;
+        // SAFETY: valid device query.
+        unsafe {
+            host.device.GetCopyableFootprints(
+                &tex_desc,
+                0,
+                1,
+                0,
+                Some(footprints.as_mut_ptr()),
+                Some(rows.as_mut_ptr()),
+                None,
+                Some(&mut total),
+            );
+        }
+        assert_eq!(total, 4 << 20);
+
+        let tiled = fill_pattern(layout.size as usize, 0xCAFE_BABE);
+        let (src_buf, src_ptr) = host.upload_buffer(layout.size.next_multiple_of(4)).unwrap();
+        // SAFETY: mapped upload buffer covers `tiled.len()`.
+        unsafe { std::ptr::copy_nonoverlapping(tiled.as_ptr(), src_ptr, tiled.len()) };
+        // SAFETY: live upload buffer.
+        let src_va = unsafe { src_buf.GetGPUVirtualAddress() };
+
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let mut dst_textures = Vec::with_capacity(POOL_TEX);
+        for _ in 0..POOL_TEX {
+            let mut tex_opt: Option<ID3D12Resource> = None;
+            // SAFETY: plain committed texture entering ComputeQ in COMMON.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &tex_desc,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        None,
+                        &mut tex_opt,
+                    )
+                    .unwrap();
+            }
+            dst_textures.push(tex_opt.unwrap());
+        }
+
+        let jobs = [SubresourceJob {
+            mip: 0,
+            slice: 0,
+            dst_offset: footprints[0].Offset,
+            row_pitch: footprints[0].Footprint.RowPitch,
+            depth_pitch: footprints[0].Footprint.RowPitch * rows[0],
+            zero: false,
+        }];
+        let indices = [0usize];
+
+        let before = telemetry_snapshot();
+        let mut last_fence = 0u64;
+        for _ in 0..ROUNDS {
+            let items: Vec<BatchItem<'_>> = dst_textures
+                .iter()
+                .map(|dst| BatchItem {
+                    layout: &layout,
+                    src_gpu_va: src_va,
+                    src_len: tiled.len() as u64,
+                    dst_texture: dst,
+                    sub_offset: 0,
+                    footprints: &footprints,
+                    jobs: &jobs,
+                    indices: &indices,
+                    linear_bytes: total,
+                    need_aliasing: false,
+                })
+                .collect();
+            last_fence = execute_compute_batch(host, &items, false)
+                .expect("execute_compute_batch failed during 128+ MiB streaming");
+            assert!(last_fence > 0);
+        }
+        assert!(wait_compute_fence(host, last_fence));
+        let after = telemetry_snapshot();
+
+        let delta_batches = after[0] - before[0];
+        let delta_textures = after[1] - before[1];
+        let delta_bytes = after[3] - before[3];
+        let delta_compute_batches = after[4] - before[4];
+        let delta_oversized = after[7] - before[7];
+        let avg_tex_per_batch = delta_textures as f64 / delta_batches.max(1) as f64;
+
+        assert!(delta_bytes >= 128 << 20, "expected >= 128 MiB streamed, got {delta_bytes}");
+        assert!(delta_compute_batches > 0, "expected compute_batches > 0");
+        assert!(
+            avg_tex_per_batch > 1.0,
+            "expected avg_tex_per_batch > 1.0, got {avg_tex_per_batch:.2}"
+        );
+        assert_eq!(delta_oversized, 0, "expected oversized == 0 under ring streaming");
+
+        // Verify last texture landed bit-exact and returned to COMMON.
+        let fp = footprints[0];
+        let pitch = fp.Footprint.RowPitch as usize;
+        let len = pitch * rows[0] as usize;
+        let rb = host.read_back_buffer(len as u64).unwrap();
+        let list = host.new_list().unwrap();
+        // SAFETY: open direct list, texture returned to COMMON by ComputeQ.
+        unsafe {
+            list.list.ResourceBarrier(&[crate::host::transition(
+                &dst_textures[POOL_TEX - 1],
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            let to = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&rb),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Offset: 0, ..fp },
+                },
+            };
+            let from = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&dst_textures[POOL_TEX - 1]),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+            list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+            list.list.ResourceBarrier(&[crate::host::transition(
+                &dst_textures[POOL_TEX - 1],
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_COMMON,
+            )]);
+        }
+        list.close();
+        host.execute_sync_internal(&list);
+
+        let mut ptr = std::ptr::null_mut();
+        // SAFETY: readback completed.
+        let got = unsafe {
+            rb.Map(0, None, Some(&mut ptr)).unwrap();
+            let bytes = std::slice::from_raw_parts(ptr.cast::<u8>(), len).to_vec();
+            rb.Unmap(0, None);
+            bytes
+        };
+        let mut expected = vec![0u8; len];
+        layout.detile(&tiled, 0, 0, &mut expected, pitch, len).unwrap();
+        assert_eq!(got, expected, "streamed texture mismatch");
+
+        // When D3D12 Debug Layer is active, assert zero ERROR/CORRUPTION messages.
+        if let Ok(iq) = host.device.cast::<ID3D12InfoQueue>() {
+            // SAFETY: live info queue query.
+            let n = unsafe { iq.GetNumStoredMessages() };
+            for i in 0..n {
+                let mut len = 0usize;
+                // SAFETY: query message size then read into buffer.
+                if unsafe { iq.GetMessage(i, None, &mut len) }.is_ok() && len > 0 {
+                    let mut buf = vec![0u8; len];
+                    let msg = buf.as_mut_ptr().cast::<D3D12_MESSAGE>();
+                    if unsafe { iq.GetMessage(i, Some(msg), &mut len) }.is_ok() {
+                        // SAFETY: filled by `GetMessage`.
+                        let sev = unsafe { (*msg).Severity };
+                        assert!(
+                            sev != D3D12_MESSAGE_SEVERITY_CORRUPTION
+                                && sev != D3D12_MESSAGE_SEVERITY_ERROR,
+                            "unexpected D3D12 debug error/corruption during ComputeQ detile streaming"
+                        );
+                    }
+                }
             }
         }
     }

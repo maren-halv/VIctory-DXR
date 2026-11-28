@@ -65,9 +65,12 @@ use crate::host::host;
 /// The card's tile: 64 KiB.
 const TILE: u64 = 64 << 10;
 
-/// Tiles in one heap of the pool (64 MiB). The largest level given is a
-/// 4096x4096 one of one byte a texel: 256 tiles.
-const HEAP_TILES: u32 = 1024;
+/// Tiles in one heap of the pool (16 MiB). The largest standard level given is
+/// a 4096x4096 BC7/BC3/BC5/BC6H or 2048x2048 RGBA8 mip: 256 tiles.
+const HEAP_TILES: u32 = 256;
+
+/// At most one completely empty spare heap is retained to avoid create/destroy churn.
+const MAX_SPARE_HEAPS: usize = 1;
 
 /// Stack buffer size for `UpdateTileMappings` ranges/regions on the common path.
 const STACK_RANGES: usize = 16;
@@ -98,25 +101,38 @@ pub(crate) static DEMOTED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 /// Default local VRAM threshold (%) above which idle large tiled textures begin
 /// fence-gated top-mip demotion (`VICTORY_TILES_DEMOTE_VRAM_PERCENT`).
-const DEFAULT_DEMOTE_VRAM_PERCENT: u64 = 72;
+const DEFAULT_DEMOTE_VRAM_PERCENT: u64 = 62;
 /// Severe VRAM pressure threshold (%) permitting deeper (up to 2 top-mip) demotion
-/// after a shorter idle grace period (still never clamping active close-up textures!).
+/// (still strictly requiring `>= 180` idle frames and never clamping active textures!).
 const SEVERE_DEMOTE_VRAM_PERCENT: u64 = 85;
-/// Comfort band (%) below which demoted textures proactively re-promote.
-const REPROMOTE_VRAM_PERCENT: u64 = 68;
-/// Idle grace period for moderate pressure (15 seconds + 60 frames) so active
+/// Hysteresis band (%) below `demote_vram_percent()` where demoted textures proactively re-promote.
+const REPROMOTE_HYSTERESIS_PCT: u64 = 4;
+/// Minimum idle frame count before any Tier-2 top-mip demotion is permitted (Spec-Trap #7).
+const DEMOTE_IDLE_MIN_FRAMES: u64 = 180;
+/// Idle grace period for moderate pressure (3 seconds + 180 frames) so active
 /// close-up Series X textures are NEVER clamped (`ARCH-01`, Spec-Trap #7).
-const DEMOTE_IDLE_MODERATE_MS: u64 = 15_000;
-const DEMOTE_IDLE_MODERATE_FRAMES: u64 = 60;
-/// Idle grace period for severe pressure (5 seconds + 30 frames).
-const DEMOTE_IDLE_SEVERE_MS: u64 = 5_000;
-const DEMOTE_IDLE_SEVERE_FRAMES: u64 = 30;
+const DEMOTE_IDLE_MODERATE_MS: u64 = 3_000;
+const DEMOTE_IDLE_MODERATE_FRAMES: u64 = DEMOTE_IDLE_MIN_FRAMES;
+/// Idle grace period for severe pressure (2 seconds + 180 frames).
+const DEMOTE_IDLE_SEVERE_MS: u64 = 2_000;
+const DEMOTE_IDLE_SEVERE_FRAMES: u64 = DEMOTE_IDLE_MIN_FRAMES;
+/// Minimum resident mip dimension preserved by idle demotion (keeps >= 256x256 + mip tail).
+const DEMOTE_KEEP_MIN_DIM: u32 = 256;
 /// Submissions / frames required after descriptor rewrite (`levels_changed`)
 /// before Phase 2 issues `UpdateTileMappings(..., NULL)`.
 const DEMOTE_FENCE_LAG: u64 = 2;
 const DEMOTE_FRAME_LAG: u64 = 2;
 /// Maximum demotion/re-promotion actions per 1-Hz sweep tick.
 const DEMOTE_PER_SWEEP: usize = 16;
+
+/// Unified minimum mip level to map/upload for a Tier-2 tiled texture:
+/// `max(effective_wanted, first_viewed, demote_floor)` (treating `wanted == u32::MAX`
+/// as `0`, i.e., no explicit view floor recorded yet).
+#[inline]
+pub(crate) fn unified_mip_bound(wanted: u32, first_viewed: u32, demote_floor: u32) -> u32 {
+    let eff_wanted = if wanted == u32::MAX { 0 } else { wanted };
+    eff_wanted.max(first_viewed).max(demote_floor)
+}
 
 fn parse_reclaim(value: Option<&str>) -> bool {
     value.is_none_or(|v| v.trim() != "0")
@@ -131,12 +147,13 @@ pub(crate) fn reclaim_wanted() -> bool {
 }
 
 fn parse_demote_wanted(value: Option<&str>) -> bool {
-    value.is_none_or(|v| v.trim() != "0")
+    value.is_some_and(|v| v.trim() == "1")
 }
 
-/// Whether idle large Tier-2 tiled textures demote top mips under VRAM/host
-/// memory pressure (`VICTORY_TILES_DEMOTE`, enabled by default when
-/// `VICTORY_LEVELS_ON_DEMAND=1`; set `0` to opt out).
+/// Whether idle large Tier-2 tiled textures unilaterally demote top mips below
+/// the title's `first_viewed` (`VICTORY_TILES_DEMOTE=1` opts in; default OFF
+/// because live bindless descriptors with `MostDetailedMip=0` read NULL tiles
+/// as solid black `(0,0,0,0)` if top mips are unmapped underneath them).
 pub(crate) fn demote_wanted() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| parse_demote_wanted(std::env::var("VICTORY_TILES_DEMOTE").ok().as_deref()))
@@ -184,11 +201,28 @@ fn evaluate_demotion_pressure(
     } else if vram_pct > threshold_pct || host_pressured {
         DemotionPressure::Moderate { vram_pct }
     } else {
-        let repromote_pct = threshold_pct.saturating_sub(4).min(REPROMOTE_VRAM_PERCENT);
+        let repromote_pct = threshold_pct.saturating_sub(REPROMOTE_HYSTERESIS_PCT);
         DemotionPressure::None {
             can_repromote: !host_pressured && vram_pct < repromote_pct,
         }
     }
+}
+
+/// Highest `target_shown` mip level that preserves at least a `256x256`
+/// fallback mip (as well as the entire packed mip tail).
+fn max_demote_target(width: u32, height: u32, standard_levels: u32, levels: u32) -> u32 {
+    let cap = standard_levels.min(levels.saturating_sub(1));
+    let mut max_target = 0u32;
+    while max_target < cap {
+        let next = max_target + 1;
+        let w = (width >> next).max(1);
+        let h = (height >> next).max(1);
+        if w.max(h) < DEMOTE_KEEP_MIN_DIM {
+            break;
+        }
+        max_target = next;
+    }
+    max_target
 }
 
 /// Pure policy deciding whether an idle tiled texture should demote its top mips
@@ -197,6 +231,7 @@ fn evaluate_demotion_pressure(
 /// Strictly enforces:
 /// - Never demotes active/recent textures (`!is_idle`) — preserving full Series X fidelity.
 /// - Never demotes small textures (`full_bytes < floor_bytes`) or single-standard-mip textures.
+/// - Never demotes below the `256x256` fallback mip or into the packed mip tail.
 /// - Never demotes any level written by the host GPU (`card` bits).
 /// - Always leaves at least one backed mip level `>= target_shown` so the texture never goes black.
 #[allow(clippy::too_many_arguments)]
@@ -204,6 +239,8 @@ fn choose_demote_target(
     pressure: DemotionPressure,
     full_bytes: u64,
     floor_bytes: u64,
+    width: u32,
+    height: u32,
     standard_levels: u32,
     levels: u32,
     current_shown: u32,
@@ -219,11 +256,11 @@ fn choose_demote_target(
     if !is_idle || full_bytes < floor_bytes || standard_levels < 2 || current_shown >= levels {
         return None;
     }
-    // Cap target at `standard_levels` so packed mip-tail stays intact and visible.
+    // Cap target at `max_demote_target` so >= 256x256 + packed mip-tail stay intact and visible.
+    let max_target = max_demote_target(width, height, standard_levels, levels);
     let target = current_shown
         .saturating_add(max_demote)
-        .min(standard_levels)
-        .min(levels.saturating_sub(1));
+        .min(max_target);
     if target <= current_shown || target >= 32 {
         return None;
     }
@@ -266,14 +303,19 @@ fn small_when_full_mb() -> u64 {
 /// megabyte.
 const SMALL_TILES: u32 = 16;
 
-/// Whether textures are made this way: the switch
-/// (`VICTORY_LEVELS_ON_DEMAND=1`; off by default), and a card that reads
-/// zeros from, and drops writes to, levels without memory (tiled resources
-/// tier 2).
+fn parse_wanted(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v.trim() == "1")
+}
+
+/// Whether textures are made this way: `VICTORY_LEVELS_ON_DEMAND=1` (opt-in;
+/// default OFF because `VICTORY_HELD_LEVELS` alone saves ~900 MB more VRAM
+/// without `UpdateTileMappings` overhead or unmapped-tile black patches), and a
+/// card that reads zeros from, and drops writes to, levels without memory
+/// (tiled resources tier 2).
 pub(crate) fn wanted() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        if !std::env::var_os("VICTORY_LEVELS_ON_DEMAND").is_some_and(|v| v == "1") {
+        if !parse_wanted(std::env::var("VICTORY_LEVELS_ON_DEMAND").ok().as_deref()) {
             return false;
         }
         let Some(host) = host() else {
@@ -294,7 +336,9 @@ pub(crate) fn wanted() -> bool {
             tier,
             on,
             floor_kb = floor() >> 10,
-            "host copies of title textures take the card's memory level by level (VICTORY_LEVELS_ON_DEMAND=1)"
+            heap_mib = (u64::from(HEAP_TILES) * TILE) >> 20,
+            demote_pct = demote_vram_percent(),
+            "host copies of title textures take the card's memory level by level (VICTORY_LEVELS_ON_DEMAND)"
         );
         on
     })
@@ -325,6 +369,9 @@ struct Heap {
     heap: ID3D12Heap,
     free: VecDeque<(u32, u32)>,
     free_count: u32,
+    /// Submission fence when tiles were last allocated from this heap, so
+    /// eager empty-heap destruction never frees a heap still referenced in flight.
+    last_alloc_fence: u64,
 }
 
 // SAFETY: a heap of the device, named only in queue and device calls, which
@@ -382,23 +429,93 @@ impl Heap {
 /// the card (a texture names its heaps by place).
 static POOL: Mutex<Vec<Option<Heap>>> = Mutex::new(Vec::new());
 
-/// `count` tiles of one heap, in as many runs as it takes, the lowest free
-/// tiles first (single free tiles are used up before a long run is cut):
+/// Selects the best pool heap for `count` tiles: prefers already-occupied
+/// (non-empty) heaps with highest occupancy (tightest fit: smallest
+/// `free_count >= count`), breaking ties by lowest heap index so upper heaps
+/// drain naturally and are eagerly destroyed. Empty spare heaps are chosen last.
+fn select_pool_heap(free_counts: impl Iterator<Item = (usize, u32)>, count: u32) -> Option<usize> {
+    free_counts
+        .filter(|&(_, free)| free >= count)
+        .min_by_key(|&(index, free)| (free == HEAP_TILES, free, index))
+        .map(|(index, _)| index)
+}
+
+/// Drains excess completely empty heaps whose last allocation fence has
+/// completed, keeping at most [`MAX_SPARE_HEAPS`] warm spare heap. Destroys
+/// highest-index empty heaps first and trims trailing empty slots.
+fn drain_empty_heaps(pool: &mut Vec<Option<Heap>>, finished_fence: u64, dropped: &mut Vec<ID3D12Heap>) {
+    let mut empty_count = pool
+        .iter()
+        .filter(|h| h.as_ref().is_some_and(|h| h.free_count == HEAP_TILES))
+        .count();
+    if empty_count <= MAX_SPARE_HEAPS {
+        return;
+    }
+    for index in (0..pool.len()).rev() {
+        if empty_count <= MAX_SPARE_HEAPS {
+            break;
+        }
+        let ready = pool[index]
+            .as_ref()
+            .is_some_and(|h| h.free_count == HEAP_TILES && finished_fence >= h.last_alloc_fence);
+        if ready && let Some(removed) = pool[index].take() {
+            empty_count -= 1;
+            STATS[3].fetch_sub(u64::from(HEAP_TILES) * TILE, Ordering::Relaxed);
+            STATS[8].fetch_add(1, Ordering::Relaxed);
+            dropped.push(removed.heap);
+        }
+    }
+    while pool.last().is_some_and(Option::is_none) {
+        pool.pop();
+    }
+}
+
+/// Bytes currently held by completely empty spare heaps in [`POOL`].
+fn empty_tile_heap_bytes() -> u64 {
+    let pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    let empty = pool
+        .iter()
+        .filter(|h| h.as_ref().is_some_and(|h| h.free_count == HEAP_TILES))
+        .count() as u64;
+    empty * u64::from(HEAP_TILES) * TILE
+}
+
+/// Destroys any excess completely empty tile heaps whose GPU fence has completed.
+pub(crate) fn reclaim_empty_heaps() {
+    let finished = crate::host::submissions().1;
+    let mut dropped_heaps = Vec::new();
+    {
+        let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        drain_empty_heaps(&mut pool, finished, &mut dropped_heaps);
+    }
+    drop(dropped_heaps);
+}
+
+/// `count` tiles of one heap, in as many runs as it takes, preferring
+/// higher-occupancy / lower-index heaps so upper heaps empty and get destroyed:
 /// the heap, its place in the pool and the runs (first tile, tiles). A new
-/// heap is made outside `POOL`'s lock when no heap has that many free.
+/// 16 MiB heap is made outside `POOL`'s lock when no heap has that many free.
 fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u32, u32)>)> {
     if count == 0 || count > HEAP_TILES {
         return None;
     }
+    let started = crate::host::submissions().0;
     {
         let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(index) = pool.iter().position(|h| h.as_ref().is_some_and(|h| h.free_count >= count)) {
+        let chosen = select_pool_heap(
+            pool.iter()
+                .enumerate()
+                .filter_map(|(i, h)| h.as_ref().map(|h| (i, h.free_count))),
+            count,
+        );
+        if let Some(index) = chosen {
             let h = pool[index].as_mut()?;
             let runs = h.take_runs(count);
+            h.last_alloc_fence = h.last_alloc_fence.max(started);
             return Some((h.heap.clone(), index, runs));
         }
     }
-    // Create the 64 MiB heap without holding POOL.lock().
+    // Create the 16 MiB heap without holding POOL.lock().
     let desc = D3D12_HEAP_DESC {
         SizeInBytes: u64::from(HEAP_TILES) * TILE,
         Properties: D3D12_HEAP_PROPERTIES {
@@ -419,9 +536,13 @@ fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u3
     let mut unused_heap: Option<ID3D12Heap> = None;
     let out = {
         let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-        let index = if let Some(existing) =
-            pool.iter().position(|h| h.as_ref().is_some_and(|h| h.free_count >= count))
-        {
+        let existing = select_pool_heap(
+            pool.iter()
+                .enumerate()
+                .filter_map(|(i, h)| h.as_ref().map(|h| (i, h.free_count))),
+            count,
+        );
+        let index = if let Some(existing) = existing {
             unused_heap = Some(made);
             existing
         } else {
@@ -431,6 +552,7 @@ fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u3
                 heap: made,
                 free,
                 free_count: HEAP_TILES,
+                last_alloc_fence: 0,
             };
             STATS[3].fetch_add(u64::from(HEAP_TILES) * TILE, Ordering::Relaxed);
             match pool.iter().position(Option::is_none) {
@@ -446,6 +568,7 @@ fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u3
         };
         let h = pool[index].as_mut()?;
         let runs = h.take_runs(count);
+        h.last_alloc_fence = h.last_alloc_fence.max(started);
         (h.heap.clone(), index, runs)
     };
     drop(unused_heap);
@@ -460,12 +583,14 @@ fn give_back(index: usize, runs: &[(u32, u32)]) {
 }
 
 /// Returns a batch of `(heap_index, start, count)` runs across one or more
-/// heaps under a single `POOL` lock acquisition, dropping any emptied
-/// `ID3D12Heap`s after releasing the lock.
+/// heaps under a single `POOL` lock acquisition, eagerly destroying excess
+/// emptied `ID3D12Heap`s (keeping at most [`MAX_SPARE_HEAPS`]) once their GPU
+/// fence has completed, after releasing the lock.
 fn return_runs(runs: &[(usize, u32, u32)]) {
     if runs.is_empty() {
         return;
     }
+    let finished = crate::host::submissions().1;
     let mut dropped_heaps: Vec<ID3D12Heap> = Vec::new();
     {
         let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
@@ -492,21 +617,12 @@ fn return_runs(runs: &[(usize, u32, u32)]) {
             }
         }
 
-        let mut live_heaps = pool.iter().flatten().count();
         for &index in touched[..touched_len].iter().chain(touched_overflow.iter()) {
-            let Some(Some(h)) = pool.get_mut(index) else {
-                continue;
-            };
-            h.coalesce();
-            if h.free_count == HEAP_TILES && live_heaps > 1 {
-                if let Some(removed) = pool[index].take() {
-                    live_heaps -= 1;
-                    STATS[3].fetch_sub(u64::from(HEAP_TILES) * TILE, Ordering::Relaxed);
-                    STATS[8].fetch_add(1, Ordering::Relaxed);
-                    dropped_heaps.push(removed.heap);
-                }
+            if let Some(Some(h)) = pool.get_mut(index) {
+                h.coalesce();
             }
         }
+        drain_empty_heaps(&mut pool, finished, &mut dropped_heaps);
     }
     drop(dropped_heaps);
 }
@@ -603,6 +719,9 @@ pub(crate) struct Tiled {
     packed: u32,
     /// Levels in all.
     levels: u32,
+    /// Base mip dimensions (for enforcing the >= 256x256 demotion floor).
+    width: u32,
+    height: u32,
     /// The bytes all its tiles would take.
     pub(crate) full: u64,
     given: Mutex<Given>,
@@ -674,6 +793,10 @@ impl Tiled {
             return None;
         }
         let full = u64::from(total) * TILE;
+        // SAFETY: a live reserved texture.
+        let tex_desc = unsafe { texture.GetDesc() };
+        let width = (tex_desc.Width.min(u64::from(u32::MAX)) as u32).max(1);
+        let height = tex_desc.Height.max(1);
         STATS[0].fetch_add(1, Ordering::Relaxed);
         STATS[1].fetch_add(full, Ordering::Relaxed);
         STATS[4].fetch_add(1, Ordering::Relaxed);
@@ -688,6 +811,8 @@ impl Tiled {
             standard,
             packed: packed_tiles,
             levels,
+            width,
+            height,
             full,
             backed: AtomicU32::new(0),
             shown: AtomicU32::new(u32::MAX),
@@ -750,7 +875,9 @@ impl Tiled {
         room: bool,
         reclaim: bool,
     ) -> (bool, bool, Option<RetiredTiles>) {
-        let held = held & self.every_level();
+        let floor = self.demote_floor.load(Ordering::Acquire);
+        let floor_mask = if floor > 0 && floor < 32 { !((1u32 << floor) - 1) } else { u32::MAX };
+        let held = held & self.every_level() & floor_mask;
         let mut given = self.given.lock().unwrap_or_else(|e| e.into_inner());
         self.held.store(held, Ordering::Relaxed);
         let card = self.card.load(Ordering::Relaxed);
@@ -833,6 +960,17 @@ impl Tiled {
         levels: u32,
     ) -> bool {
         let levels = levels & self.every_level();
+        if levels != 0 {
+            let lowest = levels.trailing_zeros();
+            let prev_floor = self.demote_floor.fetch_min(lowest, Ordering::AcqRel);
+            if prev_floor > lowest {
+                let mut pending = self.pending_demotion.lock().unwrap_or_else(|e| e.into_inner());
+                if pending.is_some_and(|p| p.target_shown > lowest) {
+                    *pending = None;
+                }
+            }
+            self.touch(crate::host::moment());
+        }
         let mut given = self.given.lock().unwrap_or_else(|e| e.into_inner());
         let prev = self.card.load(Ordering::Relaxed);
         let (changed, retired) = self.give_locked(
@@ -1432,25 +1570,45 @@ impl Tiled {
         (!retired_runs.is_empty()).then(|| (n as u32, reclaimed_bytes, RetiredTiles::new(retired_runs, reclaimed_bytes)))
     }
 
-    /// Re-promotes a demoted texture back to full resolution (`demote_floor = 0`),
-    /// cancelling any uncommitted Phase-1 demotion. Returns `true` if the texture
-    /// was demoted and needs its top mips restored/re-uploaded.
-    pub(crate) fn promote(&self) -> bool {
-        let prev = self.demote_floor.swap(0, Ordering::AcqRel);
-        if prev == 0 {
+    /// Re-promotes a demoted texture down to `target_floor` (`0` = full
+    /// resolution), cancelling any conflicting uncommitted Phase-1 demotion.
+    /// Returns `true` if `demote_floor` actually dropped and top mips need
+    /// remapping/re-uploading.
+    pub(crate) fn promote_to(&self, target_floor: u32) -> bool {
+        let prev = self.demote_floor.fetch_min(target_floor, Ordering::AcqRel);
+        if prev <= target_floor {
             return false;
         }
-        *self.pending_demotion.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        {
+            let mut pending = self.pending_demotion.lock().unwrap_or_else(|e| e.into_inner());
+            if pending.is_some_and(|p| p.target_shown > target_floor) {
+                *pending = None;
+            }
+        }
         let _given = self.given.lock().unwrap_or_else(|e| e.into_inner());
         let backed = self.backed.load(Ordering::Acquire);
         let named = self.held.load(Ordering::Relaxed) | self.card.load(Ordering::Relaxed);
-        let visible = named & backed & self.every_level();
+        let raw_visible = named & backed & self.every_level();
+        let floor = self.demote_floor.load(Ordering::Acquire);
+        let visible = if floor > 0 && floor < 32 {
+            let masked = raw_visible & !((1u32 << floor) - 1);
+            if masked != 0 { masked } else { raw_visible }
+        } else {
+            raw_visible
+        };
         if visible != 0 {
             let restored = visible.trailing_zeros();
             self.shown.store(restored, Ordering::Release);
         }
         DEMOTED[3].fetch_add(1, Ordering::Relaxed);
         true
+    }
+
+    /// Re-promotes a demoted texture back to full resolution (`demote_floor = 0`),
+    /// cancelling any uncommitted Phase-1 demotion. Returns `true` if the texture
+    /// was demoted and needs its top mips restored/re-uploaded.
+    pub(crate) fn promote(&self) -> bool {
+        self.promote_to(0)
     }
 
     fn has_pending_demotion(&self) -> bool {
@@ -1553,10 +1711,12 @@ pub(crate) fn sweep_demotions() {
         }
     }
 
+    reclaim_empty_heaps();
+
     let memory = host.video_memory();
     let pressure = evaluate_demotion_pressure(
         memory,
-        crate::pool::empty_block_bytes(),
+        crate::pool::empty_block_bytes() + empty_tile_heap_bytes(),
         crate::residency::pressured(),
         demote_vram_percent(),
     );
@@ -1595,6 +1755,8 @@ pub(crate) fn sweep_demotions() {
                     pressure,
                     tiled.full,
                     min_bytes,
+                    tiled.width,
+                    tiled.height,
                     tiled.standard.len() as u32,
                     tiled.levels,
                     current_shown,
@@ -1634,7 +1796,7 @@ pub(crate) fn sweep_demotions() {
                 );
             }
             if can_repromote {
-                for (copy, mem_va, _) in &live {
+                for (copy, mem_va, res_key) in &live {
                     if repromoted_tex >= DEMOTE_PER_SWEEP {
                         break;
                     }
@@ -1642,6 +1804,8 @@ pub(crate) fn sweep_demotions() {
                         continue;
                     };
                     if tiled.promote() {
+                        copy.invalidate_hashed_frame();
+                        crate::texture::note_promoted(*res_key as crate::object::This);
                         crate::descriptor::host::levels_waiting(*mem_va);
                         crate::descriptor::host::levels_changed(*mem_va);
                         repromoted_tex += 1;
@@ -2638,7 +2802,7 @@ void look() {
 
         // 4) After GPU fence completes, drop `RetiredTiles` and verify tiles return to
         //    `POOL`, `STATS[2]` decreases, and a new texture reuses those exact runs
-        //    without allocating a second 64 MiB heap.
+        //    without allocating a second 16 MiB heap.
         let stats2_before_drop = STATS[2].load(Ordering::Relaxed);
         let heap_bytes_before = STATS[3].load(Ordering::Relaxed);
         drop(retired);
@@ -2665,7 +2829,7 @@ void look() {
         assert_eq!(
             STATS[3].load(Ordering::Relaxed),
             heap_bytes_before,
-            "reusing reclaimed tiles must not allocate a second 64 MiB heap"
+            "reusing reclaimed tiles must not allocate a second 16 MiB heap"
         );
         let upload_b = rig.filled(&layout, |_| 0x42);
         let read_b = rig.round_trip(&tex_b, &layout, Some(&upload_b));
@@ -2868,6 +3032,8 @@ void look() {
             standard: vec![HEAP_TILES + 1, 1],
             packed: 0,
             levels: 2,
+            width: 512,
+            height: 512,
             full: TILE,
             given: Mutex::new(Given {
                 levels: vec![None, None],
@@ -2899,36 +3065,57 @@ void look() {
 
     #[test]
     fn demotion_pressure_and_target_thresholds() {
+        assert_eq!(HEAP_TILES, 256, "tile pool heaps must be 16 MiB (256 x 64 KiB)");
+        assert_eq!(u64::from(HEAP_TILES) * TILE, 16 << 20);
+        assert_eq!(DEFAULT_DEMOTE_VRAM_PERCENT, 62);
+        assert_eq!(parse_demote_vram_percent(None), 62);
+        assert_eq!(parse_demote_vram_percent(Some("70")), 70);
+        assert!(!parse_wanted(None));
+        assert!(parse_wanted(Some("1")));
+        assert!(!parse_wanted(Some("0")));
+        assert!(!parse_wanted(Some(" 0 ")));
+        assert_eq!(DEMOTE_IDLE_MODERATE_FRAMES, 180);
+        assert_eq!(DEMOTE_IDLE_SEVERE_FRAMES, 180);
+
         let budget = 10_000u64 << 20;
-        // 70% used, no empty pool blocks, not host pressured -> None { can_repromote: false } (>= 68%)
+        // Default 62% threshold: 60% -> None { can_repromote: false } (>= 58%)
         assert_eq!(
-            evaluate_demotion_pressure(Some([budget, 7_000 << 20, 0, 0]), 0, false, 72),
+            evaluate_demotion_pressure(Some([budget, 6_000 << 20, 0, 0]), 0, false, 62),
             DemotionPressure::None { can_repromote: false }
         );
-        // 65% used -> None { can_repromote: true } (< 68%)
+        // 57% -> None { can_repromote: true } (< 58%)
         assert_eq!(
-            evaluate_demotion_pressure(Some([budget, 6_500 << 20, 0, 0]), 0, false, 72),
+            evaluate_demotion_pressure(Some([budget, 5_700 << 20, 0, 0]), 0, false, 62),
             DemotionPressure::None { can_repromote: true }
         );
-        // 75% gross minus 10% empty pool blocks = 65% net -> does NOT falsely demote!
+        // 65% net with default 62% threshold -> Moderate
         assert_eq!(
-            evaluate_demotion_pressure(Some([budget, 7_500 << 20, 0, 0]), 1_000 << 20, false, 72),
-            DemotionPressure::None { can_repromote: true }
+            evaluate_demotion_pressure(Some([budget, 6_500 << 20, 0, 0]), 0, false, 62),
+            DemotionPressure::Moderate { vram_pct: 65 }
         );
-        // 74% net -> Moderate
+        // 75% gross minus 20% empty pool blocks = 55% net -> does NOT falsely demote!
         assert_eq!(
-            evaluate_demotion_pressure(Some([budget, 7_400 << 20, 0, 0]), 0, false, 72),
-            DemotionPressure::Moderate { vram_pct: 74 }
+            evaluate_demotion_pressure(Some([budget, 7_500 << 20, 0, 0]), 2_000 << 20, false, 62),
+            DemotionPressure::None { can_repromote: true }
         );
         // 50% VRAM but host `residency::pressured()` -> Moderate
         assert_eq!(
-            evaluate_demotion_pressure(Some([budget, 5_000 << 20, 0, 0]), 0, true, 72),
+            evaluate_demotion_pressure(Some([budget, 5_000 << 20, 0, 0]), 0, true, 62),
             DemotionPressure::Moderate { vram_pct: 50 }
         );
         // 86% net -> Severe
         assert_eq!(
-            evaluate_demotion_pressure(Some([budget, 8_600 << 20, 0, 0]), 0, false, 72),
+            evaluate_demotion_pressure(Some([budget, 8_600 << 20, 0, 0]), 0, false, 62),
             DemotionPressure::Severe { vram_pct: 86 }
+        );
+        // Custom override 72%: 70% -> None { can_repromote: false }, 65% -> can_repromote: true
+        assert_eq!(
+            evaluate_demotion_pressure(Some([budget, 7_000 << 20, 0, 0]), 0, false, 72),
+            DemotionPressure::None { can_repromote: false }
+        );
+        assert_eq!(
+            evaluate_demotion_pressure(Some([budget, 6_500 << 20, 0, 0]), 0, false, 72),
+            DemotionPressure::None { can_repromote: true }
         );
 
         let all_11 = (1u32 << 11) - 1;
@@ -2936,22 +3123,90 @@ void look() {
         let sev_p = DemotionPressure::Severe { vram_pct: 88 };
 
         // Active close-up texture (`is_idle = false`) MUST NEVER be clamped (Spec-Trap #7)!
-        assert_eq!(choose_demote_target(mod_p, 1 << 20, 512 << 10, 4, 11, 0, all_11, 0, false), None);
-        assert_eq!(choose_demote_target(sev_p, 1 << 20, 512 << 10, 4, 11, 0, all_11, 0, false), None);
+        assert_eq!(choose_demote_target(mod_p, 1 << 20, 512 << 10, 1024, 1024, 4, 11, 0, all_11, 0, false), None);
+        assert_eq!(choose_demote_target(sev_p, 1 << 20, 512 << 10, 1024, 1024, 4, 11, 0, all_11, 0, false), None);
 
         // Below 512 KiB floor -> never demoted.
-        assert_eq!(choose_demote_target(mod_p, 256 << 10, 512 << 10, 4, 11, 0, all_11, 0, true), None);
+        assert_eq!(choose_demote_target(mod_p, 256 << 10, 512 << 10, 1024, 1024, 4, 11, 0, all_11, 0, true), None);
 
         // Card-written mip 0 -> never demoted.
-        assert_eq!(choose_demote_target(mod_p, 1 << 20, 512 << 10, 4, 11, 0, all_11, 1 << 0, true), None);
+        assert_eq!(choose_demote_target(mod_p, 1 << 20, 512 << 10, 1024, 1024, 4, 11, 0, all_11, 1 << 0, true), None);
 
         // Only mip 0 backed (no fallback mip below it) -> never blanked!
-        assert_eq!(choose_demote_target(mod_p, 1 << 20, 512 << 10, 4, 11, 0, 1 << 0, 0, true), None);
+        assert_eq!(choose_demote_target(mod_p, 1 << 20, 512 << 10, 1024, 1024, 4, 11, 0, 1 << 0, 0, true), None);
 
-        // Idle large texture under Moderate -> demotes 1 top mip (0 -> 1).
-        assert_eq!(choose_demote_target(mod_p, 1 << 20, 512 << 10, 4, 11, 0, all_11, 0, true), Some(1));
-        // Under Severe -> demotes up to 2 top mips (0 -> 2).
-        assert_eq!(choose_demote_target(sev_p, 1 << 20, 512 << 10, 4, 11, 0, all_11, 0, true), Some(2));
+        // Always keep >= 256x256 + mip tail resident:
+        // - 256x256 -> max_demote_target == 0 (never demoted below 256x256)
+        assert_eq!(max_demote_target(256, 256, 4, 9), 0);
+        assert_eq!(choose_demote_target(sev_p, 1 << 20, 512 << 10, 256, 256, 4, 9, 0, all_11, 0, true), None);
+        // - 512x512 -> capped at mip 1 (256x256) even under Severe
+        assert_eq!(max_demote_target(512, 512, 4, 10), 1);
+        assert_eq!(choose_demote_target(sev_p, 1 << 20, 512 << 10, 512, 512, 4, 10, 0, all_11, 0, true), Some(1));
+        // - 1024x1024 -> capped at mip 2 (256x256); Moderate steps 0 -> 1, Severe 0 -> 2, and mip 2 stops!
+        assert_eq!(max_demote_target(1024, 1024, 4, 11), 2);
+        assert_eq!(choose_demote_target(mod_p, 1 << 20, 512 << 10, 1024, 1024, 4, 11, 0, all_11, 0, true), Some(1));
+        assert_eq!(choose_demote_target(sev_p, 1 << 20, 512 << 10, 1024, 1024, 4, 11, 0, all_11, 0, true), Some(2));
+        assert_eq!(choose_demote_target(sev_p, 1 << 20, 512 << 10, 1024, 1024, 4, 11, 2, all_11, 0, true), None);
+        // - 2048x2048 -> capped at mip 3 (256x256)
+        assert_eq!(max_demote_target(2048, 2048, 5, 12), 3);
+
+        // Unified mip bound: max(wanted, first_viewed, demote_floor), treating u32::MAX as 0.
+        assert_eq!(unified_mip_bound(u32::MAX, 0, 0), 0);
+        assert_eq!(unified_mip_bound(u32::MAX, 2, 0), 2);
+        assert_eq!(unified_mip_bound(3, 1, 0), 3);
+        assert_eq!(unified_mip_bound(0, 1, 2), 2);
+        assert_eq!(unified_mip_bound(1, 3, 2), 3);
+        assert_eq!(unified_mip_bound(0, 0, 0), 0);
+    }
+
+    #[test]
+    fn pool_heap_selection_prefers_higher_occupancy_and_lower_index() {
+        // Heap 0: 100 free (occupied), Heap 1: 200 free (less occupied), Heap 2: 256 free (empty spare)
+        let heaps = [(0, 100u32), (1, 200u32), (2, HEAP_TILES)];
+        // 16 tiles fits in all -> picks highest-occupancy (smallest free_count = 100 -> heap 0)
+        assert_eq!(select_pool_heap(heaps.iter().copied(), 16), Some(0));
+        // 150 tiles skips heap 0, prefers partially occupied heap 1 over empty spare heap 2
+        assert_eq!(select_pool_heap(heaps.iter().copied(), 150), Some(1));
+        // 256 tiles uses empty spare heap 2
+        assert_eq!(select_pool_heap(heaps.iter().copied(), 256), Some(2));
+        // Tie in occupancy -> prefers lower index so upper heap drains naturally
+        let tied = [(0, 128u32), (1, 128u32)];
+        assert_eq!(select_pool_heap(tied.iter().copied(), 32), Some(0));
+    }
+
+    #[test]
+    fn eager_empty_heap_reclamation_keeps_at_most_one_spare_on_warp() {
+        let _pool_guard = TestPoolGuard::acquire();
+        let Some(rig) = Rig::new() else {
+            eprintln!("no adapter with tiled resources of tier 2, or no debug layer; skipped");
+            return;
+        };
+        let heap_bytes = u64::from(HEAP_TILES) * TILE;
+        assert_eq!(heap_bytes, 16 << 20);
+        let returned_before = STATS[8].load(Ordering::Relaxed);
+
+        // Allocate three full 16 MiB heaps (256 tiles each).
+        let (_, i0, r0) = take(&rig.device, HEAP_TILES).expect("heap 0");
+        let (_, i1, r1) = take(&rig.device, HEAP_TILES).expect("heap 1");
+        let (_, i2, r2) = take(&rig.device, HEAP_TILES).expect("heap 2");
+        assert_eq!((i0, i1, i2), (0, 1, 2));
+        assert_eq!(STATS[3].load(Ordering::Relaxed), 3 * heap_bytes);
+
+        // Free heap 2 -> 1 empty heap kept as warm spare (0 destroyed yet).
+        give_back(i2, &r2);
+        assert_eq!(STATS[3].load(Ordering::Relaxed), 3 * heap_bytes);
+        assert_eq!(STATS[8].load(Ordering::Relaxed), returned_before);
+
+        // Free heap 1 -> 2 empty heaps > MAX_SPARE_HEAPS (1) -> highest-index empty heap (2) destroyed!
+        give_back(i1, &r1);
+        assert_eq!(STATS[3].load(Ordering::Relaxed), 2 * heap_bytes);
+        assert_eq!(STATS[8].load(Ordering::Relaxed), returned_before + 1);
+
+        // Free heap 0 -> 2 empty heaps again -> heap 1 destroyed, leaving exactly 1 warm spare (heap 0)!
+        give_back(i0, &r0);
+        assert_eq!(STATS[3].load(Ordering::Relaxed), heap_bytes);
+        assert_eq!(STATS[8].load(Ordering::Relaxed), returned_before + 2);
+        rig.check("eager 16 MiB empty-heap reclamation");
     }
 
     #[test]
@@ -3010,6 +3265,14 @@ void look() {
         // Wait for GPU work before returning tiles to pool.
         rig.run(|_| {});
         drop(retired);
+
+        // 4b) While demote_floor == 1, even an upload naming all levels must NOT remap mip 0!
+        let (changed_blocked, missing_blocked, _) =
+            tiled.uploaded_on_reclaim(&rig.queue, &rig.device, &texture, from_level(0), true, true);
+        rig.check("upload while demoted keeps mip 0 unmapped");
+        assert!(!changed_blocked && !missing_blocked);
+        assert!(!tiled.has_tiles(0), "demote_floor == 1 must prevent remapping mip 0");
+        assert_eq!(tiled.first_shown(), Some(1));
 
         // 5) Re-promote -> demote_floor clears, next upload re-maps and restores mip 0!
         assert!(tiled.promote());

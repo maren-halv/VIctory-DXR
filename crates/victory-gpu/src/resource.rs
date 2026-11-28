@@ -1208,6 +1208,10 @@ pub(crate) struct HostTexture {
     /// The title's level its level 0 is ([`held_only`]): larger levels have
     /// no place in it.
     pub(crate) base: u32,
+    /// Lowest mip level requested by any view of this texture (`u32::MAX` = none said),
+    /// mirrored from `Hosted::wanted` so `texture::Staging` can compute the unified
+    /// Tier-2 mapping bound without locking `Resource`.
+    pub(crate) wanted: std::sync::atomic::AtomicU32,
     /// Tells host copies apart that one texture had one after the other.
     pub(crate) serial: u64,
     /// Made in place of one with fewer levels: the slots that show that one
@@ -1307,20 +1311,40 @@ struct Hosted {
     unmapped_since: std::sync::atomic::AtomicU64,
 }
 
+#[cfg(any(windows, test))]
+fn parse_held_only(value: Option<&str>) -> bool {
+    value.is_none_or(|v| v.trim() != "0")
+}
+
 /// Whether a texture the title places in memory is read, kept and uploaded
 /// from the first level its views show on (`VICTORY_HELD_LEVELS=0`: whole,
-/// as before). Such a title describes every level of a texture and views it
-/// from the first one it holds; the memory of the larger ones is the next
-/// texture's, or nothing. Of two recorded world frames the levels some slot
-/// shows are 1.2 and 1.6 GB of the 6.3 and 6.7 GB of such host copies, and
-/// most of what was found "changed" and uploaded again was other textures'
-/// bytes.
+/// as before). Operates orthogonally alongside Tier-2 tiled textures
+/// (`crate::tiles::wanted()`): non-tiled / `< 512 KiB` / array / fallback
+/// textures use `held_only`, while readable `>= 512 KiB` 2D placed mipmapped
+/// textures use `CreateReservedResource`.
 #[cfg(windows)]
 pub(crate) fn held_only() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var_os("VICTORY_HELD_LEVELS").is_none_or(|v| v != "0") && !crate::tiles::wanted()
-    })
+    *ON.get_or_init(|| parse_held_only(std::env::var("VICTORY_HELD_LEVELS").ok().as_deref()))
+}
+
+/// Pure policy selecting Path B (Tier-2 `CreateReservedResource`) vs Path A
+/// (`VICTORY_HELD_LEVELS` committed/pooled copy): readable, non-aliased 2D
+/// placed single-layer mipmapped filled textures `>= floor_bytes` that are
+/// partially mapped/streamed (`partly`) use Tier-2 reserved resources, while
+/// fully-committed mip-0 textures and smaller/non-tiled textures use Path A.
+#[cfg(any(windows, test))]
+fn should_use_tiled(
+    shape_fits: bool,
+    placed: bool,
+    tiles_on: bool,
+    readable: bool,
+    bytes: u64,
+    floor_bytes: u64,
+    is_alias: bool,
+    partly: bool,
+) -> bool {
+    shape_fits && placed && tiles_on && readable && bytes >= floor_bytes && !is_alias && partly
 }
 
 /// The first level a placed texture's view shows: of views of one 2D
@@ -1691,25 +1715,87 @@ fn clamped_remove(addr: usize) {
 pub(crate) static HELD: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// A view of the placed texture `this` that starts at level `first` is made
-/// or brought up to date: a host copy without that level is replaced by one
-/// with it (made and filled at the next use; the slots that show the old
-/// one go on showing it until that is done).
+/// or brought up to date: for Path B (Tier-2 tiled) textures, updates `wanted`,
+/// touches recency, and immediately clears `demote_floor` down to `first` if
+/// demoted; for Path A (`held_only`) textures, replaces a host copy without
+/// that level by one with it.
 #[cfg(windows)]
 pub(crate) fn want_level(this: This, first: u32) {
-    use std::sync::atomic::Ordering::Relaxed;
-    if this.is_null() || !held_only() {
+    use std::sync::atomic::Ordering::{Acquire, Relaxed};
+    if this.is_null() || (!held_only() && !crate::tiles::wanted()) {
         return;
     }
     let r = resource(this);
     if r.desc.dimension == BUFFER || !r.host.placed.load(Relaxed) {
         return;
     }
+    if r.host.has_made.load(Acquire) {
+        let mut promoted = false;
+        let mut needs_upload = false;
+        let handled = {
+            let made = r.host.made.read().unwrap_or_else(|e| e.into_inner());
+            if let Some((host, _)) = made.as_ref() {
+                if let Some(tiled) = &host.tiled {
+                    r.host.wanted.fetch_min(first, Relaxed);
+                    host.wanted.fetch_min(first, Relaxed);
+                    let now = crate::host::moment();
+                    if tiled.last_used() != now {
+                        tiled.touch(now);
+                    }
+                    if first < tiled.demote_floor() && tiled.promote_to(first) {
+                        host.invalidate_hashed_frame();
+                        promoted = true;
+                        needs_upload = first < 32 && tiled.without(1 << first) != 0;
+                    }
+                    true
+                } else {
+                    !held_only() || host.base == 0 || host.base <= base_level(&r.desc, first)
+                }
+            } else {
+                false
+            }
+        };
+        if promoted {
+            crate::texture::note_promoted(this);
+            let mem = r.data() as u64;
+            if needs_upload {
+                crate::descriptor::host::levels_waiting(mem);
+            }
+            crate::descriptor::host::levels_changed(mem);
+        }
+        if handled {
+            return;
+        }
+    }
     let mut made = r.host.made.write().unwrap_or_else(|e| e.into_inner());
     let Some((host, _)) = made.as_ref() else {
         r.host.wanted.fetch_min(first, Relaxed);
         return;
     };
-    if host.base == 0 || host.base <= base_level(&r.desc, first) {
+    if let Some(tiled) = &host.tiled {
+        r.host.wanted.fetch_min(first, Relaxed);
+        host.wanted.fetch_min(first, Relaxed);
+        let now = crate::host::moment();
+        if tiled.last_used() != now {
+            tiled.touch(now);
+        }
+        let promoted = first < tiled.demote_floor() && tiled.promote_to(first);
+        let needs_upload = promoted && first < 32 && tiled.without(1 << first) != 0;
+        if promoted {
+            host.invalidate_hashed_frame();
+        }
+        drop(made);
+        if promoted {
+            crate::texture::note_promoted(this);
+            let mem = r.data() as u64;
+            if needs_upload {
+                crate::descriptor::host::levels_waiting(mem);
+            }
+            crate::descriptor::host::levels_changed(mem);
+        }
+        return;
+    }
+    if !held_only() || host.base == 0 || host.base <= base_level(&r.desc, first) {
         return;
     }
     host.invalidate_hashed_frame();
@@ -2142,6 +2228,26 @@ fn note_used(r: &Resource) {
     }
 }
 
+/// Updates last-use metadata on `r` and touches Tier-2 tiled recency so
+/// actively referenced bindless/table textures are never falsely marked idle.
+#[cfg(windows)]
+#[inline]
+fn note_used_host(r: &Resource, host: &HostTexture) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let now = crate::host::moment();
+    if r.host.used.load(Relaxed) != now {
+        r.host.used.store(now, Relaxed);
+    }
+    if r.host.unmapped_since.load(Relaxed) != 0 {
+        r.host.unmapped_since.store(0, Relaxed);
+    }
+    if let Some(tiled) = &host.tiled
+        && tiled.last_used() != now
+    {
+        tiled.touch(now);
+    }
+}
+
 /// Whether `this` is a texture whose host copy is not made yet (and may
 /// still be): a descriptor slot written with a view of it waits
 /// (`crate::descriptor::make_waiting`).
@@ -2175,7 +2281,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
     if r.host.has_made.load(Acquire) {
         let made = r.host.made.read().unwrap_or_else(|e| e.into_inner());
         if let Some(m) = made.as_ref() {
-            note_used(r);
+            note_used_host(r, &m.0);
             return Some((std::sync::Arc::clone(&m.0), m.1.clone()));
         }
     }
@@ -2195,13 +2301,10 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             .clear
             .as_ref()
             .map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast::<c_void>());
-        // Levels on demand (`crate::tiles`): a texture the title places in
-        // memory and fills, of a megabyte or more, that does not hold all
-        // its levels now, is made without memory and given it level by
-        // level. It does not hold them all if its memory is not all
-        // mapped, if the next texture starts inside its span, or if a
-        // view of it starts below level 0. Every other texture, and this
-        // one if the card will not have it so, is made as before.
+        // Path B (`crate::tiles`): every readable, non-aliased 2D placed
+        // mipmapped filled texture >= `tiles::floor()` (512 KiB) uses Tier-2
+        // `CreateReservedResource` regardless of initial `first_viewed`, so
+        // top mips can be mapped on demand and demoted when idle later.
         const TEXTURE_2D: u32 = 3;
         let mut tiled = None;
         let mut texture = None;
@@ -2210,18 +2313,28 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             && r.desc.depth_or_array_size == 1
             && r.desc.mip_levels > 1
             && r.desc.sample_count <= 1;
-        if shape_fits && r.host.placed.load(Relaxed) && crate::tiles::wanted() {
+        let placed = r.host.placed.load(Relaxed);
+        let is_alias = placed && shape_fits && alias_of(this).is_some();
+        if shape_fits && placed && crate::tiles::wanted() && !is_alias {
             let bytes = footprint(&r.desc).map_or(0, |f| f.size);
             let start = r.data() as u64;
             // What the upload can read: a console layout, no XOR mode
             // (`crate::texture` `staging`).
             let readable = texture_layout(&r.desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor());
-            let partly = readable
-                && bytes >= crate::tiles::floor()
-                && (!crate::texture::committed(r.data().cast_const(), bytes as usize)
-                    || crate::descriptor::host::next_start(start, start.saturating_add(bytes)).is_some()
-                    || crate::descriptor::host::first_viewed(start).is_some_and(|first| first > 0));
-            let reserved = if partly {
+            let partly = !crate::texture::committed(r.data().cast_const(), bytes as usize)
+                || crate::descriptor::host::next_start(start, start.saturating_add(bytes)).is_some()
+                || crate::descriptor::host::first_viewed(start).is_some_and(|first| first > 0);
+            let use_tiled = should_use_tiled(
+                shape_fits,
+                placed,
+                true,
+                readable,
+                bytes,
+                crate::tiles::floor(),
+                is_alias,
+                partly,
+            );
+            let reserved = if use_tiled {
                 host_texture_as(&r.desc, r.host.state, clear, true)
                     .ok()
                     .map(|(t, _, _)| t)
@@ -2233,17 +2346,17 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                 .zip(crate::host::host())
                 .and_then(|(t, host)| crate::tiles::Tiled::make(&host.device, t, u32::from(r.desc.mip_levels)));
             // (Both or neither: a reserved texture the card will not cut
-            // into tiles is dropped here, and the old kind is made below.)
+            // into tiles is dropped here, and Path A is used below.)
             if cut.is_some() {
                 tiled = cut;
                 texture = reserved;
             }
         }
-        // The levels views show ([`held_only`]), those of the slots shaders
-        // pick by index among them.
+        // Path A (`held_only`): non-tiled / `< 512 KiB` / fallback placed
+        // textures commit only the currently held mip range.
         let mut base = 0;
         let mut clamped_from: Option<u32> = None;
-        if texture.is_none() && shape_fits && r.host.placed.load(Relaxed) && held_only() && alias_of(this).is_none() {
+        if texture.is_none() && shape_fits && placed && held_only() && !is_alias {
             let wanted = r.host.wanted.load(Relaxed);
             let viewed = crate::descriptor::host::first_viewed(r.data() as u64).unwrap_or(u32::MAX);
             let first = wanted.min(viewed);
@@ -2303,6 +2416,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         };
         host.castable = castable;
         host.base = base;
+        host.wanted.store(r.host.wanted.load(Relaxed), Relaxed);
         host.grown.store(r.host.grown.swap(false, Relaxed), Relaxed);
         if base > 0 {
             HELD[0].fetch_add(1, Relaxed);
@@ -2331,6 +2445,11 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         if r.host.has_alias.load(Acquire) {
             arc.mark_aliased();
         }
+        let is_tiled = arc.tiled.is_some();
+        let serial = arc.serial;
+        if is_tiled {
+            crate::tiles::register_candidate(serial, &arc, r.data() as u64, this as usize);
+        }
         *made = Some((arc, twin));
         r.host.has_made.store(true, std::sync::atomic::Ordering::Release);
         r.host.unmapped_since.store(0, Relaxed);
@@ -2344,7 +2463,11 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         // are made before the next submission runs.
         crate::descriptor::texture_made(this as usize);
     }
-    note_used(r);
+    if let Some((host, _)) = made.as_ref() {
+        note_used_host(r, host);
+    } else {
+        note_used(r);
+    }
     made.clone()
 }
 
@@ -3547,6 +3670,7 @@ impl HostTexture {
             filled: false,
             tiled: None,
             base: 0,
+            wanted: std::sync::atomic::AtomicU32::new(u32::MAX),
             serial: SERIAL.0.fetch_add(1, Relaxed) + 1,
             grown: Default::default(),
             holds: Default::default(),
@@ -3580,6 +3704,7 @@ impl HostTexture {
             filled: false,
             tiled: Some(tiled),
             base: 0,
+            wanted: std::sync::atomic::AtomicU32::new(u32::MAX),
             serial: SERIAL.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
             grown: Default::default(),
             holds: Default::default(),
@@ -3650,7 +3775,7 @@ pub(crate) fn host_resource<'a>(
     if r.host.has_made.load(std::sync::atomic::Ordering::Acquire) {
         let made = r.host.made.read().unwrap_or_else(|e| e.into_inner());
         if let Some((host, _)) = made.as_ref() {
-            note_used(r);
+            note_used_host(r, host);
             // SAFETY: the resource holds the host copy until the title releases it
             // (lists and slots that name the texture hold it past that), or until
             // `let_go_idle` takes it: only from a texture the title fills, that no
@@ -3685,7 +3810,7 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     if r.host.has_made.load(std::sync::atomic::Ordering::Acquire) {
         let made = r.host.made.read().unwrap_or_else(|e| e.into_inner());
         if let Some((host, _)) = made.as_ref() {
-            note_used(r);
+            note_used_host(r, host);
             return Some(std::sync::Arc::clone(host));
         }
     }
@@ -3704,7 +3829,7 @@ pub(crate) fn made_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     }
     let made = r.host.made.read().unwrap_or_else(|e| e.into_inner());
     if let Some((host, _)) = made.as_ref() {
-        note_used(r);
+        note_used_host(r, host);
         return Some(std::sync::Arc::clone(host));
     }
     None
@@ -3882,10 +4007,12 @@ fn host_texture_as(
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
     };
-    // A texture the title fills, whose every subresource is uploaded before
-    // anything reads it: cut from a block (what the piece held before shows
-    // in no texel).
-    if fills(desc)
+    // A non-reserved texture the title fills, whose every subresource is
+    // uploaded before anything reads it: cut from a block (what the piece held
+    // before shows in no texel). Reserved Tier-2 textures MUST skip the placed
+    // pool and go directly to `CreateReservedResource` below.
+    if !reserved
+        && fills(desc)
         && d.sample_count <= 1
         && clear_value.is_none()
         && texture_layout(desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor())
@@ -4012,10 +4139,19 @@ pub(crate) fn host_tiled(this: This) -> Option<OnDemand> {
 
 /// The first level a view of title texture `this` may show, if its host
 /// copy is made level by level and some level is held and has memory
-/// (`crate::tiles::Tiled::first_shown`).
+/// (`crate::tiles::Tiled::first_shown`). Reads without touching recency so
+/// descriptor clamping during Phase-1 demotion does not mask idle age.
 #[cfg(windows)]
 pub(crate) fn first_shown(this: This) -> Option<u32> {
-    host_tiled(this)?.tiled()?.first_shown()
+    if this.is_null() || !crate::tiles::wanted() {
+        return None;
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER || !r.host.has_made.load(std::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
+    let made = r.host.made.read().unwrap_or_else(|e| e.into_inner());
+    made.as_ref()?.0.tiled.as_ref()?.first_shown()
 }
 
 /// A host copy made without memory of its own (`crate::tiles`), as a
@@ -6697,5 +6833,72 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert_eq!(sweep_thresholds(3_000, 600_000, true), (1_000, 15_000));
         assert_eq!(sweep_thresholds(3_000, 5_000, true), (1_000, 5_000));
         assert_eq!(std::mem::align_of::<CachePadded<std::sync::atomic::AtomicU64>>(), 64);
+    }
+
+    /// Verifies Path A (`VICTORY_HELD_LEVELS`) and Path B (`VICTORY_LEVELS_ON_DEMAND`)
+    /// operate simultaneously and orthogonally:
+    /// - `< 512 KiB` placed 2D texture uses Path A (`held_only`: `base > 0`, `tiled.is_none()`).
+    /// - `>= 512 KiB` placed 2D mipmapped texture uses Path B (`CreateReservedResource`:
+    ///   `tiled.is_some()`, `base == 0`) EVEN WHEN `first_viewed == 0` and fully committed.
+    /// - Calling `want_level(tex, 0)` on a demoted Path B texture immediately clears `demote_floor`.
+    #[cfg(windows)]
+    #[test]
+    fn held_levels_and_tier2_tiled_operate_simultaneously_with_first_viewed_zero() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        assert!(parse_held_only(None));
+        assert!(parse_held_only(Some("1")));
+        assert!(!parse_held_only(Some("0")));
+        assert!(!should_use_tiled(true, true, true, true, 256 << 10, 512 << 10, false, true));
+        assert!(should_use_tiled(true, true, true, true, 512 << 10, 512 << 10, false, true));
+        assert!(!should_use_tiled(true, true, true, true, 512 << 10, 512 << 10, false, false));
+        assert!(!should_use_tiled(true, true, true, true, 1 << 20, 512 << 10, true, true));
+        assert!(!should_use_tiled(false, true, true, true, 1 << 20, 512 << 10, false, true));
+
+        if crate::host::host().is_none() || !held_only() || !crate::tiles::wanted() {
+            return;
+        }
+
+        // 1) Small (< 512 KiB) 256x256 BC7 placed texture -> Path A (`held_only`).
+        let small_desc = [3u32, 0, 0, 0, 256, 0, 256, 0x9_0001, 98, 1, 0, 0x105, 0, 0];
+        let small_bytes = placed_bytes(&small_desc).unwrap();
+        assert!(small_bytes < crate::tiles::floor());
+        // SAFETY: private committed allocation owned by this test.
+        let small_mem = unsafe {
+            VirtualAlloc(std::ptr::null(), small_bytes as usize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        };
+        assert!(!small_mem.is_null());
+        let small_tex = texture_at(small_mem as u64, &small_desc).unwrap();
+        want_level(small_tex, 2);
+        let small_copy = host_copy(small_tex).unwrap();
+        assert!(small_copy.tiled.is_none(), "< 512 KiB texture must stay on Path A (non-tiled)");
+        assert_eq!(small_copy.base, 2, "< 512 KiB texture must commit only held levels via Path A");
+
+        // 2) Large (>= 512 KiB) 1024x1024 BC7 placed texture, partially reserved (uncommitted top mips)
+        //    -> Path B (Tier-2 `CreateReservedResource`).
+        let large_desc = [3u32, 0, 0, 0, 1024, 0, 1024, 0xb_0001, 98, 1, 0, 0x105, 0, 0];
+        let large_bytes = placed_bytes(&large_desc).unwrap();
+        assert!(large_bytes >= crate::tiles::floor());
+        // SAFETY: reserve-only allocation simulates partially-mapped streaming texture.
+        let large_mem = unsafe {
+            VirtualAlloc(std::ptr::null(), large_bytes as usize, MEM_RESERVE, PAGE_READWRITE)
+        };
+        assert!(!large_mem.is_null());
+        let large_tex = texture_at(large_mem as u64, &large_desc).unwrap();
+        want_level(large_tex, 0);
+        let large_copy = host_copy(large_tex).unwrap();
+        assert_eq!(large_copy.base, 0);
+        let tiled = large_copy
+            .tiled
+            .as_ref()
+            .expect(">= 512 KiB partly-mapped 2D mipmapped texture must use Tier-2 CreateReservedResource");
+
+        // 3) Simulate demotion on the live Tier-2 texture and verify `want_level(tex, 0)`
+        //    immediately clears `demote_floor` back to 0.
+        let (changed, missing) = tiled.uploaded(&large_copy.texture, (1u32 << 11) - 1, true);
+        assert!(changed && !missing);
+        assert!(tiled.begin_demotion(2, 100, 100));
+        assert_eq!(tiled.demote_floor(), 2);
+        want_level(large_tex, 0);
+        assert_eq!(tiled.demote_floor(), 0, "want_level(0) must immediately reset demote_floor to 0");
     }
 }

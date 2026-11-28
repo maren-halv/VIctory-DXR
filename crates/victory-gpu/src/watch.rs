@@ -1043,12 +1043,245 @@ thread_local! {
     static FOUND: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// Monotonic write-epoch bumped whenever any title page is noted written,
+/// unguarded, landed, or remapped. Combined with [`EPOCH_TABLE`] so submit-time
+/// front planning can skip unchanged spans in O(1) without locking `JOURNAL`.
+static WATCH_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+/// Floor epoch used when a single invalidation covers more than `EPOCH_BUCKETS`
+/// 64 MiB buckets (`>= 1 TiB`).
+static GLOBAL_EPOCH_FLOOR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const EPOCH_BUCKET_SHIFT: usize = 26; // 64 MiB per bucket
+const EPOCH_BUCKETS: usize = 16_384; // 1 TiB direct-mapped
+const EPOCH_BUCKET_MASK: usize = EPOCH_BUCKETS - 1;
+static EPOCH_TABLE: [std::sync::atomic::AtomicU64; EPOCH_BUCKETS] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; EPOCH_BUCKETS];
+
+/// Current global write epoch (Acquire-ordered with all preceding journal/guard updates).
+#[inline]
+pub(crate) fn current_write_epoch() -> u64 {
+    WATCH_EPOCH.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Highest write epoch recorded for any 64 MiB VA bucket overlapping `[start, end)`.
+#[inline]
+pub(crate) fn range_write_epoch(start: usize, end: usize) -> u64 {
+    use std::sync::atomic::Ordering::Acquire;
+    if start >= end {
+        return 0;
+    }
+    let first_b = start >> EPOCH_BUCKET_SHIFT;
+    let last_b = (end - 1) >> EPOCH_BUCKET_SHIFT;
+    if last_b - first_b >= EPOCH_BUCKETS {
+        return WATCH_EPOCH.load(Acquire);
+    }
+    let mut max = GLOBAL_EPOCH_FLOOR.load(Acquire);
+    for b in first_b..=last_b {
+        let e = EPOCH_TABLE[b & EPOCH_BUCKET_MASK].load(Acquire);
+        if e > max {
+            max = e;
+        }
+    }
+    max
+}
+
+/// Marks the 64 MiB VA buckets containing 64 KiB `pages` dirty at a fresh epoch.
+/// Must be called strictly AFTER the corresponding `JOURNAL`/`PUBLISHED`/`GUARDS` updates.
+fn mark_write_epoch_pages(pages: impl Iterator<Item = usize>) {
+    use std::sync::atomic::Ordering::Release;
+    let mut iter = pages.peekable();
+    if iter.peek().is_none() {
+        return;
+    }
+    let epoch = WATCH_EPOCH.fetch_add(1, Release) + 1;
+    let mut last_bucket = usize::MAX;
+    for page in iter {
+        let b = ((page.saturating_mul(PAGE)) >> EPOCH_BUCKET_SHIFT) & EPOCH_BUCKET_MASK;
+        if b != last_bucket {
+            EPOCH_TABLE[b].fetch_max(epoch, Release);
+            last_bucket = b;
+        }
+    }
+}
+
+/// Marks all 64 MiB VA buckets overlapping byte range `[start, end)` dirty at a fresh epoch.
+/// Must be called strictly AFTER the corresponding `JOURNAL`/`PUBLISHED`/`GUARDS` updates.
+fn mark_write_epoch_range(start: usize, end: usize) {
+    use std::sync::atomic::Ordering::Release;
+    if start >= end {
+        return;
+    }
+    let epoch = WATCH_EPOCH.fetch_add(1, Release) + 1;
+    let first_b = start >> EPOCH_BUCKET_SHIFT;
+    let last_b = (end - 1) >> EPOCH_BUCKET_SHIFT;
+    if last_b - first_b >= EPOCH_BUCKETS {
+        GLOBAL_EPOCH_FLOOR.fetch_max(epoch, Release);
+        return;
+    }
+    for b in first_b..=last_b {
+        EPOCH_TABLE[b & EPOCH_BUCKET_MASK].fetch_max(epoch, Release);
+    }
+}
+
+/// Whether adaptive hot-range write-watch reset suppression is enabled
+/// (`VICTORY_ADAPTIVE_WATCH=1` opts in; default OFF because `flags = 0` keeps
+/// previously dirty pages reported on every mid-frame submission, inflating
+/// upload copy bytes across multi-submit frames).
+fn adaptive_watch() -> bool {
+    #[cfg(test)]
+    if let Some(on) = ADAPTIVE_WATCH_IN_TEST.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ADAPTIVE_WATCH").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    static ADAPTIVE_WATCH_IN_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+#[derive(Clone, Copy, Default)]
+struct HotWatchEntry {
+    /// 8-bit sliding window of recent submissions that reported dirty pages.
+    hot_submits: u8,
+    /// True once `WRITE_WATCH_FLAG_RESET` was suppressed for this range in the current frame.
+    pending_reset: bool,
+}
+
+impl HotWatchEntry {
+    #[inline]
+    fn is_hot(self) -> bool {
+        self.hot_submits.count_ones() >= 4
+    }
+}
+
+const HOT_WATCH_MAX_ENTRIES: usize = 4_096;
+
+/// Per-watched-range `(first_page, last_page)` adaptive reset state.
+/// Lock ordering: leaf lock — never held across `ASKING`, `JOURNAL`, or `GetWriteWatch`.
+static HOT_WATCH: Mutex<BTreeMap<(usize, usize), HotWatchEntry>> = Mutex::new(BTreeMap::new());
+
+fn hot_watch_flags_for_groups(groups: &[(usize, usize, usize, usize)]) -> Vec<bool> {
+    if !adaptive_watch() || groups.is_empty() {
+        return vec![false; groups.len()];
+    }
+    let state = HOT_WATCH.lock().unwrap_or_else(|e| e.into_inner());
+    groups
+        .iter()
+        .map(|&(_, _, first, last)| state.get(&(first, last)).is_some_and(|e| e.is_hot()))
+        .collect()
+}
+
+fn hot_watch_record(outcomes: &[(usize, usize, bool, bool)]) {
+    if !adaptive_watch() || outcomes.is_empty() {
+        return;
+    }
+    let mut state = HOT_WATCH.lock().unwrap_or_else(|e| e.into_inner());
+    if state.len() + outcomes.len() > HOT_WATCH_MAX_ENTRIES {
+        state.retain(|_, e| e.pending_reset || e.is_hot());
+        if state.len() > HOT_WATCH_MAX_ENTRIES {
+            state.retain(|_, e| e.pending_reset);
+        }
+    }
+    for &(first, last, had_dirty, suppressed) in outcomes {
+        let entry = state.entry((first, last)).or_default();
+        if !suppressed {
+            entry.hot_submits = (entry.hot_submits << 1) | u8::from(had_dirty);
+            entry.pending_reset = false;
+        } else if !had_dirty {
+            entry.hot_submits <<= 1;
+            entry.pending_reset = false;
+        } else if !entry.pending_reset {
+            entry.hot_submits = (entry.hot_submits << 1) | 1;
+            entry.pending_reset = true;
+        }
+    }
+}
+
+fn hot_watch_invalidate(first: usize, last: usize) {
+    if first >= last {
+        return;
+    }
+    let mut state = HOT_WATCH.lock().unwrap_or_else(|e| e.into_inner());
+    if !state.is_empty() {
+        state.retain(|&(a, b), _| b <= first || a >= last);
+    }
+}
+
+/// Resets write-watch bits once per frame at `Present` for all hot ranges whose
+/// mid-frame `WRITE_WATCH_FLAG_RESET` was suppressed, recording any pages written
+/// since the last submission into `JOURNAL` so no CPU write is ever dropped.
+pub(crate) fn present_reset_hot_watches() {
+    if !adaptive_watch() {
+        return;
+    }
+    let mut to_reset: Vec<(usize, usize)> = {
+        let mut state = HOT_WATCH.lock().unwrap_or_else(|e| e.into_inner());
+        if state.is_empty() {
+            return;
+        }
+        let mut out = Vec::new();
+        for (&range, entry) in state.iter_mut() {
+            if entry.pending_reset {
+                entry.pending_reset = false;
+                out.push(range);
+            } else if entry.is_hot() {
+                entry.hot_submits <<= 1;
+            }
+        }
+        if state.len() > HOT_WATCH_MAX_ENTRIES / 2 {
+            state.retain(|_, e| e.hot_submits != 0 || e.pending_reset);
+        }
+        out
+    };
+    if to_reset.is_empty() {
+        return;
+    }
+    // Sort by `(first, Reverse(last))` and drop ranges strictly contained in an earlier range
+    // (never merging disjoint/touching ranges that might belong to distinct reservations).
+    to_reset.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
+    let mut filtered: Vec<(usize, usize)> = Vec::with_capacity(to_reset.len());
+    for (first, last) in to_reset {
+        if filtered.last().is_some_and(|&(pf, pl)| pf <= first && last <= pl) {
+            continue;
+        }
+        filtered.push((first, last));
+    }
+    let _held = AskingMany::hold(filtered.clone());
+    let mut written: Vec<(usize, u16)> = Vec::new();
+    for (first, last) in filtered {
+        if !kernel_written_into_flags(first, last, 1, &mut written) {
+            invalidate_reservations(first, last);
+        }
+    }
+    if written.is_empty() {
+        return;
+    }
+    if port_journal() {
+        let _ = note_shared(&written);
+    } else {
+        let mut j = journal_mut();
+        let now = next_asking();
+        for &(page, parts) in &written {
+            j.notes.note(page, parts, now);
+        }
+        drop(j);
+        mark_write_epoch_pages(written.iter().map(|&(p, _)| p));
+    }
+}
+
 /// Appends the pages of `[first, last)` the kernel says were written since it
 /// was last asked to `out`, returning `false` if the range is not write-watched
 /// memory of one reservation. The caller holds the range ([`Asking`]).
 fn kernel_written_into(first: usize, last: usize, out: &mut Vec<(usize, u16)>) -> bool {
-    use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
+    kernel_written_into_flags(first, last, WRITE_WATCH_FLAG_RESET, out)
+}
+
+/// Same as [`kernel_written_into`], with explicit `GetWriteWatch` `flags`
+/// (`WRITE_WATCH_FLAG_RESET = 1`, or `0` to query without clearing PTE bits).
+fn kernel_written_into_flags(first: usize, last: usize, flags: u32, out: &mut Vec<(usize, u16)>) -> bool {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
     FOUND.with(|found| {
         let mut found = found.borrow_mut();
         let mut count = (last - first) * PAGE / KERNEL_PAGE;
@@ -1061,7 +1294,7 @@ fn kernel_written_into(first: usize, last: usize, out: &mut Vec<(usize, u16)>) -
         // SAFETY: the answer buffer holds `count` entries.
         let failed = unsafe {
             GetWriteWatch(
-                WRITE_WATCH_FLAG_RESET,
+                flags,
                 (first * PAGE) as *const _,
                 (last - first) * PAGE,
                 found.as_mut_ptr().cast(),
@@ -1127,14 +1360,15 @@ fn coalesce_overlapping_pieces(pieces: &mut Vec<(usize, usize)>) {
     pieces.truncate(write + 1);
 }
 
-fn parse_watch_threads(raw: Option<&str>, _cpus: usize) -> usize {
+fn parse_watch_threads(raw: Option<&str>, cpus: usize) -> usize {
+    let default = if cpus >= 8 { 4 } else { 1 };
     raw.and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(1)
+        .unwrap_or(default)
         .clamp(1, 8)
 }
 
 /// Thread count for parallel `GetWriteWatch` across disjoint groups in
-/// `ask_once` (`VICTORY_WATCH_THREADS=<N>`, default `1` / single-threaded).
+/// `ask_once` (`VICTORY_WATCH_THREADS=<N>`, default `4` on `>= 8`-core CPUs, else `1`).
 fn watch_threads() -> usize {
     static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *THREADS.get_or_init(|| {
@@ -1162,9 +1396,9 @@ struct WatchPoolState {
 }
 
 #[derive(Clone, Copy)]
-struct WatchWork(*const (dyn Fn(usize) + Sync));
+struct WatchWork(*const (dyn Fn(usize, usize) + Sync));
 
-// SAFETY: `WatchPool::each` waits for all helpers to leave `work` before returning.
+// SAFETY: `WatchPool::each_indexed` waits for all helpers to leave `work` before returning.
 unsafe impl Send for WatchWork {}
 
 impl WatchPool {
@@ -1187,14 +1421,14 @@ impl WatchPool {
             for i in 1..threads {
                 let _ = std::thread::Builder::new().name(format!("victory-watch-{i}")).spawn(move || {
                     crate::cores::keep_helper_on_fast_cores("victory-watch");
-                    pool.help();
+                    pool.help(i);
                 });
             }
             pool
         })
     }
 
-    fn help(&self) {
+    fn help(&self, worker_id: usize) {
         use std::sync::atomic::Ordering;
         let mut seen = 0u64;
         loop {
@@ -1214,8 +1448,8 @@ impl WatchPool {
                 if i >= count {
                     break;
                 }
-                // SAFETY: counted in `running`, so `each` has not returned.
-                unsafe { (*work.0)(i) };
+                // SAFETY: counted in `running`, so `each_indexed` has not returned.
+                unsafe { (*work.0)(worker_id, i) };
             }
             if self.running.fetch_sub(1, Ordering::AcqRel) == 1 {
                 let _state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -1224,17 +1458,27 @@ impl WatchPool {
         }
     }
 
+    #[cfg(test)]
     fn each(&self, count: usize, f: &(dyn Fn(usize) + Sync)) {
+        self.each_indexed(count, &|_, i| f(i));
+    }
+
+    /// Runs `f(worker_id, item_idx)` for `item_idx in 0..count`, passing a unique
+    /// `worker_id in 0..self.threads` (`0` for the caller, `1..self.threads` for helpers)
+    /// so workers can accumulate into disjoint per-worker buffers with zero locking.
+    fn each_indexed(&self, count: usize, f: &(dyn Fn(usize, usize) + Sync)) {
         use std::sync::atomic::Ordering;
         if count < 2 || self.threads < 2 {
-            (0..count).for_each(f);
+            for i in 0..count {
+                f(0, i);
+            }
             return;
         }
         let _busy = self.busy.lock().unwrap_or_else(|e| e.into_inner());
-        // SAFETY: `_busy` serializes callers and `each` waits for `running == 0`
+        // SAFETY: `_busy` serializes callers and `each_indexed` waits for `running == 0`
         // before returning, so the erased lifetime never escapes.
         let work = WatchWork(unsafe {
-            std::mem::transmute::<*const (dyn Fn(usize) + Sync + '_), *const (dyn Fn(usize) + Sync + 'static)>(f)
+            std::mem::transmute::<*const (dyn Fn(usize, usize) + Sync + '_), *const (dyn Fn(usize, usize) + Sync + 'static)>(f)
         });
         {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -1253,13 +1497,41 @@ impl WatchPool {
             if i >= count {
                 break;
             }
-            f(i);
+            f(0, i);
         }
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.work = None;
         while self.running.load(Ordering::Acquire) > 0 {
             state = self.idle.wait(state).unwrap_or_else(|e| e.into_inner());
         }
+    }
+}
+
+/// Lock-free per-worker output slots for [`WatchPool::each_indexed`].
+struct WorkerOutputs<T>(Vec<std::cell::UnsafeCell<T>>);
+
+// SAFETY: Each `WatchPool` thread has a distinct `worker_id` in `0..len` and only
+// accesses its own slot; `WatchPool::each_indexed` synchronizes all workers before
+// the caller consumes the outputs.
+unsafe impl<T: Send> Sync for WorkerOutputs<T> {}
+
+impl<T: Default> WorkerOutputs<T> {
+    fn new(workers: usize) -> Self {
+        Self((0..workers).map(|_| std::cell::UnsafeCell::new(T::default())).collect())
+    }
+
+    /// # Safety
+    /// Must only be called with a `worker_id` unique to the calling thread for the
+    /// duration of the enclosing `WatchPool::each_indexed` batch.
+    #[inline]
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn slot_mut(&self, worker_id: usize) -> &mut T {
+        // SAFETY: caller guarantees exclusive access per `worker_id`.
+        unsafe { &mut *self.0[worker_id].get() }
+    }
+
+    fn into_vec(self) -> Vec<T> {
+        self.0.into_iter().map(std::cell::UnsafeCell::into_inner).collect()
     }
 }
 
@@ -1391,6 +1663,8 @@ fn invalidate_reservations(first: usize, last: usize) {
     if first >= last {
         return;
     }
+    hot_watch_invalidate(first, last);
+    mark_write_epoch_range(first.saturating_mul(PAGE), last.saturating_mul(PAGE));
     {
         let res = RESERVATIONS.read().unwrap_or_else(|e| e.into_inner());
         let idx = res.partition_point(|r| r.end <= first);
@@ -1542,9 +1816,11 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     j.ahead_asked = next_asking();
     j.ahead = asked;
     let now = j.ahead_asked;
-    for (page, parts) in written {
+    for &(page, parts) in &written {
         j.notes.note(page, parts, now);
     }
+    drop(j);
+    mark_write_epoch_pages(written.iter().map(|&(p, _)| p));
 }
 
 /// Renderer port #7: notes `written` (pages and their parts) as found by an
@@ -1557,6 +1833,9 @@ fn note_shared(written: &[(usize, u16)]) -> u64 {
     for &(page, parts) in written {
         held.note(page, parts, now);
     }
+    drop(held);
+    drop(j);
+    mark_write_epoch_pages(written.iter().map(|&(p, _)| p));
     port7_count(P7_SHARED_NOTES, 1);
     now
 }
@@ -1741,6 +2020,8 @@ fn drain_early_pieces(pieces: &mut Vec<usize>) -> u64 {
             for &(page, parts) in &written {
                 j.notes.note(page, parts, now);
             }
+            drop(j);
+            mark_write_epoch_pages(written.iter().map(|&(p, _)| p));
         }
     }
     asked
@@ -1845,40 +2126,56 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     let mut groups = group_pieces(&pieces, true);
     let _held = AskingMany::hold(groups.iter().map(|&(_, _, first, last)| (first, last)).collect());
     let (mut asked, mut written) = (Vec::with_capacity(groups.len()), Vec::new());
+    let mut outcomes: Vec<(usize, usize, bool, bool)> = Vec::with_capacity(groups.len());
     let threads = watch_threads();
     if threads >= 2 && groups.len() >= 2 {
         // Dispatch largest spans first to minimize parallel straggler tail.
         groups.sort_unstable_by(|a, b| (b.3 - b.2).cmp(&(a.3 - a.2)));
-        let slots: Vec<Mutex<(Vec<(usize, usize)>, Vec<(usize, u16)>)>> =
-            (0..groups.len()).map(|_| Mutex::new((Vec::new(), Vec::new()))).collect();
-        WatchPool::get(threads).each(groups.len(), &|g| {
+        let suppress = hot_watch_flags_for_groups(&groups);
+        let pool = WatchPool::get(threads);
+        type WorkerOut = (Vec<(usize, usize)>, Vec<(usize, u16)>, Vec<(usize, usize, bool, bool)>);
+        let outputs: WorkerOutputs<WorkerOut> = WorkerOutputs::new(pool.threads);
+        pool.each_indexed(groups.len(), &|worker_id, g| {
             let (i, k, first, last) = groups[g];
-            let (mut g_asked, mut g_written) = (Vec::new(), Vec::new());
+            let sup = suppress[g];
+            let flags = u32::from(!sup);
+            // SAFETY: `worker_id` is unique per thread inside `each_indexed`.
+            let (g_asked, g_written, g_outcomes) = unsafe { outputs.slot_mut(worker_id) };
             if k - i >= 2 {
-                ask_all_run(&pieces[i..k], &mut g_asked, &mut g_written);
-            } else if kernel_written_into(first, last, &mut g_written) {
-                g_asked.push((first, last));
+                ask_all_run_adaptive(&pieces[i..k], flags, sup, g_asked, g_written, g_outcomes);
             } else {
-                invalidate_reservations(first, last);
+                let before = g_written.len();
+                if kernel_written_into_flags(first, last, flags, g_written) {
+                    g_asked.push((first, last));
+                    g_outcomes.push((first, last, g_written.len() > before, sup));
+                } else {
+                    invalidate_reservations(first, last);
+                }
             }
-            *slots[g].lock().unwrap_or_else(|e| e.into_inner()) = (g_asked, g_written);
         });
-        for slot in slots {
-            let (g_asked, g_written) = slot.into_inner().unwrap_or_else(|e| e.into_inner());
+        for (g_asked, g_written, g_outcomes) in outputs.into_vec() {
             asked.extend(g_asked);
             written.extend(g_written);
+            outcomes.extend(g_outcomes);
         }
     } else {
-        for (i, k, first, last) in groups {
+        let suppress = hot_watch_flags_for_groups(&groups);
+        for (&(i, k, first, last), &sup) in groups.iter().zip(&suppress) {
+            let flags = u32::from(!sup);
             if k - i >= 2 {
-                ask_all_run(&pieces[i..k], &mut asked, &mut written);
-            } else if kernel_written_into(first, last, &mut written) {
-                asked.push((first, last));
+                ask_all_run_adaptive(&pieces[i..k], flags, sup, &mut asked, &mut written, &mut outcomes);
             } else {
-                invalidate_reservations(first, last);
+                let before = written.len();
+                if kernel_written_into_flags(first, last, flags, &mut written) {
+                    asked.push((first, last));
+                    outcomes.push((first, last, written.len() > before, sup));
+                } else {
+                    invalidate_reservations(first, last);
+                }
             }
         }
     }
+    hot_watch_record(&outcomes);
     sort_coalesce_ahead(&mut asked);
     note_hot(&written);
     if port_journal() {
@@ -1894,25 +2191,37 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     let mut j = journal_mut();
     let now = next_asking();
     j.ahead_asked = now;
-    for (page, parts) in written {
+    for &(page, parts) in &written {
         j.notes.note(page, parts, now);
     }
     let kept = !asked.is_empty();
     j.kept = kept;
     JOURNAL_KEPT.store(kept, std::sync::atomic::Ordering::Release);
     j.ahead = asked;
+    drop(j);
+    mark_write_epoch_pages(written.iter().map(|&(p, _)| p));
 }
 
 /// Like [`ask_run`], but also asks singleton ranges left after a split so
-/// `ask_once` finishes every write-watched range in one pass.
-fn ask_all_run(pieces: &[(usize, usize)], asked: &mut Vec<(usize, usize)>, written: &mut Vec<(usize, u16)>) {
+/// `ask_once` finishes every write-watched range in one pass, honoring
+/// adaptive `flags` on the unsplit group and falling back to reset flags on splits.
+fn ask_all_run_adaptive(
+    pieces: &[(usize, usize)],
+    flags: u32,
+    suppressed: bool,
+    asked: &mut Vec<(usize, usize)>,
+    written: &mut Vec<(usize, u16)>,
+    outcomes: &mut Vec<(usize, usize, bool, bool)>,
+) {
     if pieces.is_empty() {
         return;
     }
     let first = pieces[0].0;
     let last = pieces.iter().map(|p| p.1).max().unwrap_or(first);
-    if kernel_written_into(first, last, written) {
+    let before = written.len();
+    if kernel_written_into_flags(first, last, flags, written) {
         asked.push((first, last));
+        outcomes.push((first, last, written.len() > before, suppressed));
         return;
     }
     invalidate_reservations(first, last);
@@ -1920,8 +2229,8 @@ fn ask_all_run(pieces: &[(usize, usize)], asked: &mut Vec<(usize, usize)>, writt
         return;
     }
     let (a, b) = pieces.split_at(pieces.len() / 2);
-    ask_all_run(a, asked, written);
-    ask_all_run(b, asked, written);
+    ask_all_run_adaptive(a, 1, false, asked, written, outcomes);
+    ask_all_run_adaptive(b, 1, false, asked, written, outcomes);
 }
 
 /// The submission's one asking stands no longer: its refreshes are done,
@@ -1944,14 +2253,20 @@ pub(crate) fn ask_once_end() {
 /// stands (the title's buffer copies, done at submission): its pages count
 /// as written after that asking, so the refreshes that follow copy them.
 pub(crate) fn wrote(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
     // Renderer port #7: with no asking standing there is nothing to note,
     // which is seen shared. (Standing, its number moves: alone, as before.)
-    if port_journal() && (len == 0 || !journal().kept) {
+    if port_journal() && !journal().kept {
         port7_count(P7_SKIPPED, 1);
+        mark_write_epoch_range(at, at.saturating_add(len));
         return;
     }
     let mut j = journal_mut();
-    if !j.kept || len == 0 {
+    if !j.kept {
+        drop(j);
+        mark_write_epoch_range(at, at.saturating_add(len));
         return;
     }
     let now = next_asking();
@@ -1962,9 +2277,17 @@ pub(crate) fn wrote(at: usize, len: usize) {
     for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
         j.notes.note(page, WHOLE, now);
     }
-    for (_, others) in elsewhere(at, len) {
-        for other in others {
+    let aliases = elsewhere(at, len);
+    for (_, others) in &aliases {
+        for &other in others {
             j.notes.note(other / PAGE, WHOLE, now);
+        }
+    }
+    drop(j);
+    mark_write_epoch_range(at, at.saturating_add(len));
+    for (_, others) in aliases {
+        for other in others {
+            mark_write_epoch_range(other, other.saturating_add(PAGE));
         }
     }
 }
@@ -2108,14 +2431,21 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             held.note(page, parts, now);
         }
         port7_count(P7_SHARED_NOTES, 1);
-        (now, held.range(first, last))
+        let r = held.range(first, last);
+        drop(held);
+        drop(j);
+        mark_write_epoch_pages(pages.iter().map(|&(p, _)| p));
+        (now, r)
     } else {
         let mut j = journal_mut();
         let now = next_asking();
         for &(page, parts) in &pages {
             j.notes.note(page, parts, now);
         }
-        (now, j.notes.range(first, last))
+        let r = j.notes.range(first, last);
+        drop(j);
+        mark_write_epoch_pages(pages.iter().map(|&(p, _)| p));
+        (now, r)
     };
     // Noted: what the guards made clean of it is known by its bits from
     // now on. (The range is still held: no other asking of any of it came
@@ -4214,6 +4544,7 @@ pub(crate) fn note_landed_pages(pages: &[usize]) {
     for &page in pages {
         LANDED.note(page, frame);
     }
+    mark_write_epoch_pages(pages.iter().map(|&p| p / PARTS));
 }
 
 
@@ -4288,10 +4619,12 @@ pub(crate) fn landed_beside(pages: &[usize], spans: &[(usize, usize)]) -> (u64, 
         }
     }
     for &(at, len) in spans {
+        mark_write_epoch_range(at, at.saturating_add(len));
         // A placed texture there changes with no descriptor written.
         crate::descriptor::host::remapped(at, len);
     }
     for other in elsewhere.into_iter().flat_map(|(_, others)| others) {
+        mark_write_epoch_range(other, other.saturating_add(BLOCK));
         crate::descriptor::host::remapped(other, BLOCK);
     }
     (noted, before)
@@ -5026,6 +5359,7 @@ fn open_given(_g: GuardsRef<'_>, start: usize, end: usize, given: Option<&[usize
                     // Before the first can be written.
                     GUARDS_STATE.clean.remove(other);
                     PUBLISHED.clear(other);
+                    mark_write_epoch_pages(std::iter::once(other));
                     continue;
                 }
                 GUARDS_STATE.aliased.remove(other);
@@ -5157,6 +5491,7 @@ fn unguard(g: &GuardsState, blocks: &[usize]) {
             cur += 1;
         }
     }
+    mark_write_epoch_pages(blocks.iter().copied());
     #[cfg(feature = "diagnostics")]
     tally(8, started.elapsed().as_nanos() as u64);
 }
@@ -5178,6 +5513,7 @@ pub fn writing(at: usize, len: usize) {
         }
         let _ = opened;
     }
+    mark_write_epoch_range(at, at.saturating_add(len));
     // A placed texture there changes with no descriptor written.
     crate::descriptor::host::remapped(at, len);
 }
@@ -5213,6 +5549,7 @@ pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
         && !GUARDS_STATE.absent.0.any_acquire(first, last)
         && !VIEWS.any_acquire(first, last)
     {
+        mark_write_epoch_range(at, at.saturating_add(len));
         crate::descriptor::host::remapped(at, len);
         return KernelWrite { first, last: first, shards: 0 };
     }
@@ -5245,6 +5582,7 @@ pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
         }
         break;
     }
+    mark_write_epoch_range(at, at.saturating_add(len));
     crate::descriptor::host::remapped(at, len);
     KernelWrite { first, last, shards: range_shards }
 }
@@ -5323,11 +5661,13 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
     } else {
         WRITTEN[3].fetch_add(1, Relaxed);
         if mode & (4 | 8) == 0 {
+            mark_write_epoch_range(at, end);
             return;
         }
         WRITTEN[4].fetch_add(1, Relaxed);
         if mode & 4 == 0 {
             // (Bit 8 alone: the placed textures under it, not the guards.)
+            mark_write_epoch_range(at, end);
             crate::descriptor::host::page_written(at, len);
             return;
         }
@@ -5355,6 +5695,7 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
             break;
         }
     }
+    mark_write_epoch_range(at, end);
     // A placed texture there changed with no descriptor written.
     crate::descriptor::host::page_written(at, len);
 }
@@ -5713,6 +6054,8 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
             PUBLISHED.clear(block);
             PROTECTED.clear(block);
         }
+        drop(g);
+        mark_write_epoch_range(at, at.saturating_add(len));
     }
 }
 
@@ -6114,6 +6457,7 @@ pub(crate) fn tripwire_disarm_id(id: u64) {
         tripwire_restore(&entry.protected);
         tripwire_push_disarmed(&mut state, entry.start, entry.end);
         tripwire_refresh_bounds(&state);
+        mark_write_epoch_range(entry.start, entry.end);
     }
 }
 
@@ -6141,6 +6485,7 @@ pub(crate) fn tripwire_touch(at: usize, len: usize, unmapping: bool) -> bool {
                     tripwire_restore(&entry.protected);
                 }
                 tripwire_push_disarmed(&mut state, entry.start, entry.end);
+                mark_write_epoch_range(entry.start, entry.end);
                 hit_ids.push(entry.id);
             } else {
                 i += 1;
@@ -8748,8 +9093,11 @@ mod port7_tests {
 
     #[test]
     fn watch_threads_and_gap_parsing_honor_defaults_and_overrides() {
-        assert_eq!(super::parse_watch_threads(None, 16), 1);
+        assert_eq!(super::parse_watch_threads(None, 16), 4);
+        assert_eq!(super::parse_watch_threads(None, 8), 4);
+        assert_eq!(super::parse_watch_threads(None, 4), 1);
         assert_eq!(super::parse_watch_threads(None, 2), 1);
+        assert_eq!(super::parse_watch_threads(Some("1"), 16), 1);
         assert_eq!(super::parse_watch_threads(Some("4"), 16), 4);
         assert_eq!(super::parse_watch_threads(Some("0"), 16), 1);
         assert_eq!(super::parse_watch_threads(Some("12"), 16), 8);
@@ -8759,6 +9107,140 @@ mod port7_tests {
         assert_eq!(super::parse_watch_gap_pages(None, Some("2")), (2 << 20) / PAGE);
         assert_eq!(super::parse_watch_gap_pages(Some("0"), None), 0);
         assert_eq!(super::parse_watch_gap_pages(Some("999999999"), None), (1024 << 20) / PAGE);
+    }
+
+    #[test]
+    fn adaptive_hot_range_suppression_engages_resets_at_present_and_never_drops_writes() {
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        const PAGES: usize = 4;
+        const SIZE: usize = PAGES * PAGE;
+        // SAFETY: private MEM_WRITE_WATCH reservation freed at end of test.
+        let base = unsafe {
+            VirtualAlloc(std::ptr::null(), SIZE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+        } as usize;
+        assert!(base != 0 && base.is_multiple_of(PAGE));
+        let key = (base / PAGE, base / PAGE + PAGES);
+
+        super::ADAPTIVE_WATCH_IN_TEST.set(Some(true));
+        super::hot_watch_invalidate(key.0, key.1);
+
+        // Warm up / establish clean baseline (clears initial commit write-watch bits).
+        let _ = super::writes(base, base + SIZE, false).expect("watched");
+
+        // Submits 1..3 dirty: history has 1, 2, 3 bits set (< 4/8), so suppression stays OFF.
+        for round in 1..=3usize {
+            // SAFETY: committed page inside our test allocation.
+            unsafe { ((base + 64) as *mut u64).write_volatile(round as u64) };
+            let ep_before = super::range_write_epoch(base, base + SIZE);
+            super::ask_once(&[(base, base + SIZE)]);
+            assert!(
+                super::range_write_epoch(base, base + SIZE) > ep_before,
+                "dirty ask_once round {round} must bump VA-bucket write epoch"
+            );
+            super::ask_once_end();
+            let entry = {
+                let state = super::HOT_WATCH.lock().unwrap_or_else(|e| e.into_inner());
+                state.get(&key).copied().expect("range tracked in HOT_WATCH")
+            };
+            assert_eq!(entry.hot_submits.count_ones(), round as u32);
+            assert!(!entry.is_hot(), "must not engage before 4/8 dirty submits");
+            assert!(!entry.pending_reset);
+        }
+
+        // Submit 4 dirty: hits 4/8 (50%) -> transitions to hot!
+        // SAFETY: committed page inside our test allocation.
+        unsafe { ((base + 64) as *mut u64).write_volatile(4) };
+        super::ask_once(&[(base, base + SIZE)]);
+        super::ask_once_end();
+        {
+            let state = super::HOT_WATCH.lock().unwrap_or_else(|e| e.into_inner());
+            let entry = state.get(&key).copied().expect("tracked");
+            assert!(entry.is_hot(), "4/8 dirty submits must mark range hot");
+            assert!(!entry.pending_reset, "4th submit still used reset; suppression starts on 5th");
+        }
+
+        // Submit 5 dirty (page 0): now hot -> suppresses WRITE_WATCH_FLAG_RESET (`flags = 0`)!
+        // SAFETY: committed page inside our test allocation.
+        unsafe { ((base + 64) as *mut u64).write_volatile(5) };
+        super::ask_once(&[(base, base + SIZE)]);
+        let (ask5, seen5) = super::asked(base, base + SIZE).expect("covered");
+        assert!(seen5.iter().any(|&(p, at)| p == base / PAGE && at == ask5));
+        super::ask_once_end();
+        {
+            let state = super::HOT_WATCH.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(state[&key].pending_reset, "hot submit must suppress mid-frame reset");
+        }
+
+        // Submit 6: do NOT write page 0, write page 2 AFTER submit 5!
+        // With `flags = 0`, page 0 stays dirty in Windows (zero MiWriteWatchFault on rewrite)
+        // AND newly written page 2 is caught immediately!
+        // SAFETY: committed page 2 inside our test allocation.
+        unsafe { ((base + 2 * PAGE + 128) as *mut u64).write_volatile(6) };
+        super::ask_once(&[(base, base + SIZE)]);
+        let (ask6, seen6) = super::asked(base, base + SIZE).expect("covered");
+        assert!(
+            seen6.iter().any(|&(p, at)| p == base / PAGE && at == ask6),
+            "suppressed page 0 must remain reported while flags=0"
+        );
+        assert!(
+            seen6.iter().any(|&(p, at)| p == base / PAGE + 2 && at == ask6),
+            "newly written page 2 mid-frame must never be dropped"
+        );
+        super::ask_once_end();
+
+        // Simulate a CPU write to page 3 AFTER the last submission and BEFORE Present!
+        // SAFETY: committed page 3 inside our test allocation.
+        unsafe { ((base + 3 * PAGE + 256) as *mut u64).write_volatile(7) };
+        let ep_pre_present = super::range_write_epoch(base, base + SIZE);
+        super::present_reset_hot_watches();
+        assert!(
+            super::range_write_epoch(base, base + SIZE) > ep_pre_present,
+            "present_reset_hot_watches must record late writes and bump write epoch"
+        );
+        {
+            let state = super::HOT_WATCH.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(!state[&key].pending_reset, "Present must clear pending_reset");
+        }
+        // Verify page 3's late write was recorded into JOURNAL with asking > ask6!
+        super::ask_once(&[(base, base + SIZE)]);
+        let (ask7, seen7) = super::asked(base, base + SIZE).expect("covered");
+        assert!(
+            seen7.iter().any(|&(p, at)| p == base / PAGE + 3 && at > ask6 && at < ask7),
+            "late pre-Present write on page 3 must be preserved in JOURNAL across Present reset"
+        );
+        // Because Present reset PTE bits and no CPU write happened after Present,
+        // ask7 itself saw 0 newly dirty pages!
+        assert!(
+            !seen7.iter().any(|&(_, at)| at == ask7),
+            "no pages should be newly dirty after Present reset without a new CPU write"
+        );
+        super::ask_once_end();
+
+        super::ADAPTIVE_WATCH_IN_TEST.set(None);
+        super::title_memory_freed(base, SIZE);
+        // SAFETY: reservation allocated above.
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn write_epoch_table_isolates_buckets_and_invalidates_on_wrote_and_landed() {
+        let bucket_a = 0x1000_0000_0000usize; // 64 MiB aligned
+        let bucket_b = bucket_a + (64 << 20); // adjacent 64 MiB bucket
+        let ep_a0 = super::range_write_epoch(bucket_a, bucket_a + 4096);
+        let ep_b0 = super::range_write_epoch(bucket_b, bucket_b + 4096);
+
+        super::wrote(bucket_a + 128, 256);
+        let ep_a1 = super::range_write_epoch(bucket_a, bucket_a + 4096);
+        let ep_b1 = super::range_write_epoch(bucket_b, bucket_b + 4096);
+        assert!(ep_a1 > ep_a0, "wrote() must bump touched bucket epoch");
+        assert_eq!(ep_b1, ep_b0, "wrote() must not dirty disjoint 64 MiB bucket");
+
+        // `note_landed_pages` takes 4 KiB page indices.
+        super::note_landed_pages(&[(bucket_b + 4096) / super::KERNEL_PAGE]);
+        let ep_a2 = super::range_write_epoch(bucket_a, bucket_a + 4096);
+        let ep_b2 = super::range_write_epoch(bucket_b, bucket_b + 4096);
+        assert_eq!(ep_a2, ep_a1, "note_landed_pages must not dirty disjoint bucket");
+        assert!(ep_b2 > ep_b1, "note_landed_pages must bump touched bucket epoch");
     }
 
     #[test]

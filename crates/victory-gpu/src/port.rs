@@ -169,6 +169,14 @@ static BOUNDS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// so overlapping shadowed copies and textures invalidate properly (`ARCH-06 #4`).
 static PLACED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 static PLACED_BOUNDS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// Monotonic epoch bumped whenever `PLACED` or `REGIONS` changes so hot callers
+/// (e.g. `CLEAN_SPANS`) can validate non-overlap in O(1) without locking `REGIONS`.
+static PORT_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+#[inline]
+pub(crate) fn epoch() -> u64 {
+    PORT_EPOCH.load(Ordering::Acquire)
+}
 
 fn placed_bounds(intervals: &[(u64, u64)]) {
     let lo = intervals.first().map_or(0, |r| r.0);
@@ -201,6 +209,7 @@ fn note_placed_interval(start: u64, len: u64) {
     }
     let _ = &mut pos;
     placed_bounds(&intervals);
+    PORT_EPOCH.fetch_add(1, Ordering::Release);
 }
 
 fn forget_placed_interval(at: u64, end: u64) {
@@ -223,6 +232,24 @@ fn forget_placed_interval(at: u64, end: u64) {
     }
     *intervals = next;
     placed_bounds(&intervals);
+    PORT_EPOCH.fetch_add(1, Ordering::Release);
+}
+
+/// Whether `[start, start + len)` overlaps any active cached `MEM_PRIVATE`
+/// (`OpenExistingHeapFromAddress1`) region in `port::REGIONS` (Spec-Trap #8).
+pub(crate) fn has_private_region_overlap(start: u64, len: u64) -> bool {
+    let Some(end) = start.checked_add(len).filter(|&e| e > start) else {
+        return false;
+    };
+    let r_hi = BOUNDS[1].load(Ordering::Relaxed);
+    if r_hi > start && BOUNDS[0].load(Ordering::Relaxed) < end {
+        return REGIONS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|r| r.private && r.end > start && r.start < end);
+    }
+    false
 }
 
 /// Whether `[start, start + len)` overlaps any active `port 1` in-place
@@ -289,8 +316,9 @@ fn placement_policy(
     }
     if window {
         if after_card_fallback {
-            // Shared-memory fallback window (BAR/VRAM declined): section-backed only
-            // below expand=3 so MEM_PRIVATE GPU-written pools stay tracked.
+            // Shared-memory fallback window (BAR/VRAM declined): section-backed
+            // below expand=3 so L0 fallbacks do not hammer VirtualQuery under
+            // REGIONS.lock() or pin working set on low-hit MEM_PRIVATE chunks.
             Some((true, expand >= 3))
         } else if expand >= 2 {
             Some((true, expand >= 3))
@@ -366,6 +394,9 @@ pub(crate) fn place_for_window(start: u64, len: u64, after_card_fallback: bool) 
         expand_mode(),
         expand_max_bytes(),
     )?;
+    // Spec-Trap #8: never open `OpenExistingHeapFromAddress1` on pages that
+    // overlap a GPU-only/Mode-2 tripwire-eligible card buffer or active tripwire.
+    let allow_private = allow_private && !crate::shadow::overlaps_gpu_only_or_tripwired(start, len);
     place_with(start, len, true, allow_section, allow_private)
 }
 
@@ -475,6 +506,7 @@ pub(crate) fn place_in_with(
                 STATS[1].fetch_add(region_bytes, Ordering::Relaxed);
             }
             bounds(&regions);
+            PORT_EPOCH.fetch_add(1, Ordering::Release);
             n
         }
     };
@@ -489,6 +521,7 @@ pub(crate) fn place_in_with(
         gpu,
         bias: start - at,
         pinned: 0,
+        private_guard: None,
     };
     drop(regions);
     note_placed_interval(start, len);
@@ -535,7 +568,7 @@ fn open_section_slice(
                 crate::inplace_sections::release_budget(&PINNED_BYTES, bytes);
                 return Err((3, "remapped concurrently while opening view heap".to_owned()));
             }
-            tracing::info!(
+            tracing::debug!(
                 start = format_args!("{first:#x}"),
                 bytes,
                 section = format_args!("{section:#x}"),
@@ -595,15 +628,21 @@ fn open_section_region(device: &ID3D12Device, at: u64, end: u64) -> Result<Regio
 /// Opens a cached `MEM_PRIVATE` committed sub-range covering `[at, end)` via
 /// `OpenExistingHeapFromAddress1`, expanding to a `PRIVATE_CHUNK` boundary when
 /// the full chunk is committed in the same `AllocationBase` and disjoint from
-/// existing cached regions.
+/// existing cached regions and GPU-only/tripwire-eligible buffers (Spec-Trap #8).
 fn open_private_region(device: &ID3D12Device, at: u64, end: u64, existing: &[Region]) -> Result<Region, (usize, String)> {
     let generation = crate::inplace_sections::mapping_generation();
     let Some((chunk_start, chunk_len)) = crate::inplace_sections::private_chunk_bounds(at as usize, end as usize, PRIVATE_CHUNK) else {
         return Err((4, "private memory is not committed read-write within one allocation".to_owned()));
     };
     let (mut first, mut bytes) = (chunk_start as u64, chunk_len as u64);
-    if (first < at || first + bytes > end) && existing.iter().any(|r| r.end > first && r.start < first + bytes) {
+    if (first < at || first + bytes > end)
+        && (existing.iter().any(|r| r.end > first && r.start < first + bytes)
+            || crate::shadow::overlaps_gpu_only_or_tripwired(first, bytes))
+    {
         (first, bytes) = (at, end - at);
+    }
+    if crate::shadow::overlaps_gpu_only_or_tripwired(first, bytes) {
+        return Err((5, "private range overlaps GPU-only/tripwire-eligible buffer".to_owned()));
     }
     if bytes > MOST {
         return Err((3, format!("{bytes:#x} bytes, over the most of a region")));
@@ -623,7 +662,7 @@ fn open_private_region(device: &ID3D12Device, at: u64, end: u64, existing: &[Reg
                 crate::inplace_sections::release_budget(&PINNED_BYTES, bytes);
                 return Err((3, "remapped concurrently while opening private heap".to_owned()));
             }
-            tracing::info!(
+            tracing::debug!(
                 start = format_args!("{first:#x}"),
                 bytes,
                 "renderer port 1: a committed private region opened as a cached host heap"
@@ -693,6 +732,9 @@ pub(crate) fn forget(at: usize, len: usize) {
         }
         STATS[7].fetch_add(dropped.len() as u64, Ordering::Relaxed);
         bounds(&regions);
+        if !dropped.is_empty() {
+            PORT_EPOCH.fetch_add(1, Ordering::Release);
+        }
     }
     if released_bytes > 0 {
         crate::inplace_sections::release_budget(&PINNED_BYTES, released_bytes);
@@ -885,10 +927,11 @@ mod tests {
         assert_eq!(placement_policy(high_addr, 1 << 20, true, false, true, true, 1, cap), Some((true, false)));
 
         // Mode 2 (sections): adds 64-bit section-stretch buffers <= cap (e.g. 11-24 MiB Pool A)
-        // and pre-BAR section windows (still no MEM_PRIVATE), keeping > cap GPU-hot heaps in VRAM.
+        // and section windows (no MEM_PRIVATE below expand=3), keeping > cap GPU-hot heaps in VRAM.
         assert_eq!(placement_policy(high_addr, 24 << 20, false, true, false, true, 2, cap), Some((true, false)));
         assert_eq!(placement_policy(high_addr, 50 << 20, false, true, false, true, 2, cap), None);
         assert_eq!(placement_policy(high_addr, 1 << 20, true, false, false, true, 2, cap), Some((true, false)));
+        assert_eq!(placement_policy(high_addr, 1 << 20, true, false, true, true, 2, cap), Some((true, false)));
 
         // Mode 3 (all): places all 64-bit buffers (section + private) regardless of size cap.
         assert_eq!(placement_policy(high_addr, 90 << 20, false, true, false, true, 3, cap), Some((true, true)));

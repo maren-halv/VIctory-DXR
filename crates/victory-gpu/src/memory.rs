@@ -78,11 +78,18 @@ use crate::shadow::Shadow;
 
 /// A directory page.
 const PAGE: u64 = 1 << 16;
-/// An arena's bytes for builder (`Use::Builds`) workloads (64 MiB).
-const ARENA: u64 = 64 << 20;
+/// An arena's bytes for builder (`Use::Builds`) workloads (16 MiB = 256 × 64 KiB pages).
+const ARENA: u64 = 16 << 20;
+/// Number of 64 KiB pages per builder arena (`256`).
+const ARENA_PAGES: usize = (ARENA / PAGE) as usize;
 /// Initial arena size for read-only (`Use::Reads`) workloads (4 MiB = 64 pages),
-/// saving 60 MiB of Local VRAM + CPU RAM in RT-Off when only a few pages are touched.
+/// saving Local VRAM + CPU RAM in RT-Off when only a few pages are touched.
 const READ_ARENA: u64 = 4 << 20;
+/// Upper arena (`idx >= 1`) occupancy threshold (%) below which live pages are
+/// incrementally compacted into lower arenas so the upper arena can be reclaimed.
+const COMPACT_MAX_OCCUPANCY_PCT: usize = 35;
+/// Minimum frames between incremental upper-arena compaction sweeps in `ready()`.
+const COMPACT_INTERVAL_FRAMES: u64 = 60;
 /// Shared null UAV buffer size replacing retired empty arena slots in `copies`.
 const NULL_COPY_BYTES: u64 = 4096;
 /// Frames before unowned, unpinned arena pages are swept when DXR ephemeral release is active.
@@ -97,8 +104,8 @@ const WINDOWS: usize = 512;
 const PACKED: u64 = 64 << 20;
 /// For so many frames what a page holds may still be on its way.
 const YOUNG: u64 = 4;
-/// Free pages there are, at least, when a list is recorded.
-const SPARE: usize = 1024;
+/// Free pages there are, at least, when a list is recorded (1 full 16 MiB arena).
+const SPARE: usize = ARENA_PAGES;
 /// A packed structure not named for so many frames is another one.
 const AGAIN: u64 = 8;
 /// From a root view; from one that is written (a structure being built).
@@ -141,7 +148,7 @@ struct Held {
     pinned: u32,
 }
 
-/// One backing arena (`4 MiB` for `Use::Reads`, `64 MiB` for `Use::Builds`).
+/// One backing arena (`4 MiB` for `Use::Reads`, `16 MiB` for `Use::Builds`).
 struct ArenaInfo {
     /// Index in `Memory::copies`.
     copy: usize,
@@ -213,8 +220,10 @@ struct Memory {
     draining_arenas: Vec<(Arc<Shadow>, usize, u64)>,
     /// Total free pages across all non-retired arenas.
     free_pages: usize,
-    /// Whether any `Use::Builds` dispatch has been seen (switches new arenas from 4 MiB to 64 MiB).
+    /// Whether any `Use::Builds` dispatch has been seen (switches new arenas from 4 MiB to 16 MiB).
     saw_builds: bool,
+    /// Last frame on which incremental upper-arena compaction ran.
+    last_compact_frame: u64,
     /// By title page.
     pages: HashMap<u64, Held>,
     /// Their numbers in the order they came, and where the sweep is.
@@ -305,6 +314,7 @@ impl Memory {
             draining_arenas: Vec::new(),
             free_pages: 0,
             saw_builds: false,
+            last_compact_frame: 0,
             pages: HashMap::new(),
             order: Vec::new(),
             sweep: 0,
@@ -605,7 +615,171 @@ impl Memory {
         }
     }
 
-    /// Another arena's pages (`READ_ARENA` = 4 MiB for read-only workloads, `ARENA` = 64 MiB for builds).
+    /// Incrementally compacts sparse upper arenas (`idx >= 1`, occupancy `< 35%`) into
+    /// free slots in strictly lower active arenas (`0..idx`) when no page in the upper
+    /// arena is pinned and lower arenas can absorb every live page.
+    ///
+    /// Copies exact 64 KiB page contents in both CPU backing (`upload::reserve` + `resend`)
+    /// and GPU backing (via `CopyBufferRegion` on `list` when provided), atomically updates
+    /// directory entries, and calls [`Self::reclaim_empty_arenas`] so emptied upper arenas
+    /// are retired to the shared 4 KiB null UAV and freed via `host::retire_vram`.
+    fn compact_sparse_arenas(&mut self, list: Option<&HostList>) -> usize {
+        if self.arenas.len() < 2 {
+            return 0;
+        }
+        let mut total_moved = 0usize;
+        let mut emptied_any = false;
+        for idx in (1..self.arenas.len()).rev() {
+            let (src_copy, src_base, src_size, live_pages, retired) = {
+                let a = &self.arenas[idx];
+                (a.copy, a.base, a.size, a.live_pages, a.retired)
+            };
+            if retired || live_pages == 0 {
+                continue;
+            }
+            let cap = (src_size / PAGE) as usize;
+            if cap == 0 || live_pages.saturating_mul(100) >= cap.saturating_mul(COMPACT_MAX_OCCUPANCY_PCT) {
+                continue;
+            }
+            let lower_free: usize = self.arenas[..idx]
+                .iter()
+                .filter(|a| !a.retired)
+                .map(|a| a.free.len())
+                .sum();
+            if lower_free < live_pages {
+                continue;
+            }
+            let mut pages_to_move: Vec<u64> = Vec::with_capacity(live_pages);
+            let mut has_pinned = false;
+            for (&page, held) in &self.pages {
+                if held.copy == src_copy {
+                    if held.pinned > 0 {
+                        has_pinned = true;
+                        break;
+                    }
+                    pages_to_move.push(page);
+                }
+            }
+            if has_pinned || pages_to_move.is_empty() || pages_to_move.len() > lower_free {
+                continue;
+            }
+            // Move every live page from arena `idx` into strictly lower active arenas `0..idx`.
+            let mut gpu_copies: Vec<(u64, usize, u64)> = Vec::with_capacity(pages_to_move.len());
+            let mut dst_copies_touched: Vec<usize> = Vec::new();
+            for page in pages_to_move {
+                let Some((dst_copy, dst_at, dst_base)) = self.pop_free_page_below(idx) else {
+                    break;
+                };
+                let Some(held) = self.pages.get_mut(&page) else {
+                    // Should not happen; return popped slot.
+                    if let Some(a) = self.arenas[..idx].iter_mut().find(|a| a.copy == dst_copy) {
+                        a.live_pages = a.live_pages.saturating_sub(1);
+                        a.free.push(dst_at);
+                        self.free_pages += 1;
+                    }
+                    continue;
+                };
+                let src_at = held.at;
+                let src_off = (src_at - src_base) as u64;
+                let dst_off = (dst_at - dst_base) as u64;
+                // SAFETY: both `src_at` and `dst_at` are valid, disjoint 64 KiB arena pages
+                // owned by `Memory` under the `MEMORY` mutex.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(src_at as *const u8, dst_at as *mut u8, PAGE as usize);
+                }
+                crate::watch::wrote(dst_at, PAGE as usize);
+                self.copies[dst_copy].resend(dst_off as usize, dst_off as usize + PAGE as usize);
+                held.copy = dst_copy;
+                held.at = dst_at;
+                self.arenas[idx].live_pages = self.arenas[idx].live_pages.saturating_sub(1);
+                self.arenas[idx].free.push(src_at);
+                self.free_pages += 1;
+                // Atomically update directory entry (offset first, then copy number) so shaders
+                // see the relocated page consistently.
+                let dir_off = dst_at as u64 - self.copies[dst_copy].span().0;
+                let entry = self.entry(page);
+                fill(entry, dst_copy, dir_off);
+                crate::watch::wrote(entry as usize, 8);
+                gpu_copies.push((src_off, dst_copy, dst_off));
+                if !dst_copies_touched.contains(&dst_copy) {
+                    dst_copies_touched.push(dst_copy);
+                }
+                total_moved += 1;
+            }
+            if let Some(list) = list
+                && !gpu_copies.is_empty()
+            {
+                let src_shadow = self.copies[src_copy].clone();
+                let mut pre_barriers = Vec::with_capacity(1 + dst_copies_touched.len());
+                let mut post_barriers = Vec::with_capacity(1 + dst_copies_touched.len());
+                pre_barriers.push(arena_transition(
+                    &src_shadow.buffer,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                ));
+                post_barriers.push(arena_transition(
+                    &src_shadow.buffer,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_COMMON,
+                ));
+                list.keep_shadow(src_shadow.clone());
+                for &dc in &dst_copies_touched {
+                    let dst_shadow = self.copies[dc].clone();
+                    pre_barriers.push(arena_transition(
+                        &dst_shadow.buffer,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    ));
+                    post_barriers.push(arena_transition(
+                        &dst_shadow.buffer,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_COMMON,
+                    ));
+                    list.keep_shadow(dst_shadow);
+                }
+                // SAFETY: open command list; src and dst are strictly disjoint arenas kept alive
+                // on `list` and start/end in `COMMON`.
+                unsafe {
+                    list.list.ResourceBarrier(&pre_barriers);
+                    for &(src_off, dc, dst_off) in &gpu_copies {
+                        list.list.CopyBufferRegion(
+                            &self.copies[dc].buffer,
+                            dst_off,
+                            &src_shadow.buffer,
+                            src_off,
+                            PAGE,
+                        );
+                    }
+                    list.list.ResourceBarrier(&post_barriers);
+                }
+            }
+            if self.arenas[idx].live_pages == 0 {
+                emptied_any = true;
+            }
+        }
+        if emptied_any {
+            self.reclaim_empty_arenas(0);
+        } else {
+            self.drain_retired_arenas();
+        }
+        total_moved
+    }
+
+    /// Pops a free page from the lowest-indexed non-retired arena strictly below `upper_idx`.
+    fn pop_free_page_below(&mut self, upper_idx: usize) -> Option<(usize, usize, usize)> {
+        for arena in &mut self.arenas[..upper_idx] {
+            if !arena.retired
+                && let Some(at) = arena.free.pop()
+            {
+                arena.live_pages += 1;
+                self.free_pages = self.free_pages.saturating_sub(1);
+                return Some((arena.copy, at, arena.base));
+            }
+        }
+        None
+    }
+
+    /// Another arena's pages (`READ_ARENA` = 4 MiB for read-only workloads, `ARENA` = 16 MiB for builds).
     fn another(&mut self, bytes: u64) -> bool {
         let Some(at) = crate::upload::reserve(bytes as usize) else {
             return false;
@@ -1181,6 +1355,13 @@ pub(crate) fn ready(
         m.refused.clear();
         m.take_faults();
         m.look_again();
+        if m.frame.saturating_sub(m.last_compact_frame) >= COMPACT_INTERVAL_FRAMES {
+            m.last_compact_frame = frame;
+            if m.compact_sparse_arenas(Some(list)) > 0 {
+                let (d_start, d_len) = m.directory.1.span();
+                m.directory.1.refresh(list, d_start, d_len);
+            }
+        }
         m.report();
         #[cfg(feature = "diagnostics")]
         m.trace.look(frame);
@@ -1325,9 +1506,40 @@ pub(crate) fn ready(
 }
 
 /// Returns the next arena byte size: `4 MiB` for `Use::Reads`-only workloads (RT-Off),
-/// `64 MiB` once `Use::Builds` has been seen (`ARCH-10`).
+/// `16 MiB` (`256` × 64 KiB pages) once `Use::Builds` has been seen (`R2-F`).
 fn next_arena_bytes(saw_builds: bool) -> u64 {
     if saw_builds { ARENA } else { READ_ARENA }
+}
+
+/// Builds a resource transition barrier for arena buffer copies.
+fn arena_transition(
+    buffer: &ID3D12Resource,
+    before: D3D12_RESOURCE_STATES,
+    after: D3D12_RESOURCE_STATES,
+) -> D3D12_RESOURCE_BARRIER {
+    D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                // SAFETY: non-owning copy valid for the duration of the `ResourceBarrier` call.
+                pResource: unsafe { std::mem::transmute_copy(buffer) },
+                Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                StateBefore: before,
+                StateAfter: after,
+            }),
+        },
+    }
+}
+
+/// Runs incremental upper-arena compaction on idle/sweep ticks (CPU-backed / unpinned pages).
+#[allow(dead_code)]
+pub(crate) fn compact_idle() -> usize {
+    let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(m) = guard.as_mut() else {
+        return 0;
+    };
+    m.compact_sparse_arenas(None)
 }
 
 /// Pure gate for ephemeral BVH4 rehydration arena reclamation: ONLY permitted when
@@ -1627,9 +1839,12 @@ mod tests {
 
     #[test]
     fn ephemeral_release_gate_and_initial_read_arena_size() {
-        // Initial arena for Use::Reads is 4 MiB (saving 60 MiB in RT-Off); Use::Builds is 64 MiB.
+        // Initial arena for Use::Reads is 4 MiB; Use::Builds is 16 MiB (256 × 64 KiB pages).
+        assert_eq!(ARENA, 16 << 20);
+        assert_eq!(ARENA_PAGES, 256);
+        assert_eq!(SPARE, 256);
         assert_eq!(next_arena_bytes(false), 4 << 20);
-        assert_eq!(next_arena_bytes(true), 64 << 20);
+        assert_eq!(next_arena_bytes(true), 16 << 20);
 
         // Strictly allowed ONLY when VICTORY_NATIVE_RT=1, suppress_builder=1, VICTORY_BVH_BUILDER=0.
         assert!(ephemeral_release_gate(true, true, false));
@@ -1637,6 +1852,76 @@ mod tests {
         assert!(!ephemeral_release_gate(true, false, false));
         assert!(!ephemeral_release_gate(false, true, false));
         assert!(!ephemeral_release_gate(false, false, true));
+    }
+
+    #[test]
+    fn compact_sparse_arenas_preserves_page_contents_and_reclaims_upper_arena() {
+        let Some(mut m) = Memory::new() else {
+            return;
+        };
+        m.saw_builds = true;
+        // Allocate two 16 MiB builder arenas (256 pages each) and verify exact sizing.
+        assert!(m.another(ARENA));
+        assert!(m.another(ARENA));
+        assert_eq!(m.arenas.len(), 2);
+        assert_eq!(m.arenas[0].size, 16 << 20);
+        assert_eq!(m.arenas[0].free.len(), 256);
+        assert_eq!(m.arenas[1].size, 16 << 20);
+        assert_eq!(m.arenas[1].free.len(), 256);
+
+        // Place 2 pages in arena 0 and 3 pages in arena 1 (occupancy 3/256 = 1.17% < 35%).
+        let copy0 = m.arenas[0].copy;
+        for i in 0..2u64 {
+            let at = m.arenas[0].free.pop().unwrap();
+            m.arenas[0].live_pages += 1;
+            m.free_pages -= 1;
+            m.hold(0x3_0000 + i, at, copy0);
+        }
+
+        let copy1 = m.arenas[1].copy;
+        let moved_pages = [0x3_0100u64, 0x3_0101, 0x3_0102];
+        for (idx, &p) in moved_pages.iter().enumerate() {
+            let at = m.arenas[1].free.pop().unwrap();
+            m.arenas[1].live_pages += 1;
+            m.free_pages -= 1;
+            m.hold(p, at, copy1);
+            // Write distinct deterministic pattern across the full 64 KiB page.
+            let slice = unsafe { std::slice::from_raw_parts_mut(at as *mut u8, PAGE as usize) };
+            for (b_idx, byte) in slice.iter_mut().enumerate() {
+                *byte = ((idx as u8).wrapping_mul(53)) ^ ((b_idx as u8).wrapping_add(17));
+            }
+        }
+
+        // Pin one page in arena 1 -> compaction must skip arena 1 while any page is pinned.
+        m.pages.get_mut(&moved_pages[0]).unwrap().pinned = 1;
+        assert_eq!(m.compact_sparse_arenas(None), 0);
+        assert!(!m.arenas[1].retired);
+        assert_eq!(m.arenas[1].live_pages, 3);
+
+        // Unpin -> compaction moves all 3 pages into arena 0, preserves exact 64 KiB contents,
+        // updates directory entries cleanly, and retires upper arena 1 to the 4 KiB null copy.
+        m.pages.get_mut(&moved_pages[0]).unwrap().pinned = 0;
+        assert_eq!(m.compact_sparse_arenas(None), 3);
+        assert_eq!(m.arenas[0].live_pages, 5);
+        assert_eq!(m.arenas[1].live_pages, 0);
+        assert!(m.arenas[1].retired);
+        assert!(m.retired_copies.contains(&copy1));
+        assert_eq!(m.copies[copy1].span().1, NULL_COPY_BYTES);
+
+        for (idx, &p) in moved_pages.iter().enumerate() {
+            let held = m.pages.get(&p).expect("moved page stays tracked");
+            assert_eq!(held.copy, copy0);
+            let dir_copy = unsafe { m.entry(p).read() };
+            let dir_off = unsafe { m.entry(p).add(1).read() };
+            assert_eq!(dir_copy, copy0 as u32 + 1);
+            assert_eq!(u64::from(dir_off), held.at as u64 - m.copies[copy0].span().0);
+
+            let slice = unsafe { std::slice::from_raw_parts(held.at as *const u8, PAGE as usize) };
+            for (b_idx, &byte) in slice.iter().enumerate() {
+                let expected = ((idx as u8).wrapping_mul(53)) ^ ((b_idx as u8).wrapping_add(17));
+                assert_eq!(byte, expected, "page {p:#x} byte {b_idx} corrupted across compaction");
+            }
+        }
     }
 
     #[test]

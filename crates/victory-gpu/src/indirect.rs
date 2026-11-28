@@ -1661,7 +1661,19 @@ pub(crate) fn translate_signature(
 /// When two ranges overlap (e.g. a sub-buffer inside a larger buffer), the
 /// smaller (innermost) range takes precedence and the outer range is split
 /// around it so GPU binary search is exact in O(log N).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn build_rebase_table(ranges: &[(u64, u64, u64, bool)]) -> Vec<[u32; 8]> {
+    let mut out = Vec::new();
+    build_rebase_table_into(ranges, &mut out);
+    out
+}
+
+/// Scratch-reusing variant of [`build_rebase_table`] that clears and populates
+/// `out` in place without allocating a fresh output `Vec` on each indirect call.
+pub(crate) fn build_rebase_table_into(
+    ranges: &[(u64, u64, u64, bool)],
+    out: &mut Vec<[u32; 8]>,
+) {
     #[derive(Clone, Copy)]
     struct Span {
         start: u64,
@@ -1669,6 +1681,7 @@ pub(crate) fn build_rebase_table(ranges: &[(u64, u64, u64, bool)]) -> Vec<[u32; 
         host: u64,
         writable: bool,
     }
+    out.clear();
     let mut valid: Vec<Span> = ranges
         .iter()
         .filter_map(|&(start, len, host, writable)| {
@@ -1681,7 +1694,7 @@ pub(crate) fn build_rebase_table(ranges: &[(u64, u64, u64, bool)]) -> Vec<[u32; 
         })
         .collect();
     if valid.is_empty() {
-        return Vec::new();
+        return;
     }
     // Sort largest first, then split/overlay smaller (innermost) spans on top
     // so narrower buffers win on overlapping regions.
@@ -1728,21 +1741,19 @@ pub(crate) fn build_rebase_table(ranges: &[(u64, u64, u64, bool)]) -> Vec<[u32; 
         pieces.sort_unstable_by_key(|s| s.start);
         pieces
     };
-    resolved
-        .into_iter()
-        .map(|s| {
-            [
-                s.start as u32,
-                (s.start >> 32) as u32,
-                s.end as u32,
-                (s.end >> 32) as u32,
-                s.host as u32,
-                (s.host >> 32) as u32,
-                u32::from(s.writable),
-                0,
-            ]
-        })
-        .collect()
+    out.reserve(resolved.len());
+    out.extend(resolved.into_iter().map(|s| {
+        [
+            s.start as u32,
+            (s.start >> 32) as u32,
+            s.end as u32,
+            (s.end >> 32) as u32,
+            s.host as u32,
+            (s.host >> 32) as u32,
+            u32::from(s.writable),
+            0,
+        ]
+    }));
 }
 
 const REPACK_SOURCE: &str = r#"
@@ -6933,5 +6944,30 @@ mod clamp_barrier_tests {
             assert_eq!(buf2[0], 0, "table[0] stays unflushed until drop/finish");
         }
         assert_eq!(buf2[0], 1, "Drop for Table flushes final batch count once");
+    }
+
+    #[test]
+    fn build_rebase_table_into_reuses_scratch_and_matches_allocating_table() {
+        use super::{build_rebase_table, build_rebase_table_into};
+        let ranges1 = [
+            (0x1000_0000u64, 0x4000u64, 0x8000_0000u64, false),
+            (0x1000_1000u64, 0x1000u64, 0x9000_0000u64, true),
+            (0x2000_0000u64, 0x2000u64, 0xA000_0000u64, true),
+        ];
+        let ranges2 = [
+            (0x3000_0000u64, 0x1000u64, 0xB000_0000u64, false),
+        ];
+        let mut scratch = Vec::with_capacity(8);
+        let ptr_before = scratch.as_ptr();
+        build_rebase_table_into(&ranges1, &mut scratch);
+        assert_eq!(scratch, build_rebase_table(&ranges1));
+        assert_eq!(scratch.len(), 4);
+        assert_eq!(scratch.as_ptr(), ptr_before, "scratch Vec must reuse capacity without realloc");
+        build_rebase_table_into(&ranges2, &mut scratch);
+        assert_eq!(scratch, build_rebase_table(&ranges2));
+        assert_eq!(scratch.len(), 1);
+        assert_eq!(scratch.as_ptr(), ptr_before, "subsequent calls must reuse scratch allocation");
+        build_rebase_table_into(&[], &mut scratch);
+        assert!(scratch.is_empty());
     }
 }

@@ -178,6 +178,97 @@ pub(crate) fn adopted(start: u64) -> bool {
     ADOPTED.read().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|a| a.start == start)
 }
 
+/// Marks every touched slot in `[dst, dst + len)` of the marked descriptor heap
+/// in bulk (word-granular `AtomicU64` writes on `MARKS.slots` followed by
+/// `MARKS.chunks`, preserving x86-64 TSO / `Release` ordering with [`take`]).
+/// Returns the number of slots marked (`0` if outside the marked heap or empty).
+#[inline]
+pub fn mark_range(dst: u64, len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let heap_len = MARKS.len.load(Acquire);
+    if heap_len == 0 {
+        return 0;
+    }
+    let start = MARKS.start.load(Relaxed);
+    let end = dst.saturating_add(len as u64);
+    // Fast-path unsigned range check avoids work on non-heap copies.
+    if dst.wrapping_sub(start) >= heap_len && !(dst < start && end > start) {
+        return 0;
+    }
+    let lo = dst.max(start);
+    let hi = end.min(start.saturating_add(heap_len));
+    if lo >= hi {
+        return 0;
+    }
+    let first_slot = ((lo - start) / 32) as usize;
+    let last_slot = ((hi - 1 - start) / 32) as usize;
+    let first_chunk = first_slot / CHUNK;
+    let last_chunk = last_slot / CHUNK;
+    // SAFETY: `MARKS.slots` and `MARKS.chunks` point to leaked 8-byte-aligned
+    // `[AtomicU64]` arrays covering at least `MARKS.len / 32` slots and their
+    // chunks; `slots` are always marked before `chunks` so concurrent `take()`
+    // never misses a newly marked slot.
+    unsafe {
+        let slots_base = MARKS.slots.load(Relaxed).cast::<AtomicU64>();
+        let chunks_base = MARKS.chunks.load(Relaxed).cast::<AtomicU64>();
+        mark_u64_range(slots_base, first_slot, last_slot);
+        mark_u64_range(chunks_base, first_chunk, last_chunk);
+    }
+    last_slot - first_slot + 1
+}
+
+/// Bulk-marks byte lanes `first..=last` (inclusive) to `1` in an 8-byte-aligned
+/// `[AtomicU64]` mark array without clobbering sibling bytes during concurrent
+/// `AtomicU64::swap(0, AcqRel)` in [`take`].
+///
+/// # Safety
+/// `base` must point to a valid `[AtomicU64]` slice covering word `last >> 3`.
+#[inline]
+unsafe fn mark_u64_range(base: *const AtomicU64, first: usize, last: usize) {
+    const ALL_ONES: u64 = 0x0101_0101_0101_0101;
+    let w_first = first >> 3;
+    let w_last = last >> 3;
+    let lane_first = first & 7;
+    let lane_last = last & 7;
+    if w_first == w_last {
+        let mut mask = 0u64;
+        for b in lane_first..=lane_last {
+            mask |= 1u64 << (b * 8);
+        }
+        // SAFETY: caller guarantees `w_first` is in bounds.
+        unsafe { (*base.add(w_first)).fetch_or(mask, Release) };
+        return;
+    }
+    let mut w = w_first;
+    if lane_first != 0 {
+        let mut mask = 0u64;
+        for b in lane_first..8 {
+            mask |= 1u64 << (b * 8);
+        }
+        // SAFETY: `w` is in bounds.
+        unsafe { (*base.add(w)).fetch_or(mask, Release) };
+        w += 1;
+    }
+    let full_end = if lane_last == 7 { w_last + 1 } else { w_last };
+    while w < full_end {
+        // Setting all 8 byte lanes to `1` can never clear a concurrent mark in
+        // any sibling lane and matches `memset(1)` throughput at 8 slots/store.
+        // SAFETY: `w` is in bounds.
+        unsafe { (*base.add(w)).store(ALL_ONES, Release) };
+        w += 1;
+    }
+    if lane_last != 7 {
+        let mut mask = 0u64;
+        for b in 0..=lane_last {
+            mask |= 1u64 << (b * 8);
+        }
+        // SAFETY: `w_last` is in bounds.
+        unsafe { (*base.add(w_last)).fetch_or(mask, Release) };
+    }
+}
+
 /// Marks the slot at `handle` (a record our own calls wrote), if it is in the
 /// marked heap.
 #[inline]
@@ -274,11 +365,29 @@ pub(crate) fn faulted(at: usize, rip: usize) {
     }
 }
 
-/// Frames between askings of the write watch for the fallback
-/// (`VICTORY_PORT_DESCRIPTORS_EVERY=<frames>`, 8 if not given).
-fn check_every() -> u64 {
-    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *N.get_or_init(|| std::env::var("VICTORY_PORT_DESCRIPTORS_EVERY").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8u64).max(1))
+/// Maximum adaptive fallback cadence (frames between write-watch checks) when
+/// zero missed descriptor writes are observed.
+const MAX_ADAPTIVE_EVERY: u64 = 32;
+
+/// Explicit fixed fallback cadence override (`VICTORY_PORT_DESCRIPTORS_EVERY=<frames>`),
+/// or `None` when adaptive throttling (`1 -> 2 -> 4 -> 8 -> 16 -> 32`) is active.
+fn check_every_override() -> Option<u64> {
+    static N: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_PORT_DESCRIPTORS_EVERY")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|n| n.max(1))
+    })
+}
+
+/// Current adaptive fallback cadence (1..=32 frames), immediately reset to `1`
+/// whenever [`missed`] detects any unmarked view record.
+static ADAPTIVE_EVERY: AtomicU64 = AtomicU64::new(1);
+
+/// Effective frames between write-watch fallback checks (`check_every`).
+pub(crate) fn current_check_every() -> u64 {
+    check_every_override().unwrap_or_else(|| ADAPTIVE_EVERY.load(Acquire).clamp(1, MAX_ADAPTIVE_EVERY))
 }
 
 /// Pages the fallback looks at a frame (`VICTORY_PORT_DESCRIPTORS_CHECK=<pages>`,
@@ -289,22 +398,46 @@ fn check_budget() -> usize {
 }
 
 /// The fallback's pages: those the watch said were written, not looked at yet;
-/// the frame it last asked in, and the frame it last looked in.
+/// the frame it last asked in, the frame it last looked in, and the cumulative
+/// `MISSED_ALL` count snapshot at the previous ask (for adaptive throttling).
 struct Fallback {
     pages: std::collections::BTreeSet<usize>,
     asked: u64,
     looked: u64,
     /// The page it goes on from (round the heap).
     next: usize,
+    last_missed_all: u64,
 }
 
-static FALLBACK: std::sync::Mutex<Fallback> = std::sync::Mutex::new(Fallback { pages: std::collections::BTreeSet::new(), asked: 0, looked: 0, next: 0 });
+static FALLBACK: std::sync::Mutex<Fallback> = std::sync::Mutex::new(Fallback {
+    pages: std::collections::BTreeSet::new(),
+    asked: 0,
+    looked: 0,
+    next: 0,
+    last_missed_all: 0,
+});
 
 /// Whether to ask the write watch of the marked heap this frame.
+/// Adaptively throttles from `1` up to [`MAX_ADAPTIVE_EVERY`] (`32`) frames
+/// while zero missed view writes are observed, immediately resetting to `1`
+/// if any missed write is detected.
 pub(crate) fn ask_due(frame: u64) -> bool {
     let mut f = FALLBACK.lock().unwrap_or_else(|e| e.into_inner());
-    if check_budget() == 0 || f.asked != 0 && frame < f.asked + check_every() {
+    let every = current_check_every();
+    if check_budget() == 0 || (f.asked != 0 && frame < f.asked + every) {
         return false;
+    }
+    if check_every_override().is_none() {
+        let cur_missed = MISSED_ALL.load(Acquire);
+        if cur_missed > f.last_missed_all {
+            ADAPTIVE_EVERY.store(1, Release);
+            f.last_missed_all = cur_missed;
+        } else if f.asked != 0 && (f.looked >= f.asked || f.pages.is_empty()) {
+            let next = (every.saturating_mul(2)).min(MAX_ADAPTIVE_EVERY);
+            ADAPTIVE_EVERY.store(next, Release);
+        } else if f.asked == 0 {
+            f.last_missed_all = cur_missed;
+        }
     }
     f.asked = frame.max(1);
     true
@@ -377,7 +510,9 @@ pub(crate) fn missed(index: u32, handle: u64, view: bool, tabled: bool) {
         return;
     }
     CHECKED[1].fetch_add(1, Relaxed);
-    let n = MISSED_ALL.fetch_add(1, Relaxed);
+    let n = MISSED_ALL.fetch_add(1, AcqRel);
+    // Any missed view record immediately resets adaptive fallback cadence to 1 frame.
+    ADAPTIVE_EVERY.store(1, Release);
     #[cfg(feature = "diagnostics")]
     {
         let rip = a.writers.get(((handle - a.start) >> 16) as usize).map_or(0, |w| w.load(Relaxed));
@@ -406,14 +541,14 @@ pub(crate) fn missed(index: u32, handle: u64, view: bool, tabled: bool) {
     let _ = (handle, n);
 }
 
-/// The runtime's own `memcpy` and `memmove` ([`import`]).
-static REAL: [AtomicUsize; 2] = [const { AtomicUsize::new(0) }; 2];
+/// The runtime's own `memcpy`, `memmove`, and `memset` ([`import`]).
+static REAL: [AtomicUsize; 3] = [const { AtomicUsize::new(0) }; 3];
 
-/// Since the last line: the title's copies into the marked heap, records they marked.
+/// Since the last line: the title's copies/fills into the marked heap, slots they marked.
 static COPIES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
-/// Whether `memcpy`/`memmove` imports are hooked with a fast range filter
-/// (`dst.wrapping_sub(start) < len`) to mark copied view records
+/// Whether `memcpy`/`memmove`/`memset` imports are hooked with a fast range filter
+/// (`dst.wrapping_sub(start) < len`) to bulk-mark touched slots via [`mark_range`]
 /// (`VICTORY_PORT_DESCRIPTORS_MEMCPY=0` disables; default ON).
 fn hook_memcpy() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -424,11 +559,12 @@ fn hook_memcpy() -> bool {
 
 /// What the title's import of `name` (bound to `address`) is bound to: with
 /// `VICTORY_PORT_DESCRIPTORS=1` (and unless `VICTORY_PORT_DESCRIPTORS_MEMCPY=0`),
-/// its `memcpy` and `memmove` mark the view records they copy into the heap.
+/// its `memcpy`, `memmove`, and `memset` bulk-mark touched descriptor-heap slots.
 pub fn import(name: &str, address: usize) -> usize {
     let (which, ours) = match name {
         "memcpy" => (0, copy as *const () as usize),
         "memmove" => (1, shift as *const () as usize),
+        "memset" => (2, fill as *const () as usize),
         _ => return address,
     };
     if !on() || !hook_memcpy() {
@@ -439,6 +575,7 @@ pub fn import(name: &str, address: usize) -> usize {
 }
 
 type Copy = unsafe extern "system-unwind" fn(*mut u8, *const u8, usize) -> *mut u8;
+type Fill = unsafe extern "system-unwind" fn(*mut u8, i32, usize) -> *mut u8;
 
 unsafe extern "system-unwind" fn copy(to: *mut u8, from: *const u8, n: usize) -> *mut u8 {
     // SAFETY: the title's copy, by the function it asked for.
@@ -450,6 +587,11 @@ unsafe extern "system-unwind" fn shift(to: *mut u8, from: *const u8, n: usize) -
     unsafe { copied(to, from, n, REAL[1].load(Relaxed)) }
 }
 
+unsafe extern "system-unwind" fn fill(to: *mut u8, val: i32, n: usize) -> *mut u8 {
+    // SAFETY: the title's memset, by the function it asked for.
+    unsafe { filled(to, val, n, REAL[2].load(Relaxed)) }
+}
+
 /// # Safety
 /// `real` copies as `memcpy` does; the rest are the title's.
 #[inline]
@@ -458,33 +600,26 @@ unsafe fn copied(to: *mut u8, from: *const u8, n: usize, real: usize) -> *mut u8
     let real: Copy = unsafe { std::mem::transmute(real) };
     // SAFETY: by the caller.
     let out = unsafe { real(to, from, n) };
-    let len = MARKS.len.load(Acquire);
-    if len != 0 && n >= 4 {
-        let start = MARKS.start.load(Relaxed);
-        let dst = to as u64;
-        // Fast-path unsigned range check avoids overhead on non-heap copies.
-        if dst.wrapping_sub(start) < len
-            || (dst < start && dst.saturating_add(n as u64) > start)
-        {
-            let lo = dst.max(start);
-            let hi = dst.saturating_add(n as u64).min(start + len);
-            if lo < hi {
-                COPIES[0].fetch_add(1, Relaxed);
-                // Each slot whose first word now lies in the copy and is a view's.
-                let mut slot = (lo - start).div_ceil(32);
-                let mut marked = 0;
-                while start + slot * 32 + 4 <= hi {
-                    let at = start + slot * 32;
-                    // SAFETY: just written by the copy, inside the heap.
-                    if unsafe { (at as *const u32).read_unaligned() } == crate::descriptor::VIEW_TAG {
-                        mark_slot(slot as usize);
-                        marked += 1;
-                    }
-                    slot += 1;
-                }
-                COPIES[1].fetch_add(marked, Relaxed);
-            }
-        }
+    let marked = mark_range(to as u64, n);
+    if marked > 0 {
+        COPIES[0].fetch_add(1, Relaxed);
+        COPIES[1].fetch_add(marked as u64, Relaxed);
+    }
+    out
+}
+
+/// # Safety
+/// `real` fills as `memset` does; the rest are the title's.
+#[inline]
+unsafe fn filled(to: *mut u8, val: i32, n: usize, real: usize) -> *mut u8 {
+    // SAFETY: the host's function, noted by `import` before the title ran.
+    let real: Fill = unsafe { std::mem::transmute(real) };
+    // SAFETY: by the caller.
+    let out = unsafe { real(to, val, n) };
+    let marked = mark_range(to as u64, n);
+    if marked > 0 {
+        COPIES[0].fetch_add(1, Relaxed);
+        COPIES[1].fetch_add(marked as u64, Relaxed);
     }
     out
 }
@@ -551,7 +686,7 @@ pub(crate) fn line(frames: f64) {
     let writers = String::new();
     tracing::info!(
         "renderer port 2 (VICTORY_PORT_DESCRIPTORS=1) per frame: {:.0} slots told (of them {:.0} marked by our calls, the rest by the title's {} patched stores) in {:.1} takings, {:.3} ms taking; \
-         of the title's memcpy/memmove calls into the heap {:.0}, {:.0} records they marked; fallback: {:.1} pages looked at whole, {:.2} view records no store told of ({:.2} of them of draws' tables), {:.0} other records changed, {:.1} told and not taken yet, {:.2} ms; \
+         of the title's memcpy/memmove/memset calls into the heap {:.0}, {:.0} slots they marked; fallback (every {}f): {:.1} pages looked at whole, {:.2} view records no store told of ({:.2} of them of draws' tables), {:.0} other records changed, {:.1} told and not taken yet, {:.2} ms; \
          since the start: {} slots told ({} by our calls), {} pages looked at, {} view records missed; their writers: {}",
         taken as f64 / frames,
         ours as f64 / frames,
@@ -560,6 +695,7 @@ pub(crate) fn line(frames: f64) {
         ns as f64 / 1e6 / frames,
         copies[0] as f64 / frames,
         copies[1] as f64 / frames,
+        current_check_every(),
         pages as f64 / frames,
         missed as f64 / frames,
         tabled as f64 / frames,
@@ -649,5 +785,110 @@ mod tests {
         put_back_pages(&pages[1..]);
         let again = to_check(100);
         assert_eq!(again, [0x11_0000, 0x12_0000]);
+    }
+
+    #[test]
+    fn mark_range_marks_exact_slots_and_chunks_and_hooks_memcpy_memset() {
+        static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut heap = vec![0u8; 400 * 32];
+        let start = heap.as_mut_ptr() as u64;
+        assert!(adopt_now(start, 400));
+
+        // Out-of-range and empty ranges mark 0 slots.
+        assert_eq!(mark_range(start, 0), 0);
+        assert_eq!(mark_range(start - 64, 64), 0);
+        assert_eq!(mark_range(start + 400 * 32, 64), 0);
+
+        // Partial unaligned range inside slot 3..=4 (bytes 3*32+12 .. 4*32+4).
+        assert_eq!(mark_range(start + 3 * 32 + 12, 24), 2);
+        // Cross-u64-word AND cross-CHUNK=128 range (slots 120..=140 = 21 slots).
+        assert_eq!(mark_range(start + 120 * 32, 21 * 32), 21);
+        // Clamped range starting before heap and entering slots 0..=1.
+        assert_eq!(mark_range(start - 16, 16 + 33), 2);
+        // Clamped range extending past end of heap (slots 398..=399).
+        assert_eq!(mark_range(start + 398 * 32, 128), 2);
+
+        assert_eq!(
+            take(start).unwrap(),
+            [(0, 2), (3, 2), (120, 21), (398, 2)]
+        );
+        assert_eq!(take(start).unwrap(), []);
+
+        // Hooked `copied` (memcpy) and `filled` (memset) mark touched slots even
+        // when payload is NOT `VIEW_TAG` (e.g. non-view overwrites or zeroing).
+        unsafe extern "system-unwind" fn fake_memcpy(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+            // SAFETY: valid test slices.
+            unsafe { std::ptr::copy_nonoverlapping(src, dst, n) };
+            dst
+        }
+        unsafe extern "system-unwind" fn fake_memset(dst: *mut u8, val: i32, n: usize) -> *mut u8 {
+            // SAFETY: valid test slice.
+            unsafe { std::ptr::write_bytes(dst, val as u8, n) };
+            dst
+        }
+        let payload = [0xAAu8; 96]; // 3 slots, non-VIEW_TAG data
+        // SAFETY: valid pointers into `heap` and `payload`.
+        unsafe {
+            copied(
+                (start + 10 * 32) as *mut u8,
+                payload.as_ptr(),
+                payload.len(),
+                fake_memcpy as *const () as usize,
+            );
+            filled(
+                (start + 255 * 32 + 4) as *mut u8,
+                0,
+                64, // spans slots 255, 256, 257 (crosses chunk 1 -> chunk 2)
+                fake_memset as *const () as usize,
+            );
+        }
+        assert_eq!(take(start).unwrap(), [(10, 3), (255, 3)]);
+        let_go(start);
+    }
+
+    #[test]
+    fn adaptive_check_every_throttles_to_32_on_zero_misses_and_resets_to_1_on_miss() {
+        static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if check_every_override().is_some() {
+            return; // explicit env override disables adaptive mode
+        }
+        let start = 0x2000_0000u64;
+        assert!(adopt_now(start, 256));
+        {
+            let mut f = FALLBACK.lock().unwrap_or_else(|e| e.into_inner());
+            f.pages.clear();
+            f.asked = 0;
+            f.looked = 0;
+            f.next = 0;
+            f.last_missed_all = MISSED_ALL.load(Acquire);
+        }
+        ADAPTIVE_EVERY.store(1, Release);
+        assert_eq!(current_check_every(), 1);
+
+        // Initial ask on frame 1 -> still 1; after clean check, ramps 1 -> 2 -> 4 -> 8 -> 16 -> 32.
+        assert!(ask_due(1));
+        assert_eq!(current_check_every(), 1);
+        let _ = to_check(1);
+
+        let mut frame = 2u64;
+        for expected_next in [2u64, 4, 8, 16, 32, 32] {
+            assert!(ask_due(frame), "expected ask_due({frame}) to trigger");
+            assert_eq!(current_check_every(), expected_next);
+            let _ = to_check(frame);
+            // Frames strictly inside `frame + expected_next` must be throttled.
+            assert!(!ask_due(frame + 1));
+            assert!(!ask_due(frame + expected_next - 1));
+            frame += expected_next;
+        }
+        assert_eq!(current_check_every(), 32);
+
+        // Any missed view record immediately resets cadence back to 1 frame.
+        missed(7, start + 7 * 32, true, false);
+        assert_eq!(current_check_every(), 1);
+        // Very next frame after last ask (`frame - 32 + 1`) is immediately due!
+        assert!(ask_due(frame - 32 + 1));
+        let_go(start);
     }
 }

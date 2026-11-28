@@ -595,8 +595,32 @@ fn keep_shadow_dedup(
     list.keep_shadow(shadow.clone());
 }
 
+/// Compact cached buffer-UAV write declaration captured during an uncached
+/// `State::tables()` pass and replayed identically on `last_stage_tables` hits.
+#[derive(Clone)]
+struct CachedUavBuffer {
+    shadow: std::sync::Arc<crate::shadow::Shadow>,
+    address: u64,
+    len: u64,
+    /// Whether `STORES.get() || !write_skip()` was true for the stage.
+    writes: bool,
+}
+
+/// Scratch accumulator populated during an uncached `State::tables()` pass
+/// when `can_cache_tables` is true.
+#[derive(Default)]
+pub(crate) struct UavCapture {
+    buffers: Vec<CachedUavBuffer>,
+    textures: Few<usize, 4>,
+    srv_textures: Few<usize, 8>,
+    srv_tex_hazard: bool,
+    skipped_srv_check: bool,
+}
+
 /// Cached per-stage descriptor-table bind result for consecutive draws/dispatches
-/// on the same `HostList` when pipeline, heaps, table roots, and list epoch are unchanged.
+/// on the same `HostList` when pipeline, heaps, table roots, descriptor view
+/// epochs, and list epoch are unchanged — including UAV-writing dispatches whose
+/// write marks and barriers are replayed directly from `uav_buffers` / `uav_textures`.
 struct CachedStageTables {
     list_ptr: usize,
     list_epoch: u64,
@@ -604,10 +628,76 @@ struct CachedStageTables {
     heaps: [usize; 2],
     table_gen: u64,
     const_gen: u64,
+    view_epochs: (u64, u64),
+    writes_mask: u8,
     has_indexed: bool,
     tested_depth: usize,
     tested_depth_read: bool,
     stages_made: [Few<(u8, u32), 16>; 4],
+    uav_buffers: Vec<CachedUavBuffer>,
+    uav_textures: Few<usize, 4>,
+    /// True if any SRV in the cached tables could observe a texture-UAV write
+    /// (format alias, depth twin, or resource overlap), preventing `list_epoch`
+    /// advancement after a texture-UAV hit.
+    srv_tex_hazard: bool,
+}
+
+impl CachedStageTables {
+    #[inline]
+    fn matches(
+        &self,
+        list_ptr: usize,
+        list_epoch: u64,
+        pipeline: usize,
+        heaps: [usize; 2],
+        table_gen: u64,
+        const_gen: u64,
+        tested_depth: usize,
+        view_epochs: (u64, u64),
+        writes_mask: u8,
+    ) -> bool {
+        self.list_ptr == list_ptr
+            && self.list_epoch == list_epoch
+            && self.pipeline == pipeline
+            && self.heaps == heaps
+            && self.table_gen == table_gen
+            && self.tested_depth == tested_depth
+            && (!self.has_indexed || self.const_gen == const_gen)
+            && self.view_epochs == view_epochs
+            && self.writes_mask == writes_mask
+            && !self.uav_buffers.iter().any(|u| u.shadow.is_dead())
+    }
+
+    /// Replays every UAV refresh, `mark_uav_dirty`, `gpu_writes`, `texture_written`,
+    /// depth-twin sync, and `UNORDERED_ACCESS` state barrier that the uncached
+    /// `readable()` pass would emit.
+    fn replay_uavs(&self, list: &HostList) {
+        const UNORDERED_ACCESS: u32 = 0x8;
+        for u in &self.uav_buffers {
+            u.shadow.refresh(list, u.address, u.len);
+            list.mark_uav_dirty();
+            if u.writes {
+                #[cfg(feature = "diagnostics")]
+                crate::host::wide_write(u.address, u.len, 0);
+                u.shadow.gpu_writes(list, u.address, u.len);
+            } else {
+                #[cfg(feature = "diagnostics")]
+                {
+                    crate::copystat::add(crate::copystat::C::GpuWritesLeftOut, 1);
+                    crate::copystat::add(crate::copystat::C::GpuWritesLeftOutBytes, u.len);
+                }
+            }
+        }
+        for &resource in &*self.uav_textures {
+            list.mark_uav_dirty();
+            #[cfg(feature = "diagnostics")]
+            crate::capture::note_target(resource as This);
+            list.texture_written(resource as This);
+            if !list.twin_use(resource as This, true, true) {
+                crate::list::ensure_state(list, resource as This, UNORDERED_ACCESS);
+            }
+        }
+    }
 }
 
 /// What one title list has set, and what its host list was last given.
@@ -683,6 +773,11 @@ pub(crate) struct State {
     /// Reusable scratch records buffer for [`State::tables`] (`CPU-18`),
     /// avoiding `Few<[u32; 3], 64>` stack zeroing on every dynamic table.
     table_records: Vec<[u32; 3]>,
+    /// Reusable per-list scratch buffers for multi-arg indirect VA rebasing
+    /// (`State::execute_indirect_signature`), avoiding per-call allocations.
+    indirect_rebase: Vec<[u32; 8]>,
+    indirect_rebase_ranges: Vec<(u64, u64, u64, bool)>,
+    indirect_rebase_seen: Vec<u64>,
     /// Per-list batched draw/dispatch/spread counters flushed on list close/reset
     /// (`CPU-26`), eliminating per-draw cross-core atomic cache-line ping-pong.
     local_drawn: u64,
@@ -2047,6 +2142,18 @@ impl State {
         self.clear_list_caches();
         self.recent_args.clear();
         self.table_records.clear();
+        self.indirect_rebase.clear();
+        if self.indirect_rebase.capacity() > 4096 {
+            self.indirect_rebase.shrink_to(1024);
+        }
+        self.indirect_rebase_ranges.clear();
+        if self.indirect_rebase_ranges.capacity() > 4096 {
+            self.indirect_rebase_ranges.shrink_to(1024);
+        }
+        self.indirect_rebase_seen.clear();
+        if self.indirect_rebase_seen.capacity() > 4096 {
+            self.indirect_rebase_seen.shrink_to(1024);
+        }
         self.dispatch_spread = [0; 2];
         self.dispatch_threads = [0; 3];
         #[cfg(feature = "diagnostics")]
@@ -2898,23 +3005,38 @@ impl State {
         let list_ptr = std::ptr::from_ref(list) as usize;
         let pso_raw = p.pso.as_raw() as usize;
         let epoch_before = list.epoch();
+        let view_epochs = crate::descriptor::host::view_cache_epochs();
+        let quarantined = crate::pipeline::builder_quarantined(self.pipeline as This);
+        let mut writes_mask = 0u8;
+        for (stage_idx, stage) in p.stages.iter().take(4).enumerate() {
+            let t = stage.translated();
+            if (t.stores || !write_skip()) && !quarantined {
+                writes_mask |= 1u8 << stage_idx;
+            }
+        }
         let tables_hit = self.last_stage_tables[domain].as_ref().is_some_and(|c| {
-            c.list_ptr == list_ptr
-                && c.list_epoch == epoch_before
-                && c.pipeline == pso_raw
-                && c.heaps == self.heaps
-                && c.table_gen == self.table_gen[domain]
-                && c.tested_depth == tested
-                && (!c.has_indexed || c.const_gen == self.const_gen[domain])
+            c.matches(
+                list_ptr,
+                epoch_before,
+                pso_raw,
+                self.heaps,
+                self.table_gen[domain],
+                self.const_gen[domain],
+                tested,
+                view_epochs,
+                writes_mask,
+            )
         });
         if tables_hit && let Some(c) = &self.last_stage_tables[domain] {
             if c.tested_depth_read {
                 TESTED_DEPTH.set((tested, true));
             }
+            c.replay_uavs(list);
         }
         let mut can_cache_tables = !tables_hit && p.stages.len() <= 4;
         let mut cache_has_indexed = false;
         let mut cached_made: [Few<(u8, u32), 16>; 4] = Default::default();
+        let mut uav_capture = UavCapture::default();
         if can_cache_tables {
             let _ = crate::residency::take_staging_deferred();
         }
@@ -2926,8 +3048,7 @@ impl State {
         }
         for (stage_idx, stage) in p.stages.iter().enumerate() {
             let t = stage.translated();
-            let writes = (t.stores || !write_skip())
-                && !crate::pipeline::builder_quarantined(self.pipeline as This);
+            let writes = (t.stores || !write_skip()) && !quarantined;
             let made: Few<(u8, u32), 16> = if tables_hit {
                 self.last_stage_tables[domain]
                     .as_ref()
@@ -2941,15 +3062,21 @@ impl State {
                     crate::picked::runs_in(list);
                     can_cache_tables = false;
                 }
-                if stage.shader.ambient.is_some()
-                    || (writes && t.tables.groups.iter().any(|g| g.has_uav))
-                {
+                if stage.shader.ambient.is_some() {
                     can_cache_tables = false;
                 }
                 if t.tables.groups.iter().any(|g| !g.indexed.is_empty()) {
                     cache_has_indexed = true;
                 }
-                let made = self.tables(list, &t.tables, &t.host.half_views, compute, spans, &mut staged);
+                let made = self.tables(
+                    list,
+                    &t.tables,
+                    &t.host.half_views,
+                    compute,
+                    spans,
+                    &mut staged,
+                    can_cache_tables.then_some(&mut uav_capture),
+                );
                 STORES.set(true);
                 #[cfg(feature = "diagnostics")]
                 BIND_DIAG[2].fetch_add(t_tbl.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -3123,7 +3250,25 @@ impl State {
             #[cfg(feature = "diagnostics")]
             BIND_DIAG[3].fetch_add(t_rest.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
-        if can_cache_tables && !crate::residency::take_staging_deferred() {
+        // Depth textures it writes through unordered access: their colour
+        // twins hold what they lack from here on.
+        list.twins_written();
+        if tables_hit {
+            if let Some(c) = self.last_stage_tables[domain].as_mut()
+                && !c.srv_tex_hazard
+            {
+                c.list_epoch = list.epoch();
+            }
+        } else if can_cache_tables && !crate::residency::take_staging_deferred() {
+            if !uav_capture.textures.is_empty()
+                && (uav_capture.skipped_srv_check
+                    || uav_capture
+                        .textures
+                        .iter()
+                        .any(|t| uav_capture.srv_textures.contains(t)))
+            {
+                uav_capture.srv_tex_hazard = true;
+            }
             self.last_stage_tables[domain] = Some(CachedStageTables {
                 list_ptr,
                 list_epoch: list.epoch(),
@@ -3131,10 +3276,15 @@ impl State {
                 heaps: self.heaps,
                 table_gen: self.table_gen[domain],
                 const_gen: self.const_gen[domain],
+                view_epochs,
+                writes_mask,
                 has_indexed: cache_has_indexed,
                 tested_depth: tested,
                 tested_depth_read: TESTED_DEPTH.get().1,
                 stages_made: cached_made,
+                uav_buffers: uav_capture.buffers,
+                uav_textures: uav_capture.textures,
+                srv_tex_hazard: uav_capture.srv_tex_hazard,
             });
         }
         #[cfg(feature = "diagnostics")]
@@ -3155,9 +3305,6 @@ impl State {
                 );
             }
         }
-        // Depth textures it writes through unordered access: their colour
-        // twins hold what they lack from here on.
-        list.twins_written();
         true
     }
 
@@ -5450,7 +5597,13 @@ impl State {
         )
     }
 
-    fn table_entry(&mut self, list: &HostList, u: &UsedResource, compute: bool) {
+    fn table_entry(
+        &mut self,
+        list: &HostList,
+        u: &UsedResource,
+        compute: bool,
+        mut uav_capture: Option<&mut UavCapture>,
+    ) {
         let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
             return;
         };
@@ -5491,12 +5644,15 @@ impl State {
                     if ready.2 {
                         TESTED_DEPTH.set((tested.0, true));
                     }
+                    if let Some(cap) = uav_capture {
+                        cap.skipped_srv_check = true;
+                    }
                     return;
                 }
                 if let Some(view) = host.mirror(index, handle, true) {
                     let _ = crate::residency::take_staging_deferred();
                     TESTED_DEPTH.set((tested.0, false));
-                    readable(list, u.kind, &view);
+                    readable_inner(list, u.kind, &view, uav_capture.as_deref_mut());
                     let depth = TESTED_DEPTH.get().1;
                     TESTED_DEPTH.set((tested.0, tested.1 || depth));
                     if crate::descriptor::host::is_texture_view(&view) {
@@ -5513,7 +5669,7 @@ impl State {
             }
         }
         if let Some(view) = host.mirror(index, handle, true) {
-            readable(list, u.kind, &view);
+            readable_inner(list, u.kind, &view, uav_capture);
             // Up to date by this draw: not the texture pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {
                 host.texture_slot_tabled(index, true);
@@ -5550,6 +5706,7 @@ impl State {
         compute: bool,
         spans: &[(u8, u32, u32)],
         staged: &mut Few<(u64, u32), 8>,
+        mut uav_capture: Option<&mut UavCapture>,
     ) -> Few<(u8, u32), 16> {
         let mut fresh = [0u64; 4];
         let selected_slot = |mask: &[u64; 4], slot: u8| mask[usize::from(slot / 64)] & (1u64 << (slot % 64)) != 0;
@@ -5590,7 +5747,7 @@ impl State {
         for &(g, e) in &plan.direct {
             let group = &plan.groups[g];
             if !selected_slot(&fresh, group.slot) {
-                self.table_entry(list, &group.entries[e], compute);
+                self.table_entry(list, &group.entries[e], compute, uav_capture.as_deref_mut());
             }
         }
         let mut made = Few::default();
@@ -5695,7 +5852,10 @@ impl State {
                     .flatten();
                 // This reader had it brought up to date, and nothing in the
                 // list changed since: nothing to do again.
-                let once = ready_once() && selected.is_empty() && (!group.has_uav || !STORES.get());
+                let once = ready_once()
+                    && selected.is_empty()
+                    && (!group.has_uav || !STORES.get())
+                    && uav_capture.is_none();
                 if once
                     && staged_title.is_none()
                     && known.epoch == list.epoch()
@@ -5712,7 +5872,7 @@ impl State {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let k = (u.table_offset_dwords / 8) as usize;
                     if let Some(view) = crate::descriptor::view_from_words(records[k]) {
-                        readable(list, u.kind, &view);
+                        readable_inner(list, u.kind, &view, uav_capture.as_deref_mut());
                         if let Some(title) = staged_title
                             && crate::descriptor::host::is_texture_view(&view)
                         {
@@ -5731,7 +5891,7 @@ impl State {
                     if let Some(view) = crate::descriptor::view_from_words(records[k as usize])
                         && let Some(kind) = view_kind(&view)
                     {
-                        readable(list, kind, &view);
+                        readable_inner(list, kind, &view, uav_capture.as_deref_mut());
                         if let Some(title) = staged_title
                             && crate::descriptor::host::is_texture_view(&view)
                         {
@@ -5884,10 +6044,13 @@ impl State {
                                     if ready.2 {
                                         TESTED_DEPTH.set((tested.0, true));
                                     }
+                                    if let Some(cap) = uav_capture.as_deref_mut() {
+                                        cap.skipped_srv_check = true;
+                                    }
                                 } else if let Some(view) = view_opt {
                                     let _ = crate::residency::take_staging_deferred();
                                     TESTED_DEPTH.set((tested.0, false));
-                                    readable(list, kind, &view);
+                                    readable_inner(list, kind, &view, uav_capture.as_deref_mut());
                                     let depth = TESTED_DEPTH.get().1;
                                     TESTED_DEPTH.set((tested.0, tested.1 || depth));
                                     if kind == ResourceType::Srv && !crate::residency::take_staging_deferred() {
@@ -5960,7 +6123,7 @@ impl State {
                                 selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                             });
                             if let Some(kind) = kind {
-                                readable(list, kind, &view);
+                                readable_inner(list, kind, &view, uav_capture.as_deref_mut());
                             }
                             // The title's slot is a table's: out of the queue
                             // of textures picked by index if the draw read it
@@ -6686,7 +6849,6 @@ impl State {
     ) -> bool {
         use crate::indirect::{
             KIND_DISPATCH, KIND_DISPATCH_MESH, KIND_DISPATCH_SINGLE, KIND_DRAW, KIND_DRAW_INDEXED,
-            StageBinding,
         };
         match args {
             [] => return false,
@@ -6725,32 +6887,44 @@ impl State {
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
         };
-        let bindings: Vec<StageBinding<'_>> = p
-            .stages
-            .iter()
-            .map(|stage| StageBinding {
-                user_data_param: stage.user_data.map(|(param, _)| param),
-                user_data: &stage.translated().host.user_data,
-                root_cbvs: &stage.root_cbvs,
-                root_srvs: &stage.root_srvs,
-                root_uavs: &stage.root_uavs,
-            })
-            .collect();
-        let Some(plan) = crate::indirect::translate_signature(
+        let Some(cached) = cached_multi_indirect(
+            p,
             stride,
             args,
-            &bindings,
             crate::pipeline::host::bounded_root_srvs(),
         ) else {
-            why("unsupported multi-argument signature layout");
+            why("unsupported multi-argument signature layout or no host signature");
             return false;
         };
+        let plan = &cached.plan;
+        let signature = &cached.signature;
+        let mutates_root_state = cached.mutates_root_state;
         if plan.skipped_tabled_views {
             once!(
                 "indirect root SRV/UAV targets a bounded descriptor-table parameter; set VICTORY_ROOT_SRV_DIRECT=1 to enable indirect root SRV/UAV updates"
             );
         }
         let kind = plan.exec_kind;
+        // Fast path: when a multi-argument console signature performs no root-state
+        // mutations for this pipeline (`!mutates_root_state && plan.ops.is_empty()`),
+        // delegate straight to `execute_indirect` so batched/windowed clamping applies
+        // and we skip both `repack` and `invalidate_compute_host_state()`.
+        if !mutates_root_state && plan.ops.is_empty() {
+            if plan.src_exec_off == 0 {
+                return self.execute_indirect(list, (kind, stride, max), arguments, count);
+            }
+            if max == 1 && count.is_none() {
+                let exec_stride = match kind {
+                    KIND_DRAW => 16,
+                    KIND_DRAW_INDEXED => 20,
+                    KIND_DISPATCH | KIND_DISPATCH_MESH => 12,
+                    _ => stride,
+                };
+                if let Some(exec_addr) = arguments.checked_add(u64::from(plan.src_exec_off)) {
+                    return self.execute_indirect(list, (kind, exec_stride, 1), exec_addr, None);
+                }
+            }
+        }
         let made_rects = !p.rects
             && kind == KIND_DRAW
             && self.topology == RECTANGLES
@@ -6795,31 +6969,30 @@ impl State {
             },
             None => None,
         };
-        let Some(signature) = host_multi_signature(
-            plan.has_root_args.then_some(&p.root),
-            plan.dst_stride,
-            &plan.host_args,
-        ) else {
-            why("no host multi-argument signature");
-            return false;
-        };
         arg_shadow.refresh(list, arguments, len);
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
         }
-        let rebase = if plan.needs_rebase {
-            collect_rebase_entries(list, self.roots_ref(p.compute))
+        if plan.needs_rebase {
+            let roots = if p.compute { &self.compute } else { &self.graphics };
+            collect_rebase_entries_into(
+                list,
+                roots,
+                &mut self.indirect_rebase_ranges,
+                &mut self.indirect_rebase_seen,
+                &mut self.indirect_rebase,
+            );
         } else {
-            Vec::new()
-        };
+            self.indirect_rebase.clear();
+        }
         let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
         let any_in_place = arg_shadow.in_place() || counter.as_ref().is_some_and(|(s, _)| s.in_place());
         let Some(bounded) = crate::indirect::repack(
             list,
             (&arg_shadow.buffer, arg_shadow.offset(arguments)),
             count_arg,
-            &plan,
-            &rebase,
+            plan,
+            &self.indirect_rebase,
             max,
             any_in_place,
         ) else {
@@ -6827,7 +7000,10 @@ impl State {
             why("multi-arg repack failed");
             return false;
         };
-        self.invalidate_compute_host_state();
+        // `repack` only binds its compute root signature/PSO when `max > 0`.
+        if max > 0 {
+            self.invalidate_compute_host_state();
+        }
         self.window = None;
         let ran = match kind {
             KIND_DRAW | KIND_DRAW_INDEXED => self.prepare(list, kind == KIND_DRAW_INDEXED).is_some(),
@@ -6856,7 +7032,7 @@ impl State {
         // any rebased shadow buffers are kept alive for the list.
         unsafe {
             list.list.ExecuteIndirect(
-                &signature,
+                signature,
                 max,
                 &bounded,
                 0,
@@ -6864,7 +7040,7 @@ impl State {
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
-        if plan.has_root_args {
+        if mutates_root_state {
             // Multi-arg indirect signature modifies root constants/views on GPU.
             self.host_root_args[usize::from(p.compute)].clear();
         }
@@ -7206,11 +7382,17 @@ fn host_signature(kind: u32, stride: u32) -> Option<SigRef> {
 
 /// Collects active live shadow ranges into a sorted, non-overlapping GPU
 /// VA-rebase table for indirect root CBV/SRV/UAV translation, keeping every
-/// referenced shadow buffer alive on `list`.
-fn collect_rebase_entries(list: &HostList, roots: &[Root]) -> Vec<[u32; 8]> {
+/// referenced shadow buffer alive on `list` and reusing caller scratch `Vec`s.
+fn collect_rebase_entries_into(
+    list: &HostList,
+    roots: &[Root],
+    ranges: &mut Vec<(u64, u64, u64, bool)>,
+    seen_ids: &mut Vec<u64>,
+    out: &mut Vec<[u32; 8]>,
+) {
     const UNORDERED: i32 = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0;
-    let mut ranges: Vec<(u64, u64, u64, bool)> = Vec::new();
-    let mut seen_ids: Vec<u64> = Vec::new();
+    ranges.clear();
+    seen_ids.clear();
     let mut push_shadow = |s: std::sync::Arc<crate::shadow::Shadow>| {
         let id = s.id();
         if seen_ids.contains(&id) {
@@ -7242,7 +7424,186 @@ fn collect_rebase_entries(list: &HostList, roots: &[Root]) -> Vec<[u32; 8]> {
             push_shadow(s);
         }
     }
-    crate::indirect::build_rebase_table(&ranges)
+    crate::indirect::build_rebase_table_into(ranges, out);
+}
+
+/// Memoized multi-argument indirect execution entry for a `(stride, args,
+/// host root signature, stage shaders, bounded_root_srvs)` tuple.
+///
+/// Retains `_root` so `root_raw` cannot be recycled by COM while cached;
+/// `shader_ptrs` point to permanently interned `Arc<Shader>`s so they can
+/// never be recycled; `stride` and `args` are verified by value on every hit
+/// so guest signature pointer recycling can never alias.
+struct CachedMultiIndirect {
+    stride: u32,
+    args: Vec<[u32; 4]>,
+    root_raw: usize,
+    shader_ptrs: [usize; 5],
+    bounded_root_srvs: bool,
+    _root: Option<ID3D12RootSignature>,
+    plan: crate::indirect::MultiArgPlan,
+    signature: ID3D12CommandSignature,
+    mutates_root_state: bool,
+}
+
+// SAFETY: `ID3D12RootSignature` and `ID3D12CommandSignature` are free-threaded
+// immutable D3D12 device objects safe to share across threads behind `Arc`.
+unsafe impl Send for CachedMultiIndirect {}
+// SAFETY: as above.
+unsafe impl Sync for CachedMultiIndirect {}
+
+impl CachedMultiIndirect {
+    #[inline]
+    fn matches(
+        &self,
+        stride: u32,
+        args: &[[u32; 4]],
+        root_raw: usize,
+        shader_ptrs: &[usize; 5],
+        bounded_root_srvs: bool,
+    ) -> bool {
+        self.stride == stride
+            && self.root_raw == root_raw
+            && self.bounded_root_srvs == bounded_root_srvs
+            && self.shader_ptrs == *shader_ptrs
+            && self.args.as_slice() == args
+    }
+}
+
+#[inline]
+fn multi_indirect_key_hash(
+    stride: u32,
+    args: &[[u32; 4]],
+    root_raw: usize,
+    shader_ptrs: &[usize; 5],
+    bounded_root_srvs: bool,
+) -> u64 {
+    let mix = |h: u64, x: u64| (h.rotate_left(5) ^ x).wrapping_mul(0x517c_c1b7_2722_0a95);
+    let mut h = mix(u64::from(stride), root_raw as u64);
+    h = mix(h, u64::from(bounded_root_srvs) | ((args.len() as u64) << 1));
+    for &p in shader_ptrs {
+        if p != 0 {
+            h = mix(h, p as u64);
+        }
+    }
+    for &[a, b, c, d] in args {
+        h = mix(h, u64::from(a) | (u64::from(b) << 32));
+        h = mix(h, u64::from(c) | (u64::from(d) << 32));
+    }
+    h ^ (h >> 32)
+}
+
+/// Lock-free thread-local MRU + shared `RwLock` memoization cache for
+/// `(signature layout, pipeline)` → `Arc<CachedMultiIndirect>`.
+fn cached_multi_indirect(
+    p: &HostPipeline,
+    stride: u32,
+    args: &[[u32; 4]],
+    bounded_root_srvs: bool,
+) -> Option<std::sync::Arc<CachedMultiIndirect>> {
+    use crate::indirect::StageBinding;
+    use std::sync::{Arc, LazyLock, RwLock};
+
+    let root_raw = p.root.as_raw() as usize;
+    let mut shader_ptrs = [0usize; 5];
+    for (dst, stage) in shader_ptrs.iter_mut().zip(&p.stages) {
+        *dst = Arc::as_ptr(&stage.shader) as usize;
+    }
+    let key_hash = multi_indirect_key_hash(stride, args, root_raw, &shader_ptrs, bounded_root_srvs);
+
+    // 1. Lock-free thread-local MRU cache (zero mutex, zero allocation).
+    thread_local! {
+        static TLS_CACHE: std::cell::RefCell<Vec<(u64, Arc<CachedMultiIndirect>)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+    const TLS_CAP: usize = 32;
+    if let Some(hit) = TLS_CACHE.with(|cell| {
+        let cache = cell.borrow();
+        cache
+            .iter()
+            .find(|(h, e)| *h == key_hash && e.matches(stride, args, root_raw, &shader_ptrs, bounded_root_srvs))
+            .map(|(_, e)| e.clone())
+    }) {
+        return Some(hit);
+    }
+
+    static SHARED: LazyLock<
+        RwLock<std::collections::HashMap<u64, Vec<Arc<CachedMultiIndirect>>, std::hash::BuildHasherDefault<Plain>>>,
+    > = LazyLock::new(|| RwLock::new(std::collections::HashMap::default()));
+
+    let tls_insert = |entry: &Arc<CachedMultiIndirect>| {
+        TLS_CACHE.with(|cell| {
+            let mut cache = cell.borrow_mut();
+            if cache.len() >= TLS_CAP {
+                cache.remove(0);
+            }
+            cache.push((key_hash, entry.clone()));
+        });
+    };
+
+    // 2. Shared concurrent read-lock lookup across recording threads.
+    if let Some(hit) = SHARED
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key_hash)
+        .and_then(|bucket| {
+            bucket
+                .iter()
+                .find(|e| e.matches(stride, args, root_raw, &shader_ptrs, bounded_root_srvs))
+                .cloned()
+        })
+    {
+        tls_insert(&hit);
+        return Some(hit);
+    }
+
+    // 3. Cold miss: translate signature once per unique `(signature layout, pipeline)`.
+    let mut bindings: Vec<StageBinding<'_>> = Vec::with_capacity(p.stages.len());
+    for stage in &p.stages {
+        bindings.push(StageBinding {
+            user_data_param: stage.user_data.map(|(param, _)| param),
+            user_data: &stage.translated().host.user_data,
+            root_cbvs: &stage.root_cbvs,
+            root_srvs: &stage.root_srvs,
+            root_uavs: &stage.root_uavs,
+        });
+    }
+    let plan = crate::indirect::translate_signature(stride, args, &bindings, bounded_root_srvs)?;
+    let mutates_root_state = plan.has_root_args;
+    let signature = host_multi_signature(
+        plan.has_root_args.then_some(&p.root),
+        plan.dst_stride,
+        &plan.host_args,
+    )?;
+    let entry = Arc::new(CachedMultiIndirect {
+        stride,
+        args: args.to_vec(),
+        root_raw,
+        shader_ptrs,
+        bounded_root_srvs,
+        _root: Some(p.root.clone()),
+        plan,
+        signature,
+        mutates_root_state,
+    });
+    // Only cache pipelines with <= 5 stages (all D3D12 graphics/compute pipelines).
+    if p.stages.len() <= 5 {
+        let mut map = SHARED.write().unwrap_or_else(|e| e.into_inner());
+        let bucket = map.entry(key_hash).or_default();
+        if let Some(existing) = bucket
+            .iter()
+            .find(|e| e.matches(stride, args, root_raw, &shader_ptrs, bounded_root_srvs))
+        {
+            let existing = existing.clone();
+            drop(map);
+            tls_insert(&existing);
+            return Some(existing);
+        }
+        bucket.push(entry.clone());
+        drop(map);
+        tls_insert(&entry);
+    }
+    Some(entry)
 }
 
 /// Cached host multi-argument command signature keyed by
@@ -7605,6 +7966,15 @@ fn all_blocks_published(start: usize, len: usize) -> bool {
 }
 
 fn readable(list: &HostList, kind: ResourceType, view: &View) {
+    readable_inner(list, kind, view, None);
+}
+
+fn readable_inner(
+    list: &HostList,
+    kind: ResourceType,
+    view: &View,
+    mut uav_capture: Option<&mut UavCapture>,
+) {
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
@@ -7616,7 +7986,8 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             list.mark_uav_dirty();
             // A shader that cannot store to buffers leaves the range as
             // the title has it: nothing to find afterwards.
-            if STORES.get() || !write_skip() {
+            let do_write = STORES.get() || !write_skip();
+            if do_write {
                 #[cfg(feature = "diagnostics")]
                 crate::host::wide_write(address, len, 0);
                 shadow.gpu_writes(list, address, len);
@@ -7626,6 +7997,14 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
                     crate::copystat::add(crate::copystat::C::GpuWritesLeftOut, 1);
                     crate::copystat::add(crate::copystat::C::GpuWritesLeftOutBytes, len);
                 }
+            }
+            if let Some(cap) = uav_capture.as_deref_mut() {
+                cap.buffers.push(CachedUavBuffer {
+                    shadow,
+                    address,
+                    len,
+                    writes: do_write,
+                });
             }
         }
     }
@@ -7684,7 +8063,13 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
                 }
             }
             // A depth texture shaders also write: what they wrote, first.
-            list.twin_use(*resource as This, false, false);
+            let twinned = list.twin_use(*resource as This, false, false);
+            if let Some(cap) = uav_capture {
+                if aliased || twinned {
+                    cap.srv_tex_hazard = true;
+                }
+                cap.srv_textures.push(*resource);
+            }
             // The depth target the draw only tests is read in both ways at
             // once: both read states, which its preparation asks for too.
             let (tested, _) = TESTED_DEPTH.get();
@@ -7719,6 +8104,9 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // Unordered access to a depth texture is its colour twin's.
             if !list.twin_use(*resource as This, true, true) {
                 crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
+            }
+            if let Some(cap) = uav_capture {
+                cap.textures.push(*resource);
             }
         }
         _ => {}
@@ -8195,5 +8583,141 @@ mod record_hash_tests {
         assert_eq!(state.batch_list, 0);
         assert_eq!(state.window_list, 0);
         assert_eq!(state.ensured_targets.0, 0);
+    }
+
+    #[test]
+    fn uav_cached_stage_tables_replays_barriers_and_gpu_writes_and_invalidates_on_gen_change() {
+        use super::{CachedStageTables, CachedUavBuffer, Few};
+        let Some(h) = crate::host::host() else {
+            return; // no host GPU
+        };
+        let Ok(list) = h.new_list() else {
+            return;
+        };
+        let mut backing = vec![0u8; 4096];
+        let start = backing.as_ptr() as u64;
+        let shadow = crate::shadow::Shadow::unbacked(start, backing.as_mut_ptr(), 4096, false);
+        assert!(!shadow.written());
+
+        let list_ptr = std::ptr::from_ref(&list) as usize;
+        let epochs = crate::descriptor::host::view_cache_epochs();
+        let entry = CachedStageTables {
+            list_ptr,
+            list_epoch: list.epoch(),
+            pipeline: 0xDEAD_0001,
+            heaps: [0x1000, 0x2000],
+            table_gen: 7,
+            const_gen: 3,
+            view_epochs: epochs,
+            writes_mask: 1,
+            has_indexed: true,
+            tested_depth: 0,
+            tested_depth_read: false,
+            stages_made: Default::default(),
+            uav_buffers: vec![CachedUavBuffer {
+                shadow: shadow.clone(),
+                address: start,
+                len: 256,
+                writes: true,
+            }],
+            uav_textures: Few::default(),
+            srv_tex_hazard: false,
+        };
+
+        // Matches with identical state.
+        assert!(entry.matches(list_ptr, list.epoch(), 0xDEAD_0001, [0x1000, 0x2000], 7, 3, 0, epochs, 1));
+        // Invalidates on root table gen, indexed const gen, pipeline, heap, list epoch, or view epoch change.
+        assert!(!entry.matches(list_ptr, list.epoch(), 0xDEAD_0001, [0x1000, 0x2000], 8, 3, 0, epochs, 1));
+        assert!(!entry.matches(list_ptr, list.epoch(), 0xDEAD_0001, [0x1000, 0x2000], 7, 4, 0, epochs, 1));
+        assert!(!entry.matches(list_ptr, list.epoch(), 0xDEAD_0002, [0x1000, 0x2000], 7, 3, 0, epochs, 1));
+        assert!(!entry.matches(list_ptr, list.epoch(), 0xDEAD_0001, [0x1001, 0x2000], 7, 3, 0, epochs, 1));
+        assert!(!entry.matches(list_ptr, list.epoch() + 1, 0xDEAD_0001, [0x1000, 0x2000], 7, 3, 0, epochs, 1));
+        assert!(!entry.matches(list_ptr, list.epoch(), 0xDEAD_0001, [0x1000, 0x2000], 7, 3, 0, (epochs.0 + 1, epochs.1), 1));
+        assert!(!entry.matches(list_ptr, list.epoch(), 0xDEAD_0001, [0x1000, 0x2000], 7, 3, 0, (epochs.0, epochs.1 + 1), 1));
+
+        // Mark UAV clean first, then replay cached UAVs: must dirty UAV barrier state AND mark shadow written!
+        list.mark_uav_clean();
+        assert!(list.is_uav_clean());
+        entry.replay_uavs(&list);
+        assert!(!list.is_uav_clean(), "UAV-cached bind replay must emit UAV dirty barrier state");
+        assert!(shadow.written(), "UAV-cached bind replay must mark buffer shadow as GPU-written");
+
+        // Descriptor view epoch bump invalidates cached entry.
+        crate::descriptor::host::bump_buffer_view_cache_epoch();
+        let new_epochs = crate::descriptor::host::view_cache_epochs();
+        assert_ne!(new_epochs, epochs);
+        assert!(!entry.matches(list_ptr, list.epoch(), 0xDEAD_0001, [0x1000, 0x2000], 7, 3, 0, new_epochs, 1));
+    }
+
+    #[test]
+    fn multi_indirect_cache_matches_uncached_plan_and_mutates_root_state_flag() {
+        use super::{CachedMultiIndirect, multi_indirect_key_hash};
+        use crate::indirect::{
+            KIND_CONSTANT, KIND_DISPATCH, StageBinding, translate_signature,
+        };
+        use victory_shader::RootType;
+        use victory_shader::emit::UserData;
+
+        let user_data = [UserData {
+            root: RootType::Constants,
+            slot: 0,
+            dword: 0,
+            index: 2,
+        }];
+        let bindings = [StageBinding {
+            user_data_param: Some(0),
+            user_data: &user_data,
+            root_cbvs: &[],
+            root_srvs: &[],
+            root_uavs: &[],
+        }];
+
+        // Signature 1: mutates root constant slot 0 dword 0 -> `mutates_root_state == true`.
+        let args_mut = [[KIND_CONSTANT, 0, 0, 1], [KIND_DISPATCH, 0, 0, 0]];
+        let plan_mut = translate_signature(16, &args_mut, &bindings, true).expect("plan_mut");
+        assert!(plan_mut.has_root_args);
+
+        // Signature 2: writes unused console slot 3 -> `mutates_root_state == false`!
+        let args_nomut = [[KIND_CONSTANT, 3, 0, 1], [KIND_DISPATCH, 0, 0, 0]];
+        let plan_nomut = translate_signature(16, &args_nomut, &bindings, true).expect("plan_nomut");
+        assert!(!plan_nomut.has_root_args);
+
+        let shaders = [0x1111usize, 0, 0, 0, 0];
+        let h1 = multi_indirect_key_hash(16, &args_mut, 0xAA00, &shaders, true);
+        let h2 = multi_indirect_key_hash(16, &args_nomut, 0xAA00, &shaders, true);
+        assert_ne!(h1, h2);
+
+        let Some(sig_nomut) = super::host_multi_signature(None, plan_nomut.dst_stride, &plan_nomut.host_args) else {
+            return; // no host GPU
+        };
+        let cached = CachedMultiIndirect {
+            stride: 16,
+            args: args_nomut.to_vec(),
+            root_raw: 0xAA00,
+            shader_ptrs: shaders,
+            bounded_root_srvs: true,
+            _root: None,
+            plan: plan_nomut.clone(),
+            signature: sig_nomut,
+            mutates_root_state: plan_nomut.has_root_args,
+        };
+        assert_eq!(cached.plan, plan_nomut);
+        assert!(!cached.mutates_root_state);
+        assert!(cached.matches(16, &args_nomut, 0xAA00, &shaders, true));
+        // Must miss if args, stride, root_raw, shader_ptrs, or bounded flag differ.
+        assert!(!cached.matches(16, &args_mut, 0xAA00, &shaders, true));
+        assert!(!cached.matches(20, &args_nomut, 0xAA00, &shaders, true));
+        assert!(!cached.matches(16, &args_nomut, 0xBB00, &shaders, true));
+        assert!(!cached.matches(16, &args_nomut, 0xAA00, &[0x2222, 0, 0, 0, 0], true));
+        assert!(!cached.matches(16, &args_nomut, 0xAA00, &shaders, false));
+
+        // Verify `State` preserves `indirect_rebase` scratch capacity across `reset()`.
+        let mut state = State::default();
+        state.indirect_rebase = Vec::with_capacity(64);
+        state.indirect_rebase.push([1; 8]);
+        let cap = state.indirect_rebase.capacity();
+        state.reset(std::ptr::null());
+        assert!(state.indirect_rebase.is_empty());
+        assert!(state.indirect_rebase.capacity() >= cap);
     }
 }

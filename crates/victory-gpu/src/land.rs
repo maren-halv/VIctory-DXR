@@ -422,7 +422,11 @@ pub(crate) type Piece = (u64, usize, usize);
 /// of the same memory, and what overlapped came down and was merged twice.
 /// Each with the number of the piece given that it begins with.
 pub(crate) fn ordered(pieces: &[Piece]) -> Vec<(usize, usize, usize)> {
-    let mut order: Vec<usize> = (0..pieces.len()).collect();
+    // Skip pieces already covered by an active Mode-1/Mode-2 GPU-only tripwire
+    // before queuing GPU readbacks (`host::relay_card_back` filters through here).
+    let mut order: Vec<usize> = (0..pieces.len())
+        .filter(|&i| !crate::shadow::is_gpu_only_piece_va(pieces[i].0, pieces[i].1, pieces[i].2))
+        .collect();
     order.sort_by_key(|&i| pieces[i].1 / BLOCK);
     let mut out: Vec<(usize, usize, usize)> = Vec::with_capacity(order.len());
     for group in order.chunk_by(|&a, &b| pieces[a].1 / BLOCK == pieces[b].1 / BLOCK) {
@@ -626,6 +630,11 @@ pub(crate) unsafe fn piece(
     notes: &mut Notes,
     copy: *const crate::shadow::Shadow,
 ) -> u64 {
+    // Mode-1/Mode-2 GPU-only promoted piece: never touch guest `PAGE_NOACCESS`
+    // memory or merge back into title RAM.
+    if !copy.is_null() && unsafe { (&*copy).is_va_gpu_only(title) } {
+        return 0;
+    }
     // Write-watched `MEM_PRIVATE` copies have neither section views nor guards,
     // so skip `beside()` lookups, the redundant `differ()` pre-pass, and guard
     // opening and merge directly into title memory in one pass.

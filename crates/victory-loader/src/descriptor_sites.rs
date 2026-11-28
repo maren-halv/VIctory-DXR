@@ -145,9 +145,95 @@ fn lea_of(store: &[u8]) -> Option<[u8; 4]> {
 enum StoreTarget {
     /// `vmovups [base+index], ymm0`: 4-byte `lea rax, [base+index]` (flags may be clobbered).
     Lea([u8; 4]),
-    /// Direct base register (`mov rax, reg`, 3 bytes) writing `slots` consecutive 32-byte slots
-    /// (preserves `rflags` via `pushfq`/`popfq`).
+    /// Direct base register (`mov rax, reg`, 3 bytes) writing `slots * 32` consecutive bytes
+    /// (preserves `rflags` via `pushfq`/`popfq`; bulk-marks every touched slot via `rep stosb`).
     BaseReg { mov_rax: [u8; 3], slots: u8 },
+}
+
+/// Emits x86-64 instructions that bulk-mark every 32-byte slot (and its 128-slot chunk)
+/// overlapping `[rax, rax + rcx)` inside `[MARKS.start, MARKS.start + MARKS.len)` using
+/// `rep stosb` (`memset(1)`), preserving all registers and `rflags`.
+///
+/// TSO invariant: all `MARKS.slots` writes complete BEFORE any `MARKS.chunks` write.
+fn emit_bulk_range_mark(out: &mut Vec<u8>, marks: usize, load_dst_len: impl FnOnce(&mut Vec<u8>)) -> Option<()> {
+    out.push(0x9c); // pushfq
+    out.push(0xfc); // cld (guarantee forward rep stosb)
+    out.extend([0x50, 0x51, 0x52, 0x57, 0x56]); // push rax ; push rcx ; push rdx ; push rdi ; push rsi
+    load_dst_len(out);
+    out.extend([0x48, 0xba]); // mov rdx, marks
+    out.extend((marks as u64).to_le_bytes());
+
+    let mut done_fixups: Vec<usize> = Vec::with_capacity(4);
+    let push_jcc = |out: &mut Vec<u8>, fixups: &mut Vec<usize>, op2: u8| {
+        out.extend([0x0f, op2, 0, 0, 0, 0]);
+        fixups.push(out.len() - 4);
+    };
+
+    // if len == 0 || MARKS.len == 0 -> done
+    out.extend([0x48, 0x85, 0xc9]); // test rcx, rcx
+    push_jcc(out, &mut done_fixups, 0x84); // jz done
+    out.extend([0x48, 0x8b, 0x7a, 0x08]); // mov rdi, [rdx+8] (heap_len)
+    out.extend([0x48, 0x85, 0xff]); // test rdi, rdi
+    push_jcc(out, &mut done_fixups, 0x84); // jz done
+
+    // rsi = heap_start; rcx = dst.saturating_add(len)
+    out.extend([0x48, 0x8b, 0x32]); // mov rsi, [rdx]
+    out.extend([0x48, 0x01, 0xc1]); // add rcx, rax
+    out.extend([0x73, 0x07]); // jnc +7
+    out.extend([0x48, 0xc7, 0xc1, 0xff, 0xff, 0xff, 0xff]); // mov rcx, -1
+
+    // if end <= heap_start -> done
+    out.extend([0x48, 0x39, 0xf1]); // cmp rcx, rsi
+    push_jcc(out, &mut done_fixups, 0x86); // jbe done
+    // rdi = heap_end = heap_start + heap_len; if dst >= heap_end -> done
+    out.extend([0x48, 0x01, 0xf7]); // add rdi, rsi
+    out.extend([0x48, 0x39, 0xf8]); // cmp rax, rdi
+    push_jcc(out, &mut done_fixups, 0x83); // jae done
+
+    // Clamp lo = max(dst, heap_start), hi = min(end, heap_end)
+    out.extend([0x48, 0x39, 0xf0]); // cmp rax, rsi
+    out.extend([0x48, 0x0f, 0x42, 0xc6]); // cmovb rax, rsi
+    out.extend([0x48, 0x39, 0xf9]); // cmp rcx, rdi
+    out.extend([0x48, 0x0f, 0x47, 0xcf]); // cmova rcx, rdi
+
+    // Inclusive slot indices: first_slot = (lo - start) >> 5, last_slot = (hi - 1 - start) >> 5
+    out.extend([0x48, 0x29, 0xf0]); // sub rax, rsi
+    out.extend([0x48, 0x29, 0xf1]); // sub rcx, rsi
+    out.extend([0x48, 0xff, 0xc9]); // dec rcx
+    out.extend([0x48, 0xc1, 0xe8, 0x05]); // shr rax, 5 (first_slot)
+    out.extend([0x48, 0xc1, 0xe9, 0x05]); // shr rcx, 5 (last_slot)
+
+    // Save first_slot in rsi and last_slot on stack for chunk pass
+    out.extend([0x48, 0x89, 0xc6]); // mov rsi, rax
+    out.push(0x51); // push rcx
+
+    // Bulk mark MARKS.slots[first_slot..=last_slot] = 1
+    out.extend([0x48, 0x29, 0xc1]); // sub rcx, rax
+    out.extend([0x48, 0xff, 0xc1]); // inc rcx
+    out.extend([0x48, 0x8b, 0x7a, 0x10]); // mov rdi, [rdx+16] (MARKS.slots)
+    out.extend([0x48, 0x01, 0xc7]); // add rdi, rax
+    out.extend([0xb0, 0x01]); // mov al, 1
+    out.extend([0xf3, 0xaa]); // rep stosb
+
+    // Bulk mark MARKS.chunks[(first_slot >> 7)..=(last_slot >> 7)] = 1 (after slots)
+    out.push(0x59); // pop rcx (last_slot)
+    out.extend([0x48, 0xc1, 0xee, 0x07]); // shr rsi, 7 (first_chunk)
+    out.extend([0x48, 0xc1, 0xe9, 0x07]); // shr rcx, 7 (last_chunk)
+    out.extend([0x48, 0x29, 0xf1]); // sub rcx, rsi
+    out.extend([0x48, 0xff, 0xc1]); // inc rcx
+    out.extend([0x48, 0x8b, 0x7a, 0x18]); // mov rdi, [rdx+24] (MARKS.chunks)
+    out.extend([0x48, 0x01, 0xf7]); // add rdi, rsi
+    out.extend([0xb0, 0x01]); // mov al, 1
+    out.extend([0xf3, 0xaa]); // rep stosb
+
+    let done_at = out.len();
+    for pos in done_fixups {
+        let rel = i32::try_from((done_at as isize) - ((pos + 4) as isize)).ok()?;
+        out[pos..pos + 4].copy_from_slice(&rel.to_le_bytes());
+    }
+    out.extend([0x5e, 0x5f, 0x5a, 0x59, 0x58]); // pop rsi ; pop rdi ; pop rdx ; pop rcx ; pop rax
+    out.push(0x9d); // popfq
+    Some(())
 }
 
 fn target_of(store: &[u8]) -> Option<StoreTarget> {
@@ -220,41 +306,36 @@ fn stub(store: &[u8], at: usize, to: usize, marks: usize) -> Option<Vec<u8>> {
             out.push(0x9d); // popfq
         }
         StoreTarget::BaseReg { mov_rax, slots } => {
-            out.push(0x9c); // pushfq
-            out.extend([0x50, 0x52, 0x51, 0x56]); // push rax ; push rdx ; push rcx ; push rsi
-            out.extend([0x48, 0xba]); // mov rdx, marks
-            out.extend((marks as u64).to_le_bytes());
-            out.extend(mov_rax); // mov rax, base_reg
-            out.extend([0x48, 0x2b, 0x02]); // sub rax, [rdx]
-            out.extend([0x48, 0x3b, 0x42, 0x08]); // cmp rax, [rdx+8]
-            let jae_outer = out.len();
-            out.extend([0x73, 0x00]); // jae done (patched below)
-            out.extend([0xbe, slots, 0x00, 0x00, 0x00]); // mov esi, slots
-            let loop_top = out.len();
-            out.extend([0x48, 0x3b, 0x42, 0x08]); // cmp rax, [rdx+8]
-            let jae_inner = out.len();
-            out.extend([0x73, 0x00]); // jae done (patched below)
-            out.extend([0x48, 0x89, 0xc1]); // mov rcx, rax
-            out.extend([0x48, 0xc1, 0xe9, 0x05]); // shr rcx, 5: the slot
-            out.push(0x50); // push rax
-            out.extend([0x48, 0x8b, 0x42, 0x10]); // mov rax, [rdx+16]
-            out.extend([0xc6, 0x04, 0x08, 0x01]); // mov byte [rax+rcx], 1
-            out.extend([0x48, 0xc1, 0xe9, 0x07]); // shr rcx, 7: the chunk
-            out.extend([0x48, 0x8b, 0x42, 0x18]); // mov rax, [rdx+24]
-            out.extend([0xc6, 0x04, 0x08, 0x01]); // mov byte [rax+rcx], 1
-            out.push(0x58); // pop rax
-            out.extend([0x48, 0x83, 0xc0, 0x20]); // add rax, 32
-            out.extend([0xff, 0xce]); // dec esi
-            let jnz_at = out.len();
-            let back_rel = (loop_top as isize) - ((jnz_at + 2) as isize);
-            out.extend([0x75, i8::try_from(back_rel).ok()? as u8]); // jnz loop_top
-            let done_at = out.len();
-            out[jae_outer + 1] = u8::try_from(done_at - (jae_outer + 2)).ok()?;
-            out[jae_inner + 1] = u8::try_from(done_at - (jae_inner + 2)).ok()?;
-            out.extend([0x5e, 0x59, 0x5a, 0x58]); // pop rsi ; pop rcx ; pop rdx ; pop rax
-            out.push(0x9d); // popfq
+            let bytes = u32::from(slots) * 32;
+            emit_bulk_range_mark(&mut out, marks, |code| {
+                code.extend(mov_rax); // mov rax, base_reg
+                code.push(0xb9); // mov ecx, slots * 32
+                code.extend(bytes.to_le_bytes());
+            })?;
         }
     }
+    let back = crate::console_insn::jump(to + out.len(), at + store.len())?;
+    out.extend(back);
+    Some(out)
+}
+
+/// Builds a bulk-range marking trampoline for a hooked `memcpy`/`memmove`-style
+/// store sequence whose destination is moved to `rax` by `dst_mov_rax` and byte
+/// length is moved to `rcx` by `len_mov_rcx` (`rep stosb` on `MARKS.slots` + `MARKS.chunks`).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn bulk_range_stub(
+    store: &[u8],
+    dst_mov_rax: [u8; 3],
+    len_mov_rcx: [u8; 3],
+    at: usize,
+    to: usize,
+    marks: usize,
+) -> Option<Vec<u8>> {
+    let mut out = store.to_vec();
+    emit_bulk_range_mark(&mut out, marks, |code| {
+        code.extend(dst_mov_rax);
+        code.extend(len_mov_rcx);
+    })?;
     let back = crate::console_insn::jump(to + out.len(), at + store.len())?;
     out.extend(back);
     Some(out)
@@ -589,6 +670,100 @@ mod tests {
                 assert_eq!((dst.add(8) as *const u64).read_unaligned(), 0x1234_5678);
                 assert_eq!(slots[300], 1);
                 assert_eq!(chunks[300 / 128], 1);
+            }
+            drop(marks);
+        }
+    }
+
+    /// Verifies bulk-range JIT trampolines (`bulk_range_stub` and unaligned Site 6
+    /// 4x32B block store) mark exact slots and chunks across chunk boundaries,
+    /// handle partial overlaps / zero length / out-of-heap addresses, and preserve
+    /// flags and registers.
+    #[test]
+    fn bulk_range_stub_marks_exact_slots_and_chunks() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc};
+        // SAFETY: fresh RWX buffers exclusively for this test.
+        unsafe {
+            let heap = VirtualAlloc(std::ptr::null(), 0x20000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) as *mut u8;
+            assert!(!heap.is_null());
+            let (mut slots, mut chunks) = (vec![0u8; 0x8000 / 32], vec![0u8; 0x8000 / 32 / 128]);
+            let marks = Box::new(Marks {
+                start: heap as u64 + 0x2000,
+                len: 0x8000,
+                slots: slots.as_mut_ptr(),
+                chunks: chunks.as_mut_ptr(),
+            });
+
+            // 1) Unaligned Site 6 (+0x4d9f25f): 128 bytes starting at slot 126 + 16 bytes
+            //    touches 5 slots (126..=130) across chunk 0 and chunk 1.
+            {
+                let site = &SITES[6];
+                let place = VirtualAlloc(std::ptr::null(), 0x10000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) as usize;
+                let mut code: Vec<u8> = Vec::new();
+                code.extend([0x53, 0x41, 0x54]); // push rbx ; push r12
+                code.extend([0x48, 0x89, 0xcb]); // mov rbx, rcx
+                code.extend([0x49, 0x89, 0xd4]); // mov r12, rdx
+                code.extend([0xc4, 0xc1, 0x7c, 0x10, 0x04, 0x24]); // vmovups ymm0, [r12]
+                let win_at = code.len();
+                code.extend(site.bytes);
+                code.extend([0x41, 0x5c, 0x5b]); // pop r12 ; pop rbx
+                code.extend([0xc5, 0xf8, 0x77, 0xc3]); // vzeroupper ; ret
+                let entry = place + 0x200 - win_at;
+                std::ptr::copy_nonoverlapping(code.as_ptr(), entry as *mut u8, code.len());
+                let mine = [Site { window: 0x200, ..*site }];
+                assert_eq!(apply(place, 0x10000, &raw const *marks as usize, &mine), [Hooked::Done]);
+                let f: unsafe extern "system" fn(*mut u8, *const u8) = std::mem::transmute(entry);
+                let src = [0x3Cu8; 128];
+                let dst = heap.add(0x2000 + 126 * 32 + 16);
+                f(dst, src.as_ptr());
+                for s in 126..=130 {
+                    assert_eq!(slots[s], 1, "unaligned 128B write must mark slot {s}");
+                }
+                assert_eq!(slots.iter().filter(|&&b| b != 0).count(), 5);
+                assert_eq!(chunks[0], 1);
+                assert_eq!(chunks[1], 1);
+            }
+
+            // 2) Dynamic `bulk_range_stub`: fn(dst: rcx, len: rdx) -> r8 (sentinel preserved).
+            {
+                let place = VirtualAlloc(std::ptr::null(), 0x10000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) as usize;
+                // Code at place+0x100: 5-byte nop placeholder patched to jump to bulk_range_stub, then `mov rax, r8; ret`.
+                let at = place + 0x100;
+                let to = place + 0x400;
+                let store = [0x90u8; 5]; // 5-byte no-op store
+                // mov rax, rcx (48 89 c8) ; mov rcx, rdx (48 89 d1)
+                let body = bulk_range_stub(&store, [0x48, 0x89, 0xc8], [0x48, 0x89, 0xd1], at, to, &raw const *marks as usize)
+                    .expect("bulk_range_stub");
+                let jmp = crate::console_insn::jump(at, to).unwrap();
+                std::ptr::copy_nonoverlapping(body.as_ptr(), to as *mut u8, body.len());
+                std::ptr::copy_nonoverlapping(jmp.as_ptr(), at as *mut u8, jmp.len());
+                // After patch at+5: `mov rax, r8; ret` (4c 89 c0 c3)
+                std::ptr::copy_nonoverlapping([0x4c, 0x89, 0xc0, 0xc3].as_ptr(), (at + 5) as *mut u8, 4);
+                let f: unsafe extern "system" fn(u64, u64, u64) -> u64 = std::mem::transmute(at);
+
+                // Range crossing chunk boundary: slots 125..=132 (8 slots = 256 bytes).
+                slots.fill(0);
+                chunks.fill(0);
+                assert_eq!(f(marks.start + 125 * 32, 256, 0xDEAD_BEEF), 0xDEAD_BEEF);
+                for s in 125..=132 {
+                    assert_eq!(slots[s], 1, "slot {s} must be marked");
+                }
+                assert_eq!(slots.iter().filter(|&&b| b != 0).count(), 8);
+                assert_eq!(chunks[0], 1);
+                assert_eq!(chunks[1], 1);
+
+                // Zero length marks nothing.
+                slots.fill(0);
+                chunks.fill(0);
+                assert_eq!(f(marks.start + 10 * 32, 0, 0xCAFE), 0xCAFE);
+                assert!(slots.iter().chain(&chunks).all(|&b| b == 0));
+
+                // Partially overlapping start of heap marks slots 0..=1 only.
+                assert_eq!(f(marks.start - 32, 65, 0x1234), 0x1234);
+                assert_eq!(slots[0], 1);
+                assert_eq!(slots[1], 1);
+                assert_eq!(slots.iter().filter(|&&b| b != 0).count(), 2);
+                assert_eq!(chunks[0], 1);
             }
             drop(marks);
         }

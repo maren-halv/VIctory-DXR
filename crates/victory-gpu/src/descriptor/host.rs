@@ -732,6 +732,11 @@ pub(crate) struct HostHeap {
     pub(crate) buffer_sweep: Mutex<crate::draw::BufferSweep>,
     pub(crate) buffer_frame: std::sync::atomic::AtomicU64,
     pub(crate) heap: ID3D12DescriptorHeap,
+    /// Guest base address of slot 0 in the title's view heap (lazily captured
+    /// from `mirror` / `mirror_batch`; 0 until seen). Used by
+    /// [`HostHeap::unpin_stale_window_slots`] to safely revalidate guest
+    /// descriptor bytes before unpinning dead loose windows (Spec-Trap #16).
+    title_start: std::sync::atomic::AtomicU64,
     cpu: usize,
     gpu: u64,
     step: u32,
@@ -2467,6 +2472,7 @@ impl HostHeap {
             buffer_sweep: Mutex::default(),
             buffer_frame: std::sync::atomic::AtomicU64::new(u64::MAX),
             heap,
+            title_start: std::sync::atomic::AtomicU64::new(0),
             cpu,
             gpu,
             step,
@@ -4436,6 +4442,108 @@ impl HostHeap {
         self.resources.lock().unwrap_or_else(|e| e.into_inner()).clone_of(id)
     }
 
+    /// Records the guest base address of slot 0 on first view-heap mirror.
+    #[inline]
+    fn note_title_start(&self, index: u32, handle: u64) {
+        if !self.sampler && self.title_start.load(Ordering::Relaxed) == 0
+            && let Some(base) = handle.checked_sub(u64::from(index) * 32)
+            && base != 0
+        {
+            self.title_start.store(base, Ordering::Release);
+        }
+    }
+
+    /// Safe stale-slot revalidation unpinning (`Spec-Trap #16` & `Spec-Trap #4`):
+    ///
+    /// For each candidate `(raw_buffer, win_start, win_len, last_used_frame)` whose
+    /// window has been idle for `>= STALE_WINDOW_IDLE_FRAMES` (`300` frames), inspects
+    /// only title-heap slots (`0..self.count`) currently pinning `raw_buffer`.
+    /// Reads the guest descriptor's current bytes in Xbox RAM via `safecopy`
+    /// (bypassing / never tripping `PAGE_NOACCESS` tripwires per Spec-Trap #4) and
+    /// compares the current guest descriptor's VA/length against `[win_start, win_start + win_len)`.
+    ///
+    /// ONLY if the guest has ALREADY overwritten or zeroed that descriptor slot so
+    /// it no longer references `[win_start, win_start + win_len)` (a provably dead
+    /// slot) does this method null the host descriptor slot + raw twin and retire
+    /// the COM reference (Null-Before-Retire). Live bindless slots are NEVER touched.
+    pub(crate) fn unpin_stale_window_slots(
+        &self,
+        candidates: &[(usize, u64, u64, u64)],
+        now_frame: u64,
+        heap_start_override: Option<u64>,
+    ) -> usize {
+        if self.sampler || candidates.is_empty() {
+            return 0;
+        }
+        let heap_start = heap_start_override.unwrap_or_else(|| self.title_start.load(Ordering::Acquire));
+        if heap_start == 0 {
+            return 0;
+        }
+        let work: Vec<(usize, u64, u64, Vec<u32>)> = {
+            let ws = self.window_slots.lock().unwrap_or_else(|e| e.into_inner());
+            if ws.is_empty() {
+                return 0;
+            }
+            candidates
+                .iter()
+                .filter_map(|&(raw, win_start, win_len, last_used_frame)| {
+                    if win_len == 0
+                        || now_frame.saturating_sub(last_used_frame) < STALE_WINDOW_IDLE_FRAMES
+                    {
+                        return None;
+                    }
+                    ws.get(&raw)
+                        .map(|slots| (raw, win_start, win_len, slots.clone()))
+                })
+                .collect()
+        };
+        if work.is_empty() {
+            return 0;
+        }
+        let mut unpinned = 0usize;
+        for (raw, win_start, win_len, slots) in work {
+            for slot in slots {
+                if slot >= self.count {
+                    continue;
+                }
+                let Some(guest_handle) = heap_start.checked_add(u64::from(slot) * 32) else {
+                    continue;
+                };
+                // Quick unlocked pre-check before acquiring the per-slot lock:
+                // skip immediately if guest RAM cannot be safely read or still references the window.
+                if !guest_slot_proven_stale(guest_handle, win_start, win_len) {
+                    continue;
+                }
+                let _made = self.made.lock(slot);
+                if !self.window_slot_bits.get(slot as usize) || self.kept_raw_at(slot) != raw {
+                    continue;
+                }
+                // Re-verify under the slot lock so a concurrent overwrite back to
+                // this window is never erroneously nulled (Spec-Trap #16).
+                if !guest_slot_proven_stale(guest_handle, win_start, win_len) {
+                    continue;
+                }
+                // MANDATORY NULL-BEFORE-RETIRE (Spec-Trap #16):
+                // Clear quick/made caches, overwrite shader-visible slot + raw twin
+                // with `null_buffer_view` FIRST, then retire COM ref via `keep_title_owned`.
+                self.quick_is(slot, 0);
+                self.made.set(slot, 0);
+                if !self.copy_cached_null(slot, 1) {
+                    null_buffer_view(self.at(slot));
+                    self.put(slot);
+                }
+                self.clear_twin(slot);
+                self.write_stride(slot, 0, 0);
+                self.keep_title_owned(slot, None, false);
+                unpinned += 1;
+            }
+        }
+        if unpinned > 0 {
+            bump_buffer_view_cache_epoch();
+        }
+        unpinned
+    }
+
     /// Unpins title-heap descriptor slots (`0..self.count`) referencing any of
     /// `raw_buffers` (`window == true` loose shadows) using the mandatory
     /// Null-Before-Retire protocol (`ARCH-05`, Spec-Trap #16):
@@ -5255,6 +5363,9 @@ impl HostHeap {
             results.resize_with(items.len(), || (0, None, None, false));
         }
         let quick_on = quick_mirror();
+        if let Some(&(index, handle, _)) = items.first() {
+            self.note_title_start(index, handle);
+        }
         for (chunk_start, chunk) in items.chunks(MINI).enumerate().map(|(c, s)| (c * MINI, s)) {
             // Decode records, pre-fetch old views for non-draw overwrites, and handle
             // lock-free quick hits under a single `VIEWS.read()`.
@@ -5566,6 +5677,7 @@ impl HostHeap {
             }
             return None;
         }
+        self.note_title_start(index, handle);
         // SAFETY: the handle is a descriptor slot in title memory.
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
@@ -9019,6 +9131,92 @@ mod tests {
     }
 }
 
+/// Minimum idle age (in frames) before a loose window's pinning descriptor
+/// slots are eligible for safe guest-RAM stale-slot revalidation (`Spec-Trap #16`).
+pub(crate) const STALE_WINDOW_IDLE_FRAMES: u64 = 300;
+
+#[inline]
+fn ranges_overlap(a_start: u64, a_len: u64, b_start: u64, b_len: u64) -> bool {
+    if b_len == 0 {
+        return false;
+    }
+    let a_end = a_start.saturating_add(a_len.max(1));
+    let b_end = b_start.saturating_add(b_len);
+    a_start < b_end && b_start < a_end
+}
+
+/// Safely reads the first 12 bytes (`[tag, index, generation]`) of a 32-byte
+/// guest descriptor record in Xbox RAM without faulting or tripping a Mode-1/2
+/// `PAGE_NOACCESS` tripwire (`Spec-Trap #4`). Returns `None` if the address is
+/// null, tripwired, or unreadable.
+fn safe_read_guest_descriptor_words(addr: u64) -> Option<[u32; 3]> {
+    if addr == 0 {
+        return None;
+    }
+    if crate::shadow::is_tripwired(addr as usize, 32) {
+        return None;
+    }
+    let mut bytes = [0u8; 32];
+    if crate::safecopy::on() {
+        // SAFETY: `bytes` is a valid stack buffer; `safecopy::copy` catches
+        // any fault reading `addr` and never disarms shadow tripwires.
+        if !unsafe { crate::safecopy::copy(bytes.as_mut_ptr(), addr as *const u8, bytes.len()) } {
+            return None;
+        }
+    } else if !crate::host::read_into(addr as *const u8, &mut bytes) {
+        return None;
+    }
+    Some([
+        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+        u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+        u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
+    ])
+}
+
+/// Returns `true` if `view` references any address overlapping
+/// `[win_start, win_start + win_len)`.
+fn view_references_window(view: &View, win_start: u64, win_len: u64) -> bool {
+    if win_len == 0 {
+        return false;
+    }
+    if let Some((addr, len)) = buffer_range(view)
+        && ranges_overlap(addr, len, win_start, win_len)
+    {
+        return true;
+    }
+    if let Some((base, width)) = buffer_extent(view)
+        && ranges_overlap(base, width, win_start, win_len)
+    {
+        return true;
+    }
+    match view {
+        View::Constant(addr, size) => ranges_overlap(*addr, u64::from(*size), win_start, win_len),
+        View::Placed(_, _, desc) => {
+            let at = u64::from(desc[10]) | (u64::from(desc[11]) << 32);
+            at != 0 && ranges_overlap(at, 1, win_start, win_len)
+        }
+        _ => view_address(view)
+            .is_some_and(|at| at != 0 && ranges_overlap(at, 1, win_start, win_len)),
+    }
+}
+
+/// Returns `true` ONLY when `guest_handle` is safely readable in guest RAM AND
+/// has provably been zeroed, freed, or overwritten so it no longer references
+/// `[win_start, win_start + win_len)`. Any read failure or tripwire returns
+/// `false` (conservative: never speculatively null a slot).
+fn guest_slot_proven_stale(guest_handle: u64, win_start: u64, win_len: u64) -> bool {
+    let Some([tag, i, generation]) = safe_read_guest_descriptor_words(guest_handle) else {
+        return false;
+    };
+    if tag != VIEW_TAG {
+        return true;
+    }
+    match super::view_at(i, generation) {
+        None => true,
+        Some(view) => !view_references_window(&view, win_start, win_len),
+    }
+}
+
 /// Unpins title-heap descriptor slots referencing idle `window == true` loose
 /// shadow buffers (`raw_buffers` = `buffer.as_raw() as usize`), enforcing the
 /// Null-Before-Retire protocol (`ARCH-05`, Spec-Trap #16) so `shadow::let_go_idle`
@@ -9030,6 +9228,22 @@ pub(crate) fn unpin_idle_window_slots(raw_buffers: &[usize]) -> usize {
     super::with_view_heap(|host| host.unpin_window_buffers(raw_buffers)).unwrap_or(0)
 }
 
+/// Safely revalidates and unpins provably stale title-heap descriptor slots
+/// pinning idle (`>= 300` frames) loose windows (`(raw_buffer, win_start,
+/// win_len, last_used_frame)`). Callable when `l0_loose` exceeds
+/// `VICTORY_WINDOW_BUDGET_MB` (`Spec-Trap #16` & `Spec-Trap #4`).
+#[allow(dead_code)]
+pub(crate) fn unpin_stale_window_slots(
+    candidates: &[(usize, u64, u64, u64)],
+    now_frame: u64,
+) -> usize {
+    if candidates.is_empty() {
+        return 0;
+    }
+    super::with_view_heap(|host| host.unpin_stale_window_slots(candidates, now_frame, None))
+        .unwrap_or(0)
+}
+
 /// Global epoch invalidating per-thread [`ListViews`] texture CPU descriptor
 /// caches whenever host backing textures/views change (mip growth, ahead flip).
 static VIEW_CACHE_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -9037,6 +9251,16 @@ static VIEW_CACHE_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 /// Separate epoch for buffer/TLAS entries in [`ListViews`] so texture mip flips
 /// and `resource::let_go_idle` sweeps do not wipe cached buffer descriptors (`CPU-23`).
 static BUFFER_VIEW_CACHE_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Current `(texture_view_epoch, buffer_view_epoch)` pair used by
+/// `draw::State::last_stage_tables` to detect descriptor-heap invalidations.
+#[inline]
+pub(crate) fn view_cache_epochs() -> (u64, u64) {
+    (
+        VIEW_CACHE_EPOCH.load(std::sync::atomic::Ordering::Acquire),
+        BUFFER_VIEW_CACHE_EPOCH.load(std::sync::atomic::Ordering::Acquire),
+    )
+}
 
 #[inline]
 pub(crate) fn bump_view_cache_epoch() {
@@ -9764,5 +9988,129 @@ mod dynamic_pool_tests {
         // Second call is an O(1) no-op.
         assert_eq!(heap.unpin_window_buffers(&[win_raw]), 0);
         heap.release(heap.id(), dyn_slot, 1);
+    }
+
+    #[test]
+    fn unpin_stale_window_slots_never_nulls_live_guest_slot_and_unpins_overwritten_or_zeroed_slots() {
+        use super::{HostHeap, Ordering, STALE_WINDOW_IDLE_FRAMES, View, host};
+        use windows::core::Interface;
+
+        let Some(h) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 16) else {
+            return;
+        };
+        let Some((win_buf, _)) = h.shared_buffer(4096) else {
+            return;
+        };
+        let Some((keep_buf, _)) = h.shared_buffer(4096) else {
+            return;
+        };
+        let win_raw = win_buf.as_raw() as usize;
+        let keep_raw = keep_buf.as_raw() as usize;
+
+        // Backing guest descriptor heap memory (16 x 32-byte slots).
+        let mut guest_heap = vec![0u32; 16 * 8];
+        let guest_base = guest_heap.as_mut_ptr() as u64;
+
+        let win_start = 0x7000_1000_0000u64;
+        let win_len = 0x40_0000u64;
+        let other_start = 0x7000_9000_0000u64;
+
+        let placed_buf_view = |addr: u64, bytes: u32| {
+            let mut desc = [0u32; 16];
+            desc[0] = 0; // UNKNOWN (structured)
+            desc[1] = 1; // BUFFER
+            desc[2] = 5768;
+            desc[5] = bytes / 16; // NumElements
+            desc[6] = 16; // StructureByteStride
+            desc[10] = addr as u32;
+            desc[11] = (addr >> 32) as u32;
+            let mut res = [0u32; 14];
+            res[0] = 1; // BUFFER
+            res[4] = bytes;
+            View::Placed(false, res, desc)
+        };
+
+        // Slot 2: LIVE guest descriptor still pointing into `[win_start, win_start + win_len)`.
+        crate::descriptor::record(guest_base + 2 * 32, placed_buf_view(win_start + 0x1000, 4096));
+        heap.made.set(2, 0x2002);
+        heap.quick_is(2, 0x2002);
+        heap.keep_window(2, Some(win_buf.clone()), true);
+
+        // Slot 3: STALE guest descriptor ZEROED by the title.
+        // (`guest_heap` bytes at slot 3 are already all 0 != VIEW_TAG.)
+        heap.made.set(3, 0x2003);
+        heap.quick_is(3, 0x2003);
+        heap.twins.set(3, true);
+        heap.keep_window(3, Some(win_buf.clone()), true);
+
+        // Slot 4: STALE guest descriptor OVERWRITTEN to point to a different VA outside the window.
+        crate::descriptor::record(guest_base + 4 * 32, placed_buf_view(other_start, 4096));
+        heap.made.set(4, 0x2004);
+        heap.quick_is(4, 0x2004);
+        heap.keep_window(4, Some(win_buf.clone()), true);
+
+        // Slot 5: non-window slot (must never be touched).
+        heap.made.set(5, 0x2005);
+        heap.quick_is(5, 0x2005);
+        heap.keep_window(5, Some(keep_buf.clone()), false);
+
+        // 1) Window idle for < 300 frames: NOTHING is unpinned (even zeroed slot 3).
+        let young = [(win_raw, win_start, win_len, 500u64)];
+        assert_eq!(
+            heap.unpin_stale_window_slots(&young, 500 + STALE_WINDOW_IDLE_FRAMES - 1, Some(guest_base)),
+            0
+        );
+        assert_eq!(heap.kept_raw_at(3), win_raw);
+        assert_eq!(heap.kept_raw_at(4), win_raw);
+
+        // 2) Window idle for >= 300 frames:
+        //    - Slot 2 (still references `win_start + 0x1000`) MUST stay intact! (Spec-Trap #16)
+        //    - Slot 3 (zeroed) and Slot 4 (overwritten to `other_start`) MUST be unpinned cleanly!
+        let epoch_before = super::BUFFER_VIEW_CACHE_EPOCH.load(Ordering::Acquire);
+        let idle = [
+            (win_raw, win_start, win_len, 100u64),
+            (keep_raw, win_start, win_len, 100u64),
+        ];
+        let unpinned = heap.unpin_stale_window_slots(&idle, 100 + STALE_WINDOW_IDLE_FRAMES, Some(guest_base));
+        assert_eq!(unpinned, 2);
+        assert!(super::BUFFER_VIEW_CACHE_EPOCH.load(Ordering::Acquire) > epoch_before);
+
+        // Live bindless slot 2 MUST NEVER be nulled.
+        assert_eq!(heap.made.get(2), Some(0x2002));
+        assert_eq!(heap.quick.get(2, Ordering::Acquire), Some(0x2002));
+        assert_eq!(heap.kept_raw_at(2), win_raw);
+        assert!(heap.window_slot_bits.get(2));
+
+        // Provably stale slots 3 (zeroed) and 4 (overwritten) MUST be nulled-before-retire.
+        for slot in [3u32, 4] {
+            assert_eq!(heap.made.get(slot), Some(0));
+            assert_eq!(heap.quick.get(slot as usize, Ordering::Acquire), Some(0));
+            assert_eq!(heap.kept_raw_at(slot), 0);
+            assert!(!heap.twins.get(slot as usize));
+            assert!(!heap.window_slot_bits.get(slot as usize));
+            assert_eq!(heap.null_kind.get(slot as usize), Some(2));
+        }
+
+        // Non-window slot 5 untouched.
+        assert_eq!(heap.made.get(5), Some(0x2005));
+        assert_eq!(heap.kept_raw_at(5), keep_raw);
+
+        // Repeating revalidation with slot 2 still live does nothing.
+        assert_eq!(
+            heap.unpin_stale_window_slots(&idle, 1000, Some(guest_base)),
+            0
+        );
+        assert_eq!(heap.kept_raw_at(2), win_raw);
+
+        // Once guest overwrites slot 2 to zero, revalidation unpins it cleanly too.
+        guest_heap[2 * 8..2 * 8 + 8].fill(0);
+        assert_eq!(
+            heap.unpin_stale_window_slots(&idle, 1000, Some(guest_base)),
+            1
+        );
+        assert_eq!(heap.kept_raw_at(2), 0);
     }
 }

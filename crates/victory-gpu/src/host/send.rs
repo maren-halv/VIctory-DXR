@@ -132,9 +132,10 @@ static SPARE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// Number of buffers currently retained in [`SPARE`].
 static SPARE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// Default [`SPARE`] retention cap in MiB (`64 MiB` for both BAR and L0,
-/// replacing the `192–256 MiB` largest-first cache; `ARCH-05`).
-const DEFAULT_SPARE_MB: u64 = 64;
+/// Default [`SPARE`] retention cap in MiB (`192 MiB`, holding two in-flight
+/// frames of 40–75 MiB submissions so `send::memory` never churns BAR/L0
+/// `CreateCommittedResource` allocations or triggers OS page-fault storms).
+const DEFAULT_SPARE_MB: u64 = 192;
 
 fn resolve_kept_bytes(env: Option<&str>) -> u64 {
     let mb = env
@@ -222,6 +223,16 @@ fn on_card() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_SEND_BAR").is_some_and(|v| v == "1"))
 }
 
+fn bucket_size(size: u64) -> u64 {
+    // Power-of-two below 4 MiB (512 KiB, 1, 2, 4 MiB), then 4 MiB steps so a
+    // 33 MiB submission allocates 36 MiB instead of rounding up to 64 MiB.
+    if size <= 4 << 20 {
+        size.max(512 << 10).next_power_of_two()
+    } else {
+        size.next_multiple_of(4 << 20)
+    }
+}
+
 fn memory(host: &Host, size: u64) -> Option<Memory> {
     {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
@@ -239,15 +250,18 @@ fn memory(host: &Host, size: u64) -> Option<Memory> {
             return Some(mem);
         }
     }
-    // By doubles from 512 KiB (average flight sends ~1-2 MiB), so small flights
-    // don't pin 8 MiB BAR buffers and overflow `kept()`.
-    let size = size.max(512 << 10).next_power_of_two();
-    let mapped = if on_card() { host.mapped_card_buffer(size, false) } else { None };
+    let alloc_t = std::time::Instant::now();
+    let size = bucket_size(size);
+    // Internal non-bindless BAR staging: skips `CREATE_NOT_RESIDENT` /
+    // `MakeResident` / paging-fence stalls (identical to `upload_buffer`).
+    let mapped = if on_card() { host.internal_mapped_card_buffer(size) } else { None };
     let (buffer, data) = match mapped {
         Some(made) => made,
         None => host.upload_buffer(size)?,
     };
     name(&buffer, || "bytes a submission sends up".into());
+    STATS[4].fetch_add(1, Ordering::Relaxed);
+    STATS[5].fetch_add(alloc_t.elapsed().as_micros() as u64, Ordering::Relaxed);
     Some(Memory {
         buffer,
         data: data as usize,
@@ -285,9 +299,10 @@ pub(super) fn give_back(mut memory: Memory) {
     }
 }
 
-/// Since the last frame-rate line: bytes copied, runs copied, words stored,
-/// microseconds of taking them out of the CPU sides.
-pub(super) static STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+/// Since the last frame-rate line: `[0]` bytes copied, `[1]` runs copied,
+/// `[2]` words stored, `[3]` microseconds taking them out of CPU sides,
+/// `[4]` `memory()` cache-miss allocations, `[5]` microseconds spent allocating.
+pub(super) static STATS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
 /// One copy's sends: ranges copied (offset in the copy, in the memory,
 /// bytes), and its pairs (where in the memory, how many).
@@ -302,8 +317,115 @@ pub(super) struct Own {
     copies: Vec<Copy>,
 }
 
-/// Runs whose pairs are one piece of work.
-const RUNS_AT_A_TIME: usize = 4096;
+/// Minimum total staging payload bytes (`long copies + scatter pairs * 8`)
+/// required to fan out [`take`] across Tier-1 workers.
+const PARALLEL_MIN_BYTES: u64 = 256 << 10;
+/// Minimum scatter word-pair count required to fan out [`take`] across Tier-1 workers.
+const PARALLEL_MIN_PAIRS: u64 = 4_096;
+/// Target scatter pairs per parallel worker task (16 KiB output per task).
+const WORDS_PER_TASK: usize = 2_048;
+
+#[inline]
+fn should_parallelize_take(total_bytes: u64, total_words: u64) -> bool {
+    total_bytes.saturating_add(total_words.saturating_mul(8)) >= PARALLEL_MIN_BYTES
+        || total_words >= PARALLEL_MIN_PAIRS
+}
+
+enum StagingTask {
+    /// Pack `all_shorts[range_start..range_end]` from `from` into `to` as `[offset, word]` pairs.
+    Pairs {
+        from: usize,
+        range_start: usize,
+        range_end: usize,
+        to: usize,
+    },
+}
+
+/// Fills disjoint destination slices in the mapped staging buffer from long
+/// byte-copy `moves` and short word-pair `pair_groups`. Runs inline when
+/// `!parallel`, or fans out both copies and scatter-pair packing in a single
+/// Tier-1 worker dispatch when `parallel` is true.
+fn fill_staging(
+    moves: &[(usize, usize, usize)],
+    all_shorts: &[(usize, usize)],
+    pair_groups: &[(usize, std::ops::Range<usize>, usize)],
+    parallel: bool,
+) {
+    let pack_pairs = |from: usize, ranges: &[(usize, usize)], mut to: usize| {
+        let mut dst = to as *mut [u32; 2];
+        for &(a, b) in ranges {
+            for offset in (a..b).step_by(4) {
+                // SAFETY: inside the copy's CPU staging (sole writer during `take`)
+                // and inside this task's disjoint slice of the mapped staging buffer.
+                unsafe {
+                    let word = ((from + offset) as *const u32).read_unaligned();
+                    dst.write([offset as u32, word]);
+                    dst = dst.add(1);
+                }
+            }
+            to += ((b - a) / 4) * 8;
+        }
+        let _ = to;
+    };
+
+    if !parallel {
+        for &(from, ref span, dst) in pair_groups {
+            pack_pairs(from, &all_shorts[span.clone()], dst);
+        }
+        for &(src, dst, len) in moves {
+            if len > 0 {
+                // SAFETY: caller guarantees disjoint valid source and destination ranges.
+                unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len) };
+            }
+        }
+        return;
+    }
+
+    // Stream long copies sequentially on the caller thread so Write-Combining
+    // PCIe BAR bursts coalesce at full bus speed (splitting 64 KiB WC writes
+    // across `land::each_under` workers regresses `send::take` 2 ms -> 24 ms).
+    for &(src, dst, len) in moves {
+        if len > 0 {
+            // SAFETY: caller guarantees disjoint valid source and destination ranges.
+            unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len) };
+        }
+    }
+
+    let mut tasks: Vec<StagingTask> = Vec::with_capacity(pair_groups.len());
+    for &(from, ref span, dst_base) in pair_groups {
+        let mut cursor = span.start;
+        let mut to = dst_base;
+        while cursor < span.end {
+            let chunk_start = cursor;
+            let mut words = 0usize;
+            while cursor < span.end && (words == 0 || words < WORDS_PER_TASK) {
+                let (a, b) = all_shorts[cursor];
+                words += (b - a) / 4;
+                cursor += 1;
+            }
+            tasks.push(StagingTask::Pairs {
+                from,
+                range_start: chunk_start,
+                range_end: cursor,
+                to,
+            });
+            to += words * 8;
+        }
+    }
+
+    if tasks.len() < 2 {
+        for StagingTask::Pairs { from, range_start, range_end, to } in tasks {
+            pack_pairs(from, &all_shorts[range_start..range_end], to);
+        }
+        return;
+    }
+
+    let run_task = |i: usize| {
+        let StagingTask::Pairs { from, range_start, range_end, to } = tasks[i];
+        pack_pairs(from, &all_shorts[range_start..range_end], to);
+    };
+    crate::land::each_under(tasks.len(), &run_task);
+}
 
 /// Takes what `dirty` sends up out of the CPU sides.
 pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, usize)>)]) -> Option<Own> {
@@ -316,38 +438,25 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
     let mut total_words = 0u64;
     let mut copies = Vec::with_capacity(dirty.len());
     let mut all_shorts: Vec<(usize, usize)> = Vec::new();
-    let mut all_chunk_words: Vec<usize> = Vec::new();
-    let mut copy_short_spans: Vec<(std::ops::Range<usize>, std::ops::Range<usize>)> =
-        Vec::with_capacity(dirty.len());
+    let mut copy_short_spans: Vec<std::ops::Range<usize>> = Vec::with_capacity(dirty.len());
     for (_, ranges) in dirty {
         let mut runs = Vec::new();
         let short_start = all_shorts.len();
-        let chunk_start = all_chunk_words.len();
-        let mut cur_chunk_words = 0usize;
         let mut words = 0usize;
         for &(a, b) in ranges {
             let len = b - a;
             if short(a, len) {
-                let w = len / 4;
-                words += w;
-                cur_chunk_words += w;
+                words += len / 4;
                 all_shorts.push((a, b));
-                if (all_shorts.len() - short_start) % RUNS_AT_A_TIME == 0 {
-                    all_chunk_words.push(cur_chunk_words);
-                    cur_chunk_words = 0;
-                }
             } else {
                 runs.push((a, at, len));
                 total_bytes += len as u64;
                 at += (len as u64).next_multiple_of(16);
             }
         }
-        if cur_chunk_words > 0 {
-            all_chunk_words.push(cur_chunk_words);
-        }
         total_words += words as u64;
         copies.push(Copy { runs, pairs: (at, words as u32) });
-        copy_short_spans.push((short_start..all_shorts.len(), chunk_start..all_chunk_words.len()));
+        copy_short_spans.push(short_start..all_shorts.len());
         at += (words as u64 * 8).next_multiple_of(16);
     }
     if at == 0 {
@@ -355,10 +464,8 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
     }
     let memory = memory(host, at)?;
     let mut moves: Vec<(usize, usize, usize)> = Vec::new();
-    let mut work: Vec<(usize, &[(usize, usize)], usize)> = Vec::new();
-    for (((shadow, _), copy), (short_span, chunk_span)) in
-        dirty.iter().zip(&copies).zip(copy_short_spans)
-    {
+    let mut pair_groups: Vec<(usize, std::ops::Range<usize>, usize)> = Vec::new();
+    for (((shadow, _), copy), short_span) in dirty.iter().zip(&copies).zip(copy_short_spans) {
         for &(a, _, n) in &copy.runs {
             if !shadow.ensure_staging_committed(a, a + n) {
                 return None;
@@ -372,36 +479,14 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
         let from = shadow.card_data() as usize;
         moves.extend(copy.runs.iter().map(|&(a, to, n)| (from + a, memory.data + to as usize, n)));
         if !short_span.is_empty() {
-            // (80,000 runs of some words a frame: in pieces of work.)
-            let mut to = memory.data + copy.pairs.0 as usize;
-            for (chunk, &words) in all_shorts[short_span].chunks(RUNS_AT_A_TIME).zip(&all_chunk_words[chunk_span]) {
-                work.push((from, chunk, to));
-                to += words * 8;
-            }
+            pair_groups.push((from, short_span, memory.data + copy.pairs.0 as usize));
         }
     }
-    let one = |i: usize| {
-        let (from, ranges, to) = work[i];
-        let mut to = to as *mut [u32; 2];
-        for &(a, b) in ranges {
-            for offset in (a..b).step_by(4) {
-                // SAFETY: inside the copy's mapping (its CPU side, which
-                // the thread that asked, and waits, alone writes in these
-                // ranges) and inside the memory, which has room for every
-                // pair, a piece of work's behind the last one's.
-                unsafe {
-                    let word = ((from + offset) as *const u32).read_unaligned();
-                    to.write([offset as u32, word]);
-                    to = to.add(1);
-                }
-            }
-        }
-    };
-    crate::land::each_under(work.len(), &one);
+    let parallel = should_parallelize_take(total_bytes, total_words);
+    fill_staging(&moves, &all_shorts, &pair_groups, parallel);
     STATS[0].fetch_add(total_bytes, Ordering::Relaxed);
     STATS[1].fetch_add(moves.len() as u64, Ordering::Relaxed);
     STATS[2].fetch_add(total_words, Ordering::Relaxed);
-    crate::shadow::copy_all(moves);
     STATS[3].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
     Some(Own { memory, copies })
 }
@@ -485,16 +570,22 @@ impl Own {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_SPARE_MB, resolve_kept_bytes, select_spare_evictions};
+    use super::{
+        DEFAULT_SPARE_MB, PARALLEL_MIN_BYTES, PARALLEL_MIN_PAIRS, fill_staging, resolve_kept_bytes,
+        select_spare_evictions, short, should_parallelize_take,
+    };
 
     #[test]
-    fn spare_cap_defaults_to_64_mib_and_evicts_duplicates_then_lru() {
+    fn spare_cap_defaults_to_192_mib_and_evicts_duplicates_then_lru() {
         const MIB: u64 = 1 << 20;
         assert_eq!(resolve_kept_bytes(None), DEFAULT_SPARE_MB * MIB);
-        assert_eq!(DEFAULT_SPARE_MB, 64);
+        assert_eq!(DEFAULT_SPARE_MB, 192);
         assert_eq!(resolve_kept_bytes(Some("128")), 128 * MIB);
         assert_eq!(resolve_kept_bytes(Some("0")), 0);
-        assert_eq!(resolve_kept_bytes(Some("bad")), 64 * MIB);
+        assert_eq!(resolve_kept_bytes(Some("bad")), 192 * MIB);
+        assert_eq!(super::bucket_size(100 << 10), 512 << 10);
+        assert_eq!(super::bucket_size(3 << 20), 4 << 20);
+        assert_eq!(super::bucket_size(33 << 20), 36 << 20);
 
         // Two 16 MiB duplicates (ticks 1, 5), one recent 32 MiB bucket (tick 9),
         // and one 8 MiB bucket (tick 2): total 72 MiB > 64 MiB cap.
@@ -516,5 +607,128 @@ mod tests {
             (32 * MIB, 9),
         ];
         assert_eq!(select_spare_evictions(&unique, 40 * MIB), vec![0, 1]);
+    }
+
+    #[test]
+    fn parallel_send_take_matches_serial_bit_for_bit_and_honors_thresholds() {
+        assert!(!should_parallelize_take(PARALLEL_MIN_BYTES - 1, 0));
+        assert!(should_parallelize_take(PARALLEL_MIN_BYTES, 0));
+        assert!(!should_parallelize_take(0, PARALLEL_MIN_PAIRS - 1));
+        assert!(should_parallelize_take(0, PARALLEL_MIN_PAIRS));
+        assert!(should_parallelize_take(200 << 10, 8_192));
+
+        // Build 3 deterministic source buffers with mixed long copies (>256 B & unaligned)
+        // and >8,000 short scatter word pairs across multiple runs.
+        let make_src = |len: usize, seed: u8| -> Vec<u8> {
+            (0..len)
+                .map(|i| ((i.wrapping_mul(37).wrapping_add(seed as usize * 13)) ^ (i >> 5)) as u8)
+                .collect()
+        };
+        let src0 = make_src(512 << 10, 1);
+        let src1 = make_src(256 << 10, 2);
+        let src2 = make_src(128 << 10, 3);
+        let srcs = [&src0, &src1, &src2];
+
+        let mut per_buf_ranges: [Vec<(usize, usize)>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        // Buf 0: one large 300 KiB long copy + one odd unaligned 273 B copy + 200 short runs of 128 B (6,400 words).
+        per_buf_ranges[0].push((0, 300 << 10));
+        per_buf_ranges[0].push((301 << 10 | 3, (301 << 10 | 3) + 273));
+        for k in 0..200usize {
+            let off = (320 << 10) + k * 256;
+            per_buf_ranges[0].push((off, off + 128));
+        }
+        // Buf 1: 400 tiny 4-byte/16-byte/64-byte short runs + 2 medium long runs (1024 B, 70 KiB).
+        for k in 0..400usize {
+            let off = k * 128;
+            let len = match k % 3 {
+                0 => 4,
+                1 => 16,
+                _ => 64,
+            };
+            per_buf_ranges[1].push((off, off + len));
+        }
+        per_buf_ranges[1].push((100 << 10, (100 << 10) + 1024));
+        per_buf_ranges[1].push((120 << 10, (120 << 10) + (70 << 10)));
+        // Buf 2: 50 short runs of 256 B (3,200 words) + 1 unaligned 1001 B long copy.
+        for k in 0..50usize {
+            let off = k * 512;
+            per_buf_ranges[2].push((off, off + 256));
+        }
+        per_buf_ranges[2].push((64 << 10 | 1, (64 << 10 | 1) + 1001));
+
+        // Lay out destination offsets identically to `take()`.
+        let mut at = 0usize;
+        let mut all_shorts: Vec<(usize, usize)> = Vec::new();
+        let mut run_plans: Vec<Vec<(usize, usize, usize)>> = Vec::new();
+        let mut short_plans: Vec<(std::ops::Range<usize>, usize, usize)> = Vec::new();
+        let mut total_bytes = 0u64;
+        let mut total_words = 0u64;
+        for ranges in &per_buf_ranges {
+            let mut runs = Vec::new();
+            let short_start = all_shorts.len();
+            let mut words = 0usize;
+            for &(a, b) in ranges {
+                let len = b - a;
+                if short(a, len) {
+                    words += len / 4;
+                    all_shorts.push((a, b));
+                } else {
+                    runs.push((a, at, len));
+                    total_bytes += len as u64;
+                    at += len.next_multiple_of(16);
+                }
+            }
+            total_words += words as u64;
+            let pairs_at = at;
+            at += (words * 8).next_multiple_of(16);
+            run_plans.push(runs);
+            short_plans.push((short_start..all_shorts.len(), pairs_at, words));
+        }
+        assert!(should_parallelize_take(total_bytes, total_words));
+
+        let mut serial_buf = vec![0xCCu8; at];
+        let mut parallel_buf = vec![0xCCu8; at];
+
+        let run_into = |dst_buf: &mut [u8], parallel: bool| {
+            let dst_base = dst_buf.as_mut_ptr() as usize;
+            let mut moves = Vec::new();
+            let mut pair_groups = Vec::new();
+            for ((src, runs), (span, pairs_at, _)) in srcs.iter().zip(&run_plans).zip(&short_plans) {
+                let from = src.as_ptr() as usize;
+                for &(a, to, n) in runs {
+                    moves.push((from + a, dst_base + to, n));
+                }
+                if !span.is_empty() {
+                    pair_groups.push((from, span.clone(), dst_base + *pairs_at));
+                }
+            }
+            fill_staging(&moves, &all_shorts, &pair_groups, parallel);
+        };
+
+        run_into(&mut serial_buf, false);
+        run_into(&mut parallel_buf, true);
+
+        assert_eq!(parallel_buf, serial_buf, "parallel send::take must be bit-identical to serial");
+
+        // Spot-check that long copies and word pairs actually contain expected bytes/pairs.
+        for ((src, runs), (span, pairs_at, words)) in srcs.iter().zip(&run_plans).zip(&short_plans) {
+            for &(a, to, n) in runs {
+                assert_eq!(&parallel_buf[to..to + n], &src[a..a + n]);
+            }
+            let mut cursor = *pairs_at;
+            let mut seen_words = 0usize;
+            for &(a, b) in &all_shorts[span.clone()] {
+                for off in (a..b).step_by(4) {
+                    let got_off = u32::from_le_bytes(parallel_buf[cursor..cursor + 4].try_into().unwrap());
+                    let got_val = u32::from_le_bytes(parallel_buf[cursor + 4..cursor + 8].try_into().unwrap());
+                    let want_val = u32::from_le_bytes(src[off..off + 4].try_into().unwrap());
+                    assert_eq!(got_off, off as u32);
+                    assert_eq!(got_val, want_val);
+                    cursor += 8;
+                    seen_words += 1;
+                }
+            }
+            assert_eq!(seen_words, *words);
+        }
     }
 }

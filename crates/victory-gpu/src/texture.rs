@@ -65,6 +65,9 @@ pub(crate) struct Staging {
     /// Which host copy it uploads into, and what that is told to hold.
     serial: u64,
     holds: Arc<crate::resource::Holds>,
+    /// Weak handle to the host copy (never pins `Arc::strong_count`) so
+    /// `Staging::judgement` reads live `wanted` and `demote_floor`.
+    copy: Weak<crate::resource::HostTexture>,
     /// Made by the pass over textures picked by index, for one upload
     /// ([`once`]): read when the list is submitted, and never looked at again.
     once: std::sync::atomic::AtomicBool,
@@ -1015,7 +1018,7 @@ pub(crate) struct Digest(u128);
 /// texture the title placed there may be no memory of the larger ones, and
 /// what lies there is another texture's. (After victory-amd 4436f8f1.)
 pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
-    let first = if crate::resource::held_only() { first } else { 0 };
+    let first = if crate::resource::held_only() || crate::tiles::wanted() { first } else { 0 };
     // shortcut: a texture the host copied into keeps the host's contents
     // even if the title later writes its memory too.
     if host_wrote(resource as usize) {
@@ -1031,8 +1034,9 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     }
     // Under `VICTORY_HEAP_WORKER=1`, `host.mirror()` runs at batch publish
     // rather than before upload recording; request the needed mip level here
-    // so a clamped or lower-mip host copy grows before staging.
-    if crate::resource::held_only() {
+    // so a clamped or lower-mip host copy grows (Path A) or clears its Tier-2
+    // `demote_floor` (Path B) before staging.
+    if crate::resource::held_only() || crate::tiles::wanted() {
         crate::resource::want_level(resource, first);
     }
     let Some(copy) = crate::resource::host_copy(resource) else {
@@ -1065,7 +1069,9 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     {
         tiled.touch(now);
         crate::tiles::register_candidate(copy.serial, &copy, staging.memory as u64, resource as usize);
-        if tiled.promote() {
+        if first < tiled.demote_floor() && tiled.promote_to(first) {
+            copy.invalidate_hashed_frame();
+            staging.forget();
             staging.dirty.store(true, Relaxed);
         }
     }
@@ -1367,19 +1373,57 @@ impl PreludeUpload {
         }
     }
 
-    /// Dispatches the native compute detiler from `self.staging.buffer` (raw
-    /// tiled bytes) into a ring-buffered device-local UAV scratch slice, then
-    /// copies the selected subresources VRAM-to-VRAM into `texture`.
-    fn record_gpu_detiled(
+    /// Whether this upload uses GPU compute detiling and can batch onto the
+    /// dedicated `COMPUTE` queue when its destination texture is in `COMMON`.
+    pub(crate) fn can_compute_detile(&self) -> bool {
+        self.staging.gpu_detile && crate::gpu_detile::compute_queue_enabled()
+    }
+
+    /// Queues this `COMMON`-state GPU-detiled texture upload into `batch` for
+    /// batched execution on the dedicated `COMPUTE` queue.
+    pub(crate) fn push_to_compute_batch(
         &self,
-        cmd_list: &ID3D12GraphicsCommandList,
-        texture: &ID3D12Resource,
+        batch: &mut crate::gpu_detile::ComputeBatch,
+        sub_mask: u64,
+        first_upload: bool,
+    ) -> bool {
+        if !self.staging.gpu_detile {
+            return false;
+        }
+        let sub_count = self.staging.footprints.len();
+        let (jobs, indices) = self.build_gpu_detile_jobs(sub_mask, sub_count);
+        if jobs.is_empty() {
+            return true;
+        }
+        // SAFETY: live staging upload buffer.
+        let src_va = unsafe { self.staging.buffer.GetGPUVirtualAddress() } + self.staging.base;
+        let was_aliased = self
+            .staging
+            .gpu_detile_aliased
+            .swap(true, std::sync::atomic::Ordering::AcqRel);
+        let need_aliasing = crate::pool::on() && (first_upload || !was_aliased);
+        batch.push(
+            crate::gpu_detile::ComputeBatchEntry {
+                staging: self.staging.clone(),
+                dst_texture: self.copy.texture.clone(),
+                src_gpu_va: src_va,
+                src_len: self.staging.read as u64,
+                sub_offset: self.staging.first - self.staging.level0,
+                jobs,
+                indices,
+                linear_bytes: self.staging.linear_bytes,
+                need_aliasing,
+            },
+            self.on_demand.is_some(),
+        );
+        true
+    }
+
+    fn build_gpu_detile_jobs(
+        &self,
         sub_mask: u64,
         sub_count: usize,
-    ) {
-        let Some(host) = host() else {
-            return;
-        };
+    ) -> (Vec<crate::gpu_detile::SubresourceJob>, Vec<usize>) {
         let held = if self.staging.on_demand {
             self.staging
                 .detiled
@@ -1412,6 +1456,23 @@ impl PreludeUpload {
             });
             indices.push(i);
         }
+        (jobs, indices)
+    }
+
+    /// Dispatches the native compute detiler from `self.staging.buffer` (raw
+    /// tiled bytes) into a ring-buffered device-local UAV scratch slice, then
+    /// copies the selected subresources VRAM-to-VRAM into `texture`.
+    fn record_gpu_detiled(
+        &self,
+        cmd_list: &ID3D12GraphicsCommandList,
+        texture: &ID3D12Resource,
+        sub_mask: u64,
+        sub_count: usize,
+    ) {
+        let Some(host) = host() else {
+            return;
+        };
+        let (jobs, indices) = self.build_gpu_detile_jobs(sub_mask, sub_count);
         if jobs.is_empty() {
             return;
         }
@@ -1439,6 +1500,15 @@ impl PreludeUpload {
         if !ok {
             once!("gpu detile dispatch validation failed; skipping texture upload");
         }
+    }
+}
+
+impl Staging {
+    /// Layout and placed subresource footprints borrowed by `gpu_detile::ComputeBatch`.
+    pub(crate) fn detile_parts(
+        &self,
+    ) -> (&victory_formats::texture::Layout, &[D3D12_PLACED_SUBRESOURCE_FOOTPRINT]) {
+        (&self.layout, &self.footprints)
     }
 }
 
@@ -1705,18 +1775,57 @@ pub(crate) fn card_writes(list: &HostList, resource: This, texture: &ID3D12Resou
     });
 }
 
+/// Pure level-selection logic for [`Staging::held_levels`]: sets bit `level`
+/// for each mip `>= first` whose console bytes end at `<= limit` and pass
+/// `there(from, to)`.
+fn held_levels_for(
+    layout: &victory_formats::texture::Layout,
+    first: u32,
+    limit: u64,
+    there: impl Fn(u64, u64) -> bool,
+) -> u32 {
+    let mips = &layout.mips;
+    if layout.slices != 1 || mips.is_empty() || mips.len() > 32 {
+        return u32::MAX;
+    }
+    let tail = (layout.first_tail_mip as usize).min(mips.len());
+    let mut held = 0u32;
+    for (level, m) in mips.iter().enumerate().take(tail) {
+        let end = if level == 0 { layout.slice_size } else { mips[level - 1].offset };
+        if level as u32 >= first && end > m.offset && end <= limit && there(m.offset, end) {
+            held |= 1 << level;
+        }
+    }
+    let tail_end = layout.alignment.min(layout.slice_size);
+    if tail < mips.len() && tail_end > 0 && tail_end <= limit && there(0, tail_end) {
+        for level in tail..mips.len() {
+            if level as u32 >= first {
+                held |= 1 << level;
+            }
+        }
+    }
+    held
+}
+
 impl Staging {
     /// Levels on demand: what says, beside the mapping, which levels of
-    /// the texture are the title's now. First the lowest level a live view
-    /// of the texture shows (0 without a view that says): the title's own
-    /// word, a texture it holds from level 3 on is viewed from level 3.
-    /// Then where the next texture placed in this one's span starts, in
-    /// bytes from this one's start (`u64::MAX`: none does): for a texture
-    /// viewed from level 0 although a neighbour sits where its large
-    /// levels would be.
+    /// the texture are the title's now. First the unified mip bound
+    /// `max(r.host.wanted, first_viewed, r.demote_floor)` (clamped to
+    /// `>= self.first` so only subresources covered by `self.footprints` are
+    /// mapped and uploaded). Then where the next texture placed in this one's
+    /// span starts, in bytes from this one's start (`u64::MAX`: none does).
     fn judgement(&self) -> [u64; 2] {
         let start = self.memory as u64;
-        let first = crate::descriptor::host::first_viewed(start).map_or(0, u64::from);
+        let first_viewed = crate::descriptor::host::first_viewed(start).unwrap_or(0);
+        let (wanted, demote_floor) = self.copy.upgrade().map_or((u32::MAX, 0), |c| {
+            (
+                c.wanted.load(Ordering::Relaxed),
+                c.tiled.as_ref().map_or(0, |t| t.demote_floor()),
+            )
+        });
+        let first = u64::from(
+            crate::tiles::unified_mip_bound(wanted, first_viewed, demote_floor).max(self.first),
+        );
         let limit = crate::descriptor::host::next_start(start, start.saturating_add(self.layout.size))
             .map_or(u64::MAX, |at| at - start);
         [first, limit]
@@ -1729,37 +1838,12 @@ impl Staging {
     }
 
     /// Levels on demand: the levels that are the title's now, a bit a
-    /// level. A level is held if no view starts above it, its bytes end
-    /// before the next texture starts, and all of them are mapped. The
-    /// smallest levels share the texture's first block and are held
-    /// together. (The console layout: that block first, then the other
-    /// levels from the smallest up, level 0 last:
-    /// `victory_formats::texture::Layout`.) A texture this cannot tell
-    /// the levels of holds them all.
+    /// level. A level is held if `level >= max(wanted, first_viewed, demote_floor)`,
+    /// its bytes end before the next texture starts, and all of them are mapped.
     fn held_levels(&self, [first, limit]: [u64; 2]) -> u32 {
-        let mips = &self.layout.mips;
-        if self.layout.slices != 1 || mips.is_empty() || mips.len() > 32 {
-            return u32::MAX;
-        }
-        let tail = (self.layout.first_tail_mip as usize).min(mips.len());
-        let there = |from: u64, to: u64| {
-            to > from && to <= limit && committed(self.memory.wrapping_add(from as usize), (to - from) as usize)
-        };
-        let mut held = 0u32;
-        for (level, m) in mips.iter().enumerate().take(tail) {
-            let end = if level == 0 { self.layout.slice_size } else { mips[level - 1].offset };
-            if level as u64 >= first && there(m.offset, end) {
-                held |= 1 << level;
-            }
-        }
-        if tail < mips.len() && there(0, self.layout.alignment.min(self.layout.slice_size)) {
-            for level in tail..mips.len() {
-                if level as u64 >= first {
-                    held |= 1 << level;
-                }
-            }
-        }
-        held
+        held_levels_for(&self.layout, first.min(u64::from(u32::MAX)) as u32, limit, |from, to| {
+            committed(self.memory.wrapping_add(from as usize), (to - from) as usize)
+        })
     }
 
     /// Forgets what the staging buffer was last filled from: the next
@@ -2359,6 +2443,25 @@ impl Staging {
     }
 }
 
+/// Marks a Tier-2 tiled texture's cached staging buffer as stale after its
+/// `demote_floor` drops so the next submission re-detiles, synchronously maps
+/// missing top-mip tiles, and populates them from guest memory before draw.
+pub(crate) fn note_promoted(resource: This) {
+    let key = resource as usize;
+    let hit = if let Some(s) = staging_tls_get(key) {
+        Some(s)
+    } else if STAGING_COUNT.load(Ordering::Acquire) > 0 {
+        let map = STAGING.read().unwrap_or_else(|e| e.into_inner());
+        map.as_ref().and_then(|m| m.get(&key).cloned())
+    } else {
+        None
+    };
+    if let Some(s) = hit {
+        s.forget();
+        s.dirty.store(true, Ordering::Release);
+    }
+}
+
 /// Lets go of a title texture's staging buffer (lists that recorded an
 /// upload from it hold it until they have run); the next upload makes one
 /// anew.
@@ -2743,7 +2846,7 @@ fn mapped_regions(start: usize, end: usize, first_only: bool) -> u64 {
 }
 
 /// The staging state of a title texture, made on first use.
-fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> Option<Arc<Staging>> {
+fn staging(resource: This, copy: &Arc<crate::resource::HostTexture>, first: u32) -> Option<Arc<Staging>> {
     let key = resource as usize;
     let need_first = first.max(copy.base);
     if let Some(s) = staging_tls_get(key)
@@ -2874,6 +2977,7 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         read,
         serial: copy.serial,
         holds: copy.holds.clone(),
+        copy: Arc::downgrade(copy),
         once: std::sync::atomic::AtomicBool::new(once() && !on_demand && PICKING.get().is_some()),
         bytes: alloc_bytes,
         linear_bytes: total,
@@ -3440,6 +3544,48 @@ mod prelude_upload_tests {
     }
 
     #[test]
+    fn held_levels_respects_unified_wanted_first_viewed_and_demote_floor_bound() {
+        use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+        let layout = Layout::new(&Desc {
+            dimension: Dimension::Tex2d,
+            width: 1024,
+            height: 1024,
+            depth: 1,
+            mips: 11,
+            element_bytes: 16,
+            block: 4,
+            samples: 1,
+            swizzle: Swizzle::SW_64KB_D,
+        })
+        .unwrap();
+        let all_11 = (1u32 << 11) - 1;
+
+        // Fully committed, wanted=unset, first_viewed=0, demote_floor=0 -> all 11 mips held.
+        let b0 = crate::tiles::unified_mip_bound(u32::MAX, 0, 0);
+        assert_eq!(super::held_levels_for(&layout, b0, u64::MAX, |_, _| true), all_11);
+
+        // Idle demote_floor=2 clamps out mips 0 and 1 even when wanted=0 and first_viewed=0.
+        let b_demoted = crate::tiles::unified_mip_bound(0, 0, 2);
+        assert_eq!(b_demoted, 2);
+        assert_eq!(
+            super::held_levels_for(&layout, b_demoted, u64::MAX, |_, _| true),
+            all_11 & !0b11
+        );
+
+        // Higher first_viewed=3 or wanted=3 clamps to mip >= 3.
+        let b_viewed = crate::tiles::unified_mip_bound(1, 3, 2);
+        assert_eq!(b_viewed, 3);
+        assert_eq!(
+            super::held_levels_for(&layout, b_viewed, u64::MAX, |_, _| true),
+            all_11 & !0b111
+        );
+
+        // After demote_floor clears back to 0 and view asks for 0, mip 0 is immediately included.
+        let b_restored = crate::tiles::unified_mip_bound(0, 0, 0);
+        assert_eq!(super::held_levels_for(&layout, b_restored, u64::MAX, |_, _| true), all_11);
+    }
+
+    #[test]
     fn staging_and_through_tls_caches_invalidate_on_unstage_and_forget_without_pinning_arc() {
         use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
         use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
@@ -3481,6 +3627,7 @@ mod prelude_upload_tests {
             read: 0,
             serial: 7,
             holds: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            copy: std::sync::Weak::new(),
             once: AtomicBool::new(false),
             bytes: 0,
             linear_bytes: 0,

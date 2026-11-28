@@ -499,6 +499,12 @@ pub(crate) struct SpeculativeAnyHit {
     pub p1_t_f32: Option<V>,
     /// Pass 1 `COMMITTED_RAY_T(rq)` (`i32` bitcast) read once in `p1_bridge_blk` (when needed).
     pub p1_t_i32: Option<V>,
+    /// `RayQuery` handle for deferred Pass-1-reject `COMMITTED_RAY_T` reads (`R2-F`).
+    pub(crate) rq: V,
+    /// When `true`, `COMMITTED_RAY_T` was omitted from `p1_bridge_blk` because neither Pass 1
+    /// `AnyHit` nor post-loop outputs read it; `finish_fno_spec_pass1` emits it strictly on the
+    /// Pass-1-reject edge (`p1_reject_blk` -> `p2_trace_blk`) before `TraceRayInline(p2)`.
+    pub(crate) defer_p1_t_to_reject: bool,
     /// Pass 1 hit/miss check block (branches to `p1_bridge_blk` on hit or `after_blk` on miss).
     pub p1_check_blk: usize,
     /// Present for dynamic `ray_flags`: `start_blk` bypasses Pass 1 directly into `p2_trace_blk`.
@@ -3530,7 +3536,24 @@ impl<'a> Analyzer<'a> {
         let mut sorted_reads: Vec<Value> = scaffolding_reads.into_iter().collect();
         sorted_reads.sort_unstable();
         for v in sorted_reads {
-            if cand_t_vals.contains(&v) {
+            if dead_addr_inputs.contains(&v) {
+                inputs.push((v, CandidateInput::Zero));
+            } else if (cand_t_vals.contains(&v)
+                || cand_bary_u_vals.contains(&v)
+                || cand_bary_v_vals.contains(&v)
+                || cand_ff_vals.contains(&v))
+                && self.is_dead_implicit_guarded_read(
+                    v,
+                    anyhit_entry,
+                    &anyhit_set,
+                    tail_block,
+                    &skipped_tail_set,
+                )
+            {
+                // Demand-driven filtering (`R2-F`): dead implicit guarded candidate fields
+                // never emit `COMMITTED_*` / `CANDIDATE_*` intrinsics in `p1_bridge_blk`.
+                inputs.push((v, CandidateInput::Zero));
+            } else if cand_t_vals.contains(&v) {
                 inputs.push((v, CandidateInput::RayT));
             } else if cand_bary_u_vals.contains(&v) {
                 inputs.push((v, CandidateInput::Bary(0)));
@@ -3540,8 +3563,6 @@ impl<'a> Analyzer<'a> {
                 inputs.push((v, CandidateInput::FrontFace));
             } else if cur_tri_vals.contains(&v) || cur_inst_vals.contains(&v) {
                 inputs.push((v, CandidateInput::One));
-            } else if dead_addr_inputs.contains(&v) {
-                inputs.push((v, CandidateInput::Zero));
             } else if let Some(&sidx) = state_val_to_idx.get(&v) {
                 inputs.push((v, CandidateInput::StateVar(sidx)));
             } else if self.is_dead_implicit_guarded_read(
@@ -8670,19 +8691,29 @@ pub(crate) fn finish_fno_spec_pass1(
     p1_tail_blk: usize,
     p1_accept: V,
 ) {
+    let (reject_target, reject_pred, p1_t_for_p2) = if spec.defer_p1_t_to_reject {
+        let p1_reject_blk = s.m.new_block();
+        // Demand-driven Pass 1 `COMMITTED_RAY_T(rq)` read ONLY on Pass 1 reject, strictly
+        // BEFORE `TraceRayInline(p2)` in `p2_trace_blk` (Guard 4 compliant).
+        let deferred_t = s.ray_query_state_f32(p1_reject_blk, rq_op::COMMITTED_RAY_T, spec.rq);
+        s.m.terminate(p1_reject_blk, Term::Br(spec.p2_trace_blk));
+        (p1_reject_blk, p1_reject_blk, Some(deferred_t))
+    } else {
+        (spec.p2_trace_blk, p1_tail_blk, spec.p1_t_f32)
+    };
     s.m.terminate(
         p1_tail_blk,
-        Term::CondBr(p1_accept, spec.after_blk, spec.p2_trace_blk),
+        Term::CondBr(p1_accept, spec.after_blk, reject_target),
     );
     if let (Some(fp1), Some(bypass)) = (spec.p2_from_p1_phi, spec.dyn_bypass_blk) {
         let true_v = s.m.bool(true);
         let false_v = s.m.bool(false);
-        s.m.set_phi(fp1, vec![(true_v, p1_tail_blk), (false_v, bypass)]);
+        s.m.set_phi(fp1, vec![(true_v, reject_pred), (false_v, bypass)]);
     }
     if let (Some(t1_phi), Some(p1_t), Some(bypass)) =
-        (spec.p2_t1_phi, spec.p1_t_f32, spec.dyn_bypass_blk)
+        (spec.p2_t1_phi, p1_t_for_p2, spec.dyn_bypass_blk)
     {
-        s.m.set_phi(t1_phi, vec![(p1_t, p1_tail_blk), (spec.t_min_f32, bypass)]);
+        s.m.set_phi(t1_phi, vec![(p1_t, reject_pred), (spec.t_min_f32, bypass)]);
     }
     if let Some((final_t, t_max_i, p2_t)) = spec.final_t_phi {
         let p1_t_i = spec.p1_t_i32.expect("p1_t_i32 for final_t_phi");
@@ -9121,17 +9152,23 @@ fn emit_trace_body(
             .iter()
             .any(|&(_, ci)| ci == CandidateInput::RayT);
 
-        // Read `p1_t = COMMITTED_RAY_T(rq)` ONCE in `p1_bridge_blk` (before Pass 2 starts).
-        let (p1_t_f32, p1_t_i32) = if allow_prefix_skip || needs_committed_ray_t || ah_reads_ray_t {
+        // Demand-driven `p1_bridge_blk` materialization (`R2-F`): read `COMMITTED_RAY_T(rq)`
+        // in `p1_bridge_blk` ONLY when Pass 1's `AnyHit` body or post-loop outputs actually use it.
+        // When only Pass 2's prefix skip needs `p1_t`, defer the `COMMITTED_RAY_T(rq)` read out of
+        // `p1_bridge_blk` onto the Pass-1-reject path (strictly before `TraceRayInline(p2)`).
+        let p1_needs_t_eagerly = needs_committed_ray_t || ah_reads_ray_t;
+        let (p1_t_f32, p1_t_i32) = if p1_needs_t_eagerly {
             let tf = s.ray_query_state_f32(p1_bridge_blk, rq_op::COMMITTED_RAY_T, rq);
             let ti = s.m.cast(p1_bridge_blk, Cast::Bitcast, tf, i32t);
             (Some(tf), Some(ti))
         } else {
             (None, None)
         };
+        let defer_p1_t_to_reject = allow_prefix_skip && !p1_needs_t_eagerly && dyn_bypass_blk.is_some();
 
         // Materialize Pass 1's `AnyHit` inputs directly from `Committed*` + `init_vals` in
-        // `p1_bridge_blk` (strictly outside Pass 2's loop; zero `spec_phi`).
+        // `p1_bridge_blk` (strictly outside Pass 2's loop; zero `spec_phi`). Only emit
+        // `COMMITTED_*` intrinsics for fields actually referenced in `ah.inputs`.
         let mut p1_cache: HashMap<CandidateInput, V> = HashMap::new();
         if let Some(ti) = p1_t_i32 {
             p1_cache.insert(CandidateInput::RayT, ti);
@@ -9173,7 +9210,16 @@ fn emit_trace_body(
         // Exact `nextafter_down(t1)` prefix skip with Guard 1 (NaN Underflow: `t1 > tMin && t1 > 0.0`)
         // and Guard 2 (`ACCEPT_FIRST_HIT` ban, including dynamic flag check when `ray_flags` is dynamic).
         let t_min_p2 = if allow_prefix_skip {
-            let t1 = p2_t1_phi.unwrap_or_else(|| p1_t_f32.expect("p1_t_f32"));
+            let t1 = if let Some(phi) = p2_t1_phi {
+                phi
+            } else if let Some(tf) = p1_t_f32 {
+                tf
+            } else {
+                // Static flags + Pass 1 reject only: `p2_trace_blk` is entered strictly from
+                // Pass 1 reject while `rq` still holds Pass 1's pure-opaque committed hit
+                // (before `TraceRayInline(p2)` below; Guard 4 compliant).
+                s.ray_query_state_f32(p2_trace_blk, rq_op::COMMITTED_RAY_T, rq)
+            };
             let f_zero = s.m.f32(0.0f32.to_bits());
             let gt_tmin = s.m.cmp(p2_trace_blk, pred::OGT, t1, t_min);
             let gt_zero = s.m.cmp(p2_trace_blk, pred::OGT, t1, f_zero);
@@ -9432,6 +9478,8 @@ fn emit_trace_body(
                 p1_cand_outs,
                 p1_t_f32,
                 p1_t_i32,
+                rq,
+                defer_p1_t_to_reject,
                 p1_check_blk,
                 dyn_bypass_blk,
                 t_min_f32: t_min,
@@ -9575,6 +9623,40 @@ fn emit_trace_body(
             (start_blk, None)
         };
 
+        // Wave-uniform Pass-B skip guard (`R2-F`): wrap Pass B `TraceRayInline` + `Proceed()`
+        // in `if (WaveActiveAnyTrue(pass_b_active))` so waves where every active lane is masked
+        // off or has an empty ray interval (`!(t_max > t_min)`) skip Pass B traversal completely.
+        let valid_interval = s.m.cmp(b_start_blk, pred::OGT, t_max, t_min);
+        let pass_b_active = match rl.instance_mask {
+            RayInput::Const(m) => {
+                if (m & 0xFF) == 0 {
+                    s.m.bool(false)
+                } else {
+                    valid_interval
+                }
+            }
+            RayInput::Val(_) | RayInput::ShiftedMask(_) => {
+                let zero = s.m.i32(0);
+                let mask_nz = s.m.cmp(b_start_blk, pred::NE, mask, zero);
+                s.m.bin(b_start_blk, Bin::And, mask_nz, valid_interval)
+            }
+        };
+        let any_b = s.op(
+            b_start_blk,
+            "waveAnyTrue",
+            Attr::NoUnwind,
+            s.t.i1,
+            113,
+            &[pass_b_active],
+        );
+        s.flags |= super::shader::flags::WAVE_OPS;
+
+        let b_trace_blk = s.m.new_block();
+        let b_proceed_blk = s.m.new_block();
+        let b_done_blk = s.m.new_block();
+        let after_blk = s.m.new_block();
+        s.m.terminate(b_start_blk, Term::CondBr(any_b, b_trace_blk, after_blk));
+
         // Pass B: pure-opaque back-face trace (`FORCE_OPAQUE | CULL_FRONT_FACING_TRIANGLES`)
         // with full `t_max` so back-faces behind front-faces still commit in `rq` (also
         // serving all post-loop `committed_meta_loads` directly from `rq`).
@@ -9582,7 +9664,7 @@ fn emit_trace_body(
             (base_opaque | ray_flag::CULL_FRONT_FACING_TRIANGLES) & !inputs.group_const_flags,
         );
         s.ray_query_trace_inline(
-            b_start_blk,
+            b_trace_blk,
             rq,
             inputs.tlas,
             dyn_flags_back,
@@ -9592,7 +9674,139 @@ fn emit_trace_body(
             dir,
             t_max,
         );
-        (b_start_blk, None, min_f)
+        s.m.terminate(b_trace_blk, Term::Br(b_proceed_blk));
+
+        let b_more = s.ray_query_proceed(b_proceed_blk, rq);
+        s.m.terminate(b_proceed_blk, Term::CondBr(b_more, b_proceed_blk, b_done_blk));
+
+        // Materialize Pass B `COMMITTED_*` outputs strictly inside `b_done_blk` (only when
+        // Pass B ran) and PHI-merge with clean miss/fallback values on the skipped edge.
+        let needs_status = rl.outputs.iter().any(|b| {
+            matches!(
+                b.output,
+                RayOutput::CommittedStatusTriNode
+                    | RayOutput::CommittedRayT
+                    | RayOutput::CommittedBary(_)
+                    | RayOutput::CommittedFrontFace
+            )
+        });
+        let zero = s.m.i32(0);
+        let one = s.m.i32(1);
+        let (hit_tri, hit_any) = if needs_status {
+            let status = s.ray_query_state_i32(b_done_blk, rq_op::COMMITTED_STATUS, rq);
+            (
+                Some(s.m.cmp(b_done_blk, pred::EQ, status, one)),
+                Some(s.m.cmp(b_done_blk, pred::NE, status, zero)),
+            )
+        } else {
+            (None, None)
+        };
+        let mut raw_cache: HashMap<RayOutput, V> = HashMap::new();
+        let mut b_vals: Vec<Option<(V, V)>> = Vec::with_capacity(rl.outputs.len());
+        for binding in &rl.outputs {
+            let pair = match binding.output {
+                RayOutput::CommittedStatusTriNode => {
+                    let v_b = s.m.select(b_done_blk, hit_tri.expect("status"), one, zero);
+                    Some((v_b, zero))
+                }
+                RayOutput::CommittedRayT => {
+                    let t_i = *raw_cache.entry(RayOutput::CommittedRayT).or_insert_with(|| {
+                        emit_committed_hit_output(s, b_done_blk, rq, RayOutput::CommittedRayT, i32t)
+                    });
+                    let miss_t = binding
+                        .fallback
+                        .and_then(|fb| inputs.fallbacks.get(&fb).copied())
+                        .unwrap_or(inputs.t_max);
+                    let v_b = s.m.select(b_done_blk, hit_any.expect("status"), t_i, miss_t);
+                    Some((v_b, miss_t))
+                }
+                RayOutput::CommittedBary(comp) => {
+                    let b_i = *raw_cache
+                        .entry(RayOutput::CommittedBary(comp))
+                        .or_insert_with(|| {
+                            emit_committed_hit_output(
+                                s,
+                                b_done_blk,
+                                rq,
+                                RayOutput::CommittedBary(comp),
+                                i32t,
+                            )
+                        });
+                    let miss_b = binding
+                        .fallback
+                        .and_then(|fb| inputs.fallbacks.get(&fb).copied())
+                        .unwrap_or(zero);
+                    let v_b = s.m.select(b_done_blk, hit_any.expect("status"), b_i, miss_b);
+                    Some((v_b, miss_b))
+                }
+                RayOutput::CommittedFrontFace => {
+                    let ff_v = *raw_cache
+                        .entry(RayOutput::CommittedFrontFace)
+                        .or_insert_with(|| {
+                            emit_committed_hit_output(
+                                s,
+                                b_done_blk,
+                                rq,
+                                RayOutput::CommittedFrontFace,
+                                i32t,
+                            )
+                        });
+                    let miss_ff = binding
+                        .fallback
+                        .and_then(|fb| inputs.fallbacks.get(&fb).copied())
+                        .unwrap_or(zero);
+                    let v_b = s.m.select(b_done_blk, hit_any.expect("status"), ff_v, miss_ff);
+                    Some((v_b, miss_ff))
+                }
+                committed @ (RayOutput::CommittedInstanceIndex
+                | RayOutput::CommittedInstanceId
+                | RayOutput::CommittedInstanceContribution
+                | RayOutput::CommittedGeometryIndex
+                | RayOutput::CommittedPrimitiveIndex
+                | RayOutput::CommittedObjectToWorld(_, _)
+                | RayOutput::CommittedWorldToObject(_, _)) => {
+                    let v_b = *raw_cache.entry(committed).or_insert_with(|| {
+                        emit_committed_hit_output(s, b_done_blk, rq, committed, i32t)
+                    });
+                    Some((v_b, zero))
+                }
+                RayOutput::FrontBackMinFrontT
+                | RayOutput::Zero
+                | RayOutput::CopyOf(_)
+                | RayOutput::AnyHitState(_) => None,
+            };
+            b_vals.push(pair);
+        }
+        s.m.terminate(b_done_blk, Term::Br(after_blk));
+
+        let mut phi_cache: HashMap<(V, V), V> = HashMap::new();
+        let mut outs = Vec::with_capacity(rl.outputs.len());
+        for (binding, pair) in rl.outputs.iter().zip(b_vals) {
+            let v = if let Some((v_b, v_skip)) = pair {
+                *phi_cache.entry((v_b, v_skip)).or_insert_with(|| {
+                    let phi = s.m.phi(after_blk, i32t);
+                    s.m.set_phi(phi, vec![(v_b, b_done_blk), (v_skip, b_start_blk)]);
+                    phi
+                })
+            } else {
+                match binding.output {
+                    RayOutput::FrontBackMinFrontT => {
+                        let mf = min_f.expect("front_back min phi");
+                        s.m.cast(after_blk, Cast::Bitcast, mf, i32t)
+                    }
+                    RayOutput::Zero => zero,
+                    RayOutput::CopyOf(pre) => inputs
+                        .fallbacks
+                        .get(&pre)
+                        .copied()
+                        .unwrap_or(zero),
+                    RayOutput::AnyHitState(_) => unreachable!("FrontBackTrack has no AnyHitState"),
+                    _ => unreachable!(),
+                }
+            };
+            outs.push((binding.value, v));
+        }
+        return (after_blk, outs, Vec::new(), None, None);
     } else {
         let dyn_flags = match rl.ray_flags {
             RayInput::Const(f) => s.m.i32(f & !inputs.group_const_flags),
@@ -12043,5 +12257,290 @@ mod tests {
             lifted[0].rq_group, lifted[1].rq_group,
             "Mirror-TLAS FrontBackTrack (512) and fno_spec AnyHit (512) must coalesce onto 1 RayQuery handle"
         );
+    }
+
+    #[test]
+    fn demand_driven_p1_bridge_omits_unused_committed_intrinsics_and_preserves_guard4() {
+        let flags = ray_flag::FORCE_NON_OPAQUE | ray_flag::SKIP_PROCEDURAL_PRIMITIVES;
+        // Shadow-style speculative AnyHit: neither `ah.inputs` nor `rl.outputs` reads
+        // `RayT`, `Bary`, or `FrontFace` (only `CommittedStatusTriNode`).
+        let rl_shadow = RayLoop {
+            rq_group: 0,
+            entry_block: 1,
+            exit_block: 3,
+            exit_pred: 1,
+            skipped_blocks: vec![],
+            template: RayTemplate::Bvh64,
+            kind: RayLoopKind::AnyHit(AnyHitInfo {
+                opacity_block: 1,
+                entry_block: 2,
+                tail_block: 2,
+                body_blocks: vec![2],
+                skipped_tail_insts: vec![],
+                accept_mask: Value(20),
+                accept_invert: false,
+                accept_first_hit: false,
+                inputs: vec![(Value(15), CandidateInput::Zero)],
+                const_lane_atoms: vec![],
+                state_vars: vec![],
+                cand_meta_loads: vec![],
+            }),
+            tlas_load: (0, 0),
+            tlas_root_load: None,
+            active_ray_mask: None,
+            origin: [RayInput::Val(Value(1)); 3],
+            t_min: None,
+            dir: [RayInput::Val(Value(2)); 3],
+            t_max: RayInput::Val(Value(3)),
+            instance_mask: RayInput::Const(0xFF),
+            ray_flags: RayInput::Const(flags),
+            outputs: vec![RayOutputBinding {
+                value: Value(10),
+                output: RayOutput::CommittedStatusTriNode,
+                fallback: Some(Value(0)),
+            }],
+            committed_meta_loads: vec![],
+            direct_normals: vec![],
+        };
+
+        let prev_fno = super::super::lower::TEST_NATIVE_RT_FNO_MODE.replace(Some(2));
+        let mut s = Shader::new(false);
+        s.threads = Some([8, 8, 1]);
+        let entry = s.entry;
+        let p1_body = s.m.new_block();
+        let p2_body = s.m.new_block();
+        let exit = s.m.new_block();
+        let tlas = s.rtas_root_srv_handle(entry, 0);
+        let alloc_flags = ray_flag::SKIP_PROCEDURAL_PRIMITIVES;
+        let rq = s.allocate_ray_query(entry, alloc_flags);
+        let zero = s.m.i32(0);
+        let one_f = s.m.i32(1.0f32.to_bits());
+        let ten_f = s.m.i32(10.0f32.to_bits());
+        let mut fallbacks = HashMap::new();
+        fallbacks.insert(Value(0), zero);
+        fallbacks.insert(Value(3), ten_f);
+
+        let inputs = ResolvedRayInputs {
+            rq,
+            two_pass_early_fields: None,
+            tlas,
+            active_ray: Some(s.m.bool(true)),
+            origin: [zero, zero, zero],
+            t_min: None,
+            dir: [one_f, zero, zero],
+            t_max: ten_f,
+            instance_mask: None,
+            ray_flags: None,
+            group_const_flags: alloc_flags,
+            fbt_split_mask: 0,
+            fbt_mirror_tlas: false,
+            init_min_front_t: None,
+            anyhit_inits: vec![],
+            anyhit_entry_dxil: Some(p2_body),
+            fallbacks,
+        };
+
+        let emitted = emit_ray_loop(&mut s, entry, exit, &rl_shadow, &inputs);
+        let pending = emitted.pending_anyhit.expect("pending anyhit");
+        let spec = pending.spec.expect("speculative FNO metadata");
+        super::super::lower::TEST_NATIVE_RT_FNO_MODE.set(prev_fno);
+
+        // Demand-driven check: `p1_bridge_blk` MUST NOT emit `COMMITTED_RAY_T` or any other
+        // unused `COMMITTED_*` intrinsic when neither Pass 1 AnyHit nor outputs consume them!
+        assert!(spec.p1_t_f32.is_none());
+        assert!(spec.p1_t_i32.is_none());
+        assert!(!spec.defer_p1_t_to_reject);
+        assert!(spec.p2_t_track.is_none());
+
+        s.m.terminate(spec.p1_bridge_blk, Term::Br(p1_body));
+        let (p1_b, g1) = emit_ray_meta_load(&mut s, p1_body, rq, false, RayMetaKind::GeometryIndexShl8, 1, None);
+        let p1_acc = s.m.cmp(p1_b, pred::NE, g1[0], zero);
+        finish_fno_spec_pass1(&mut s, &spec, p1_b, p1_acc);
+
+        let (p2_b, g2) = emit_ray_meta_load(&mut s, p2_body, rq, true, RayMetaKind::GeometryIndexShl8, 1, None);
+        let p2_acc = s.m.cmp(p2_b, pred::NE, g2[0], zero);
+        s.m.terminate(p2_b, Term::CondBr(p2_acc, pending.do_commit_blk, pending.latch_blk));
+        s.m.terminate(exit, Term::Ret);
+
+        let mut dxbc = s.finish();
+        assert!(dxbc.starts_with(b"DXBC"));
+        // Unused `CommittedBary` (`StateVector.f32`) must not be emitted anywhere in DXIL.
+        let has_state_vec = dxbc
+            .windows(b"rayQuery_StateVector".len())
+            .any(|w| w == b"rayQuery_StateVector");
+        assert!(!has_state_vec, "unused COMMITTED_TRIANGLE_BARYCENTRICS must not be emitted");
+        if let Ok(mut v) = crate::emit::validator::Validator::load(
+            crate::emit::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut dxbc)
+                .expect("demand-driven p1_bridge_blk fno_spec DXIL must pass dxil.dll validation");
+        }
+
+        // Dynamic-flags variant with deferred Pass-1-reject `COMMITTED_RAY_T` (`defer_p1_t_to_reject == true`):
+        let mut rl_dyn = rl_shadow.clone();
+        rl_dyn.ray_flags = RayInput::Val(Value(99));
+        let prev_fno2 = super::super::lower::TEST_NATIVE_RT_FNO_MODE.replace(Some(2));
+        let mut s2 = Shader::new(false);
+        s2.threads = Some([8, 8, 1]);
+        let e2 = s2.entry;
+        let p1_b2 = s2.m.new_block();
+        let p2_b2 = s2.m.new_block();
+        let ex2 = s2.m.new_block();
+        let tlas2 = s2.rtas_root_srv_handle(e2, 0);
+        let rq2 = s2.allocate_ray_query(e2, 0);
+        let z2 = s2.m.i32(0);
+        let one2 = s2.m.i32(1.0f32.to_bits());
+        let ten2 = s2.m.i32(10.0f32.to_bits());
+        let dyn_f2 = s2.m.i32(flags);
+        let mut fb2 = HashMap::new();
+        fb2.insert(Value(0), z2);
+        fb2.insert(Value(3), ten2);
+        let in2 = ResolvedRayInputs {
+            rq: rq2,
+            two_pass_early_fields: None,
+            tlas: tlas2,
+            active_ray: None,
+            origin: [z2, z2, z2],
+            t_min: None,
+            dir: [one2, z2, z2],
+            t_max: ten2,
+            instance_mask: None,
+            ray_flags: Some(dyn_f2),
+            group_const_flags: 0,
+            fbt_split_mask: 0,
+            fbt_mirror_tlas: false,
+            init_min_front_t: None,
+            anyhit_inits: vec![],
+            anyhit_entry_dxil: Some(p2_b2),
+            fallbacks: fb2,
+        };
+        let em2 = emit_ray_loop(&mut s2, e2, ex2, &rl_dyn, &in2);
+        let pend2 = em2.pending_anyhit.expect("pending anyhit dyn");
+        let spec2 = pend2.spec.expect("spec dyn");
+        super::super::lower::TEST_NATIVE_RT_FNO_MODE.set(prev_fno2);
+        assert!(spec2.p1_t_f32.is_none());
+        assert!(spec2.defer_p1_t_to_reject);
+        s2.m.terminate(spec2.p1_bridge_blk, Term::Br(p1_b2));
+        let (pb1, g1d) = emit_ray_meta_load(&mut s2, p1_b2, rq2, false, RayMetaKind::GeometryIndexShl8, 1, None);
+        let acc1 = s2.m.cmp(pb1, pred::NE, g1d[0], z2);
+        finish_fno_spec_pass1(&mut s2, &spec2, pb1, acc1);
+        let (pb2, g2d) = emit_ray_meta_load(&mut s2, p2_b2, rq2, true, RayMetaKind::GeometryIndexShl8, 1, None);
+        let acc2 = s2.m.cmp(pb2, pred::NE, g2d[0], z2);
+        s2.m.terminate(pb2, Term::CondBr(acc2, pend2.do_commit_blk, pend2.latch_blk));
+        s2.m.terminate(ex2, Term::Ret);
+        let mut dxbc2 = s2.finish();
+        assert!(dxbc2.starts_with(b"DXBC"));
+        if let Ok(mut v) = crate::emit::validator::Validator::load(
+            crate::emit::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut dxbc2)
+                .expect("dynamic-flags deferred p1_t fno_spec DXIL must pass dxil.dll validation");
+        }
+    }
+
+    #[test]
+    fn fbt_two_pass_emits_wave_active_any_true_pass_b_skip_guard_and_validates_dxil() {
+        let flags = ray_flag::FORCE_NON_OPAQUE | ray_flag::SKIP_PROCEDURAL_PRIMITIVES;
+        let rl = RayLoop {
+            rq_group: 0,
+            entry_block: 1,
+            exit_block: 2,
+            exit_pred: 1,
+            skipped_blocks: vec![],
+            template: RayTemplate::Bvh64,
+            kind: RayLoopKind::FrontBackTrack {
+                init_min_front_t: RayInput::Val(Value(7)),
+            },
+            tlas_load: (0, 0),
+            tlas_root_load: None,
+            active_ray_mask: None,
+            origin: [RayInput::Val(Value(1)); 3],
+            t_min: None,
+            dir: [RayInput::Val(Value(2)); 3],
+            t_max: RayInput::Val(Value(7)),
+            instance_mask: RayInput::Val(Value(8)),
+            ray_flags: RayInput::Const(flags),
+            outputs: vec![
+                RayOutputBinding {
+                    value: Value(10),
+                    output: RayOutput::CommittedStatusTriNode,
+                    fallback: Some(Value(0)),
+                },
+                RayOutputBinding {
+                    value: Value(11),
+                    output: RayOutput::CommittedRayT,
+                    fallback: Some(Value(7)),
+                },
+                RayOutputBinding {
+                    value: Value(12),
+                    output: RayOutput::FrontBackMinFrontT,
+                    fallback: Some(Value(7)),
+                },
+                RayOutputBinding {
+                    value: Value(13),
+                    output: RayOutput::CommittedGeometryIndex,
+                    fallback: None,
+                },
+            ],
+            committed_meta_loads: vec![],
+            direct_normals: vec![],
+        };
+
+        let mut s = Shader::new(false);
+        s.threads = Some([8, 8, 1]);
+        let entry = s.entry;
+        let exit = s.m.new_block();
+        let tlas = s.rtas_root_srv_handle(entry, 0);
+        let alloc_flags = ray_flag::SKIP_PROCEDURAL_PRIMITIVES;
+        let rq = s.allocate_ray_query(entry, alloc_flags);
+        let zero = s.m.i32(0);
+        let one_f = s.m.i32(1.0f32.to_bits());
+        let ten_f = s.m.i32(10.0f32.to_bits());
+        let mask_v = s.m.i32(0xFF);
+        let mut fallbacks = HashMap::new();
+        fallbacks.insert(Value(0), zero);
+        fallbacks.insert(Value(7), ten_f);
+
+        let inputs = ResolvedRayInputs {
+            rq,
+            two_pass_early_fields: None,
+            tlas,
+            active_ray: Some(s.m.bool(true)),
+            origin: [zero, zero, zero],
+            t_min: None,
+            dir: [one_f, zero, zero],
+            t_max: ten_f,
+            instance_mask: Some(mask_v),
+            ray_flags: None,
+            group_const_flags: alloc_flags,
+            fbt_split_mask: 0,
+            fbt_mirror_tlas: true,
+            init_min_front_t: Some(ten_f),
+            anyhit_inits: vec![],
+            anyhit_entry_dxil: None,
+            fallbacks,
+        };
+
+        let emitted = emit_ray_loop(&mut s, entry, exit, &rl, &inputs);
+        assert_eq!(emitted.outs.len(), 4);
+        assert_ne!(
+            s.flags & super::super::shader::flags::WAVE_OPS,
+            0,
+            "WaveActiveAnyTrue Pass-B guard must set WAVE_OPS DXIL shader flag"
+        );
+        assert!(
+            s.m.usage().wave_ops,
+            "fbt_two_pass IR must contain dx.op.waveAnyTrue Pass-B skip guard"
+        );
+
+        s.m.terminate(exit, Term::Ret);
+        let mut dxbc = s.finish();
+        assert!(dxbc.starts_with(b"DXBC"));
+        if let Ok(mut v) = crate::emit::validator::Validator::load(
+            crate::emit::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut dxbc)
+                .expect("fbt_two_pass with WaveActiveAnyTrue Pass-B guard must pass dxil.dll validation");
+        }
     }
 }

@@ -107,14 +107,23 @@ pub(crate) fn sections_on() -> bool {
     })
 }
 
+/// Default cap for address-opened heaps (`VICTORY_INPLACE_MB`, 4096 MiB).
+const DEFAULT_INPLACE_MB: u64 = 4096;
+
 /// The most title memory pinned in place at once via address-opened heaps, in
-/// bytes (`VICTORY_INPLACE_MB`, 4096): opening from an address locks pages into
+/// bytes (`VICTORY_INPLACE_MB`, 1024): opening from an address locks pages into
 /// the PC's working set, also those the title never touched. Section heaps
 /// opened via `OpenExistingHeapFromFileMapping` lock 0 MB and do not consume
 /// this budget.
 pub(crate) fn most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *MOST.get_or_init(|| std::env::var("VICTORY_INPLACE_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(4096) << 20)
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_INPLACE_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(DEFAULT_INPLACE_MB)
+            << 20
+    })
 }
 
 /// In place now: windows and their bytes, title buffers and their bytes;
@@ -158,6 +167,16 @@ impl Drop for OwnedView {
     }
 }
 
+/// RAII guard unregistering a `place_part` private `OpenExistingHeapFromAddress1`
+/// interval when the owning `Placed` or `Shadow` drops.
+pub(crate) struct PrivatePlacedGuard(u64, u64);
+
+impl Drop for PrivatePlacedGuard {
+    fn drop(&mut self) {
+        forget_private_placed(self.0, self.1);
+    }
+}
+
 /// A buffer placed over title memory, and its heap.
 pub(crate) struct Placed {
     pub(crate) buffer: ID3D12Resource,
@@ -170,6 +189,66 @@ pub(crate) struct Placed {
     pub(crate) bias: u64,
     /// Bytes accounted in `inplace::PINNED_BYTES` (`0` for `port` and section heaps).
     pub(crate) pinned: u64,
+    /// Unregisters the private address-heap interval when dropped (Spec-Trap #8).
+    pub(crate) private_guard: Option<PrivatePlacedGuard>,
+}
+
+/// Active private `OpenExistingHeapFromAddress1` intervals `(start, end)` opened
+/// via [`place_part`] so Mode-1/Mode-2 `PAGE_NOACCESS` tripwires never overlap
+/// them (Spec-Trap #8).
+static PRIVATE_PLACED: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
+static PRIVATE_PLACED_BOUNDS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+fn private_placed_refresh_bounds(intervals: &[(u64, u64)]) {
+    let lo = intervals.iter().map(|r| r.0).min().unwrap_or(0);
+    let hi = intervals.iter().map(|r| r.1).max().unwrap_or(0);
+    PRIVATE_PLACED_BOUNDS[0].store(lo, Ordering::Relaxed);
+    PRIVATE_PLACED_BOUNDS[1].store(hi, Ordering::Relaxed);
+}
+
+fn note_private_placed(start: u64, len: u64) {
+    let Some(end) = start.checked_add(len).filter(|&e| e > start) else {
+        return;
+    };
+    let mut intervals = PRIVATE_PLACED.lock().unwrap_or_else(|e| e.into_inner());
+    intervals.push((start, end));
+    private_placed_refresh_bounds(&intervals);
+}
+
+fn forget_private_placed(start: u64, len: u64) {
+    if len == 0 {
+        return;
+    }
+    let end = start.saturating_add(len);
+    if PRIVATE_PLACED_BOUNDS[1].load(Ordering::Relaxed) <= start
+        || PRIVATE_PLACED_BOUNDS[0].load(Ordering::Relaxed) >= end
+    {
+        return;
+    }
+    let mut intervals = PRIVATE_PLACED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(pos) = intervals.iter().position(|&(s, e)| s == start && e == end) {
+        intervals.swap_remove(pos);
+    } else {
+        intervals.retain(|&(s, e)| e <= start || s >= end);
+    }
+    private_placed_refresh_bounds(&intervals);
+}
+
+/// Whether `[start, start + len)` overlaps any active `OpenExistingHeapFromAddress1`
+/// heap opened on `MEM_PRIVATE` pages (via `inplace::place_part` or `port::REGIONS`).
+/// Enforces Spec-Trap #8 mutual exclusion with `PAGE_NOACCESS` tripwires.
+pub(crate) fn overlaps_private_placed(start: u64, len: u64) -> bool {
+    let Some(end) = start.checked_add(len).filter(|&e| e > start) else {
+        return false;
+    };
+    let hi = PRIVATE_PLACED_BOUNDS[1].load(Ordering::Relaxed);
+    if hi > start && PRIVATE_PLACED_BOUNDS[0].load(Ordering::Relaxed) < end {
+        let intervals = PRIVATE_PLACED.lock().unwrap_or_else(|e| e.into_inner());
+        if intervals.iter().any(|&(s, e)| e > start && s < end) {
+            return true;
+        }
+    }
+    crate::port::has_private_region_overlap(start, len)
 }
 
 /// Opens the 64 KiB pages that hold title memory `[start, start + len)`
@@ -180,6 +259,11 @@ pub(crate) struct Placed {
 pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<Placed, Option<windows::core::Error>> {
     let at = start & !(K64 as u64 - 1);
     let bytes = (start + len.max(1)).next_multiple_of(K64 as u64) - at;
+    // Spec-Trap #8: never open `OpenExistingHeapFromAddress1` on pages that are
+    // currently tripwired or belong to a GPU-only tripwire-eligible card buffer.
+    if crate::shadow::overlaps_gpu_only_or_tripwired(at, bytes) {
+        return Err(None);
+    }
     if !crate::inplace_sections::private_committed_subrange(at as usize, bytes as usize) {
         return Err(None);
     }
@@ -187,7 +271,16 @@ pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<
     let buffer = place(device, &heap, 0, bytes).map_err(Some)?;
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
-    Ok(Placed { buffer, heap, view: None, gpu, bias: start - at, pinned: bytes })
+    note_private_placed(at, bytes);
+    Ok(Placed {
+        buffer,
+        heap,
+        view: None,
+        gpu,
+        bias: start - at,
+        pinned: bytes,
+        private_guard: Some(PrivatePlacedGuard(at, bytes)),
+    })
 }
 
 /// Title memory `[start, start + len)` in place, for a window outside
@@ -283,6 +376,7 @@ pub fn title_memory_freeing(at: usize, len: usize) {
     crate::inplace_sections::bump_generation();
     // Renderer port 1's regions there: no longer what the title shows.
     crate::port::forget(at, len);
+    forget_private_placed(at as u64, len as u64);
     // Evict & unpin non-placed loose windows wholly inside freed/remapped guest VA.
     let _ = crate::shadow::loose_unmapped(at as u64, len as u64);
     if STATS[0].load(Ordering::Relaxed) + STATS[2].load(Ordering::Relaxed) == 0 {
@@ -670,6 +764,38 @@ pub(crate) fn is_committed_section(section: usize) -> bool {
 pub(crate) fn stretch(at: usize, len: usize) -> Option<(usize, usize, usize, u64)> {
     let v = views();
     stretch_in(&v.views, at, len)
+}
+
+/// Returns the contiguous single-section stretch `(run_start, run_end)` covering
+/// `[at, end)` if `[at, end)` lies within one stretch of a `SEC_COMMIT` section,
+/// so loose windows clamp ONLY for stretches eligible for zero-copy, zero-pinned
+/// `OpenExistingHeapFromFileMapping` (never fragmenting `SEC_RESERVE` stretches
+/// into overlapping L0 copies).
+pub(crate) fn committed_section_run_bounds(at: u64, end: u64) -> Option<(u64, u64)> {
+    let len = end.checked_sub(at)?;
+    if len == 0 {
+        return None;
+    }
+    let v = views();
+    let (s_start, s_len, section, _) = stretch_in(&v.views, at as usize, len as usize)?;
+    if !v.sections.iter().any(|s| s.0 == section && s.2) {
+        return None;
+    }
+    let run_start = s_start as u64;
+    let run_end = run_start.checked_add(s_len as u64)?;
+    Some((run_start, run_end))
+}
+
+#[allow(dead_code)]
+pub(crate) fn section_run_bounds(at: u64, end: u64) -> Option<(u64, u64)> {
+    let len = end.checked_sub(at)?;
+    if len == 0 {
+        return None;
+    }
+    let (s_start, s_len, _, _) = stretch(at as usize, len as usize)?;
+    let run_start = s_start as u64;
+    let run_end = run_start.checked_add(s_len as u64)?;
+    Some((run_start, run_end))
 }
 
 #[allow(dead_code)]
