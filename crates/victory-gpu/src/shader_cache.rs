@@ -63,6 +63,10 @@ fn build() -> [u8; 32] {
     // The view heap's null slot differs by host GPU: a translation cached
     // without the clamp must not be served (`host_settings` below).
     crate::descriptor::host::probe_view_limit();
+    translation_key()
+}
+
+fn translation_key() -> [u8; 32] {
     static FIXED: OnceLock<Vec<u8>> = OnceLock::new();
     let fixed = FIXED.get_or_init(|| {
         let limit = victory_shader::emit::loop_limit();
@@ -103,6 +107,13 @@ fn build() -> [u8; 32] {
             if let Some(value) = std::env::var_os(name) {
                 bytes.extend_from_slice(value.as_encoded_bytes());
             }
+            bytes.push(0);
+        }
+        // Closest-hit pre-shrink is distinct from the two-pass state-machine
+        // and front/back traversal options. Use the lowerer's effective bit.
+        if victory_shader::emit::native_rt() {
+            bytes.extend_from_slice(b"VICTORY_NATIVE_RT_TWO_PASS=");
+            bytes.push(u8::from(victory_shader::emit::native_rt_two_pass()));
             bytes.push(0);
         }
         // And which clean-up passes ran over the translated code.
@@ -959,6 +970,65 @@ mod tests {
         // Failures are not stored.
         let fail = |_: &[u8]| Err::<HostShader, _>("unsupported".to_owned());
         assert!(cached(&cache, &build, b"other", fail).is_err());
+    }
+
+    #[test]
+    fn native_rt_two_pass_modes_get_separate_disk_entries() {
+        const CACHE_DIR: &str = "VICTORY_TEST_NATIVE_RT_CACHE_DIR";
+        const EXPECT_MISS: &str = "VICTORY_TEST_NATIVE_RT_CACHE_MISS";
+        const NATIVE: &str = "VICTORY_NATIVE_RT";
+        const TWO_PASS: &str = "VICTORY_NATIVE_RT_TWO_PASS";
+        if let Some(dir) = std::env::var_os(CACHE_DIR) {
+            let cache = Cache::open(PathBuf::from(dir)).unwrap();
+            let mut expected = shader();
+            let mode = if victory_shader::emit::native_rt() {
+                1 + u8::from(victory_shader::emit::native_rt_two_pass())
+            } else {
+                0
+            };
+            expected.dxil.push(mode);
+            let ran = AtomicBool::new(false);
+            let actual = cached(&cache, &translation_key(), b"same container in all modes", |_| {
+                ran.store(true, Ordering::Relaxed);
+                Ok(expected.clone())
+            })
+            .unwrap();
+            assert_eq!(actual, expected, "a warm hit returned another mode's bytes");
+            assert_eq!(ran.load(Ordering::Relaxed), std::env::var_os(EXPECT_MISS).is_some());
+            return;
+        }
+
+        // The effective options and fixed key are initialized once per process.
+        let executable = std::env::current_exe().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        for (native, two_pass, miss) in [
+            ("1", None, true),
+            ("1", Some("0"), true),
+            ("1", Some("1"), false),
+            ("1", Some("0"), false),
+            ("0", None, true),
+            ("0", Some("0"), false),
+        ] {
+            let mut cmd = Command::new(&executable);
+            cmd.args(["--exact", "shader_cache::tests::native_rt_two_pass_modes_get_separate_disk_entries"])
+                .env(CACHE_DIR, dir.path())
+                .env(NATIVE, native)
+                .env_remove(TWO_PASS)
+                .env_remove(EXPECT_MISS);
+            if let Some(value) = two_pass {
+                cmd.env(TWO_PASS, value);
+            }
+            if miss {
+                cmd.env(EXPECT_MISS, "1");
+            }
+            let out = cmd.output().unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success() && stdout.contains("1 passed"),
+                "native={native} two-pass={two_pass:?}: {stdout}\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
