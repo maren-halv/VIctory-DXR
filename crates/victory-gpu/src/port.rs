@@ -164,6 +164,95 @@ pub(crate) fn pinned_bytes() -> u64 {
 /// quick look on the paths that run thousands of times a frame.
 static BOUNDS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+/// Active `port 1` in-place intervals `(start, end)` (including zero-pinned
+/// committed-section placements that bypass `REGIONS`), coalesced and sorted,
+/// so overlapping shadowed copies and textures invalidate properly (`ARCH-06 #4`).
+static PLACED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+static PLACED_BOUNDS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+fn placed_bounds(intervals: &[(u64, u64)]) {
+    let lo = intervals.first().map_or(0, |r| r.0);
+    let hi = intervals.last().map_or(0, |r| r.1);
+    PLACED_BOUNDS[0].store(lo, Ordering::Relaxed);
+    PLACED_BOUNDS[1].store(hi, Ordering::Relaxed);
+}
+
+fn note_placed_interval(start: u64, len: u64) {
+    let Some(end) = start.checked_add(len).filter(|&e| e > start) else {
+        return;
+    };
+    let mut intervals = PLACED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut pos = intervals.partition_point(|r| r.1 < start);
+    let mut lo = start;
+    let mut hi = end;
+    let mut merge_end = pos;
+    while merge_end < intervals.len() && intervals[merge_end].0 <= hi {
+        lo = lo.min(intervals[merge_end].0);
+        hi = hi.max(intervals[merge_end].1);
+        merge_end += 1;
+    }
+    if merge_end == pos {
+        intervals.insert(pos, (lo, hi));
+    } else {
+        intervals[pos] = (lo, hi);
+        if merge_end > pos + 1 {
+            intervals.drain(pos + 1..merge_end);
+        }
+    }
+    let _ = &mut pos;
+    placed_bounds(&intervals);
+}
+
+fn forget_placed_interval(at: u64, end: u64) {
+    if PLACED_BOUNDS[1].load(Ordering::Relaxed) <= at || PLACED_BOUNDS[0].load(Ordering::Relaxed) >= end {
+        return;
+    }
+    let mut intervals = PLACED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut next = Vec::with_capacity(intervals.len());
+    for &(lo, hi) in intervals.iter() {
+        if hi <= at || lo >= end {
+            next.push((lo, hi));
+        } else {
+            if lo < at {
+                next.push((lo, at));
+            }
+            if hi > end {
+                next.push((end, hi));
+            }
+        }
+    }
+    *intervals = next;
+    placed_bounds(&intervals);
+}
+
+/// Whether `[start, start + len)` overlaps any active `port 1` in-place
+/// placement or cached region (including zero-pinned committed sections).
+pub(crate) fn overlaps(start: u64, len: u64) -> bool {
+    let Some(end) = start.checked_add(len).filter(|&e| e > start) else {
+        return false;
+    };
+    let p_hi = PLACED_BOUNDS[1].load(Ordering::Relaxed);
+    if p_hi > start && PLACED_BOUNDS[0].load(Ordering::Relaxed) < end {
+        let intervals = PLACED.lock().unwrap_or_else(|e| e.into_inner());
+        let i = intervals.partition_point(|r| r.1 <= start);
+        if intervals.get(i).is_some_and(|r| r.0 < end) {
+            return true;
+        }
+    }
+    let r_hi = BOUNDS[1].load(Ordering::Relaxed);
+    if r_hi > start && BOUNDS[0].load(Ordering::Relaxed) < end {
+        if REGIONS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|r| r.end > start && r.start < end)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Since the start: `[0]` view regions opened, `[1]` their bytes; `[2]` title
 /// buffers and windows placed; refused `[3]` not one stretch/private, `[4]` not
 /// committed, `[5]` refused by host/budget, `[6]` no buffer; `[7]` regions
@@ -352,6 +441,7 @@ pub(crate) fn place_in_with(
             Ok(placed) => {
                 STATS[13].fetch_add(1, Ordering::Relaxed);
                 STATS[14].fetch_add(len, Ordering::Relaxed);
+                note_placed_interval(start, len);
                 return Ok(placed);
             }
             Err(crate::inplace_sections::SectionPlaceError::NotCommittedRun) => {}
@@ -392,14 +482,17 @@ pub(crate) fn place_in_with(
     let buffer = crate::inplace::place(device, &region.heap, at - region.start, end - at).map_err(|e| (6, format!("no buffer placed in the region: {e}")))?;
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
-    Ok(Placed {
+    let placed = Placed {
         buffer,
         heap: region.heap.clone(),
         view: region.view.clone(),
         gpu,
         bias: start - at,
         pinned: 0,
-    })
+    };
+    drop(regions);
+    note_placed_interval(start, len);
+    Ok(placed)
 }
 
 /// Maps and opens `[first, first + bytes)` of `section` at `offset` as a
@@ -580,6 +673,7 @@ fn bounds(regions: &[Region]) {
 /// forgotten (what is placed in them is let go by the caller).
 pub(crate) fn forget(at: usize, len: usize) {
     let (at, end) = (at as u64, (at as u64).saturating_add(len as u64));
+    forget_placed_interval(at, end);
     if BOUNDS[1].load(Ordering::Relaxed) <= at || BOUNDS[0].load(Ordering::Relaxed) >= end {
         return;
     }
@@ -612,21 +706,7 @@ pub(crate) fn forget(at: usize, len: usize) {
 /// Whether `[at, at + len)` touches ported memory (a quick look).
 #[allow(dead_code)]
 fn touches(at: usize, len: usize) -> bool {
-    let hi = BOUNDS[1].load(Ordering::Relaxed);
-    let lo = BOUNDS[0].load(Ordering::Relaxed);
-    let (start, end) = (at as u64, (at as u64).saturating_add(len as u64));
-    if hi == 0 || start >= hi || end <= lo {
-        return false;
-    }
-    if hi <= LOW {
-        return true;
-    }
-    // When both 32-bit and 64-bit regions exist, verify an actual region overlaps.
-    REGIONS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .iter()
-        .any(|r| r.end > start && r.start < end)
+    overlaps(at as u64, len as u64)
 }
 
 /// A fill of upload memory read `len` bytes at `src` on the CPU.
@@ -1039,5 +1119,23 @@ mod tests {
             assert_eq!(REGIONS.lock().unwrap().len(), regions_before);
             let _ = mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE);
         }
+    }
+
+    #[test]
+    fn placed_intervals_track_overlaps_and_split_on_forget() {
+        let base = 0x6_E000_0000_0000u64;
+        assert!(!overlaps(base, 0x30_0000));
+        note_placed_interval(base, 0x10_0000);
+        note_placed_interval(base + 0x10_0000, 0x10_0000);
+        assert!(overlaps(base + 0x08_0000, 0x4000));
+        assert!(overlaps(base + 0x18_0000, 0x4000));
+        assert!(!overlaps(base + 0x20_0000, 0x1000));
+        // Punch a hole in the middle: both ends stay tracked while the middle clears.
+        forget_placed_interval(base + 0x08_0000, base + 0x18_0000);
+        assert!(overlaps(base, 0x1000));
+        assert!(!overlaps(base + 0x08_0000, 0x10_0000));
+        assert!(overlaps(base + 0x18_0000, 0x1000));
+        forget_placed_interval(base, base + 0x20_0000);
+        assert!(!overlaps(base, 0x20_0000));
     }
 }

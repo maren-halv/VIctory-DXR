@@ -405,9 +405,10 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
                 drop(_over);
                 drop(_round);
                 let frame = crate::frame::current();
-                if SYNC_ASKED.load(Acquire) <= SYNC_DONE.load(Acquire)
-                    || last_maint_frame.saturating_add(2) <= frame
-                {
+                // Yield forced maintenance whenever `victory-submit` is waiting
+                // (`CPU-10`); only force a tiny slice if starved for 8+ frames.
+                let waiting = SYNC_ASKED.load(Acquire) > SYNC_DONE.load(Acquire);
+                if !waiting || last_maint_frame.saturating_add(8) <= frame {
                     last_maint_frame = frame;
                     let _maint = crate::timeline::span("the heaps' records, maintenance");
                     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -571,6 +572,7 @@ fn scan_heap_parts(
     frame: u64,
     batch: &[(usize, usize, bool)],
     chunk_size: usize,
+    defer_unmake: bool,
 ) -> Vec<SyncPart> {
     use std::sync::atomic::Ordering::Relaxed;
     if batch.is_empty() {
@@ -675,9 +677,14 @@ fn scan_heap_parts(
                     crate::port_descriptors::missed(index, start + u64::from(index) * step, !samplers && word(0) == VIEW_TAG, host.copied_tabled(index, frame));
                 }
                 if !samplers && word(0) == VIEW_TAG {
-                    // A draw's own table: the draw makes what it
-                    // reads of it (`draw.rs` `tables`).
-                    if host.copied_tabled(index, frame) {
+                    // A draw's own table: defer past `stamp + COPIED_FRAMES + 1`
+                    // instead of silently dropping after `self.copied` was mutated
+                    // (`ARCH-08`), using `quick_matches()` as a cheap no-op check.
+                    if let Some(due_frame) = host.copied_tabled_until(index, frame) {
+                        let key = u64::from(word(2)) << 32 | u64::from(word(1));
+                        if !host.quick_matches(index, key) {
+                            out.tabled_wait.push((due_frame, index));
+                        }
                         out.tabled += 1;
                         continue;
                     }
@@ -695,6 +702,13 @@ fn scan_heap_parts(
                 // b2-water).
                 if word(0) != VIEW_TAG && host.shows_none(index) {
                     out.nothing += 1;
+                    continue;
+                }
+                // Non-view unmakes (`~4.1k/f`) are deferred off `sync_heaps_marked`
+                // onto maintenance (`CPU-02`), where each re-checks `word(0) != VIEW_TAG`.
+                if defer_unmake && !samplers && word(0) != VIEW_TAG {
+                    out.unmake.push(index);
+                    out.kinds[0] += 1;
                     continue;
                 }
                 out.make.push(index);
@@ -797,8 +811,11 @@ fn sync_heaps_marked() {
             frame,
             &parts,
             mark_pages_a_job,
+            !heap.samplers(),
         );
         let mut make: Vec<u32> = Vec::new();
+        let mut unmake: Vec<u32> = Vec::new();
+        let mut tabled_wait: std::collections::BTreeMap<u64, Vec<u32>> = std::collections::BTreeMap::new();
         for mut part in found {
             pages += part.pages;
             views += part.views;
@@ -811,6 +828,10 @@ fn sync_heaps_marked() {
             mirrored += part.make.len() as u64;
             wait.append(&mut part.wait);
             make.append(&mut part.make);
+            unmake.append(&mut part.unmake);
+            for (due, slot) in part.tabled_wait {
+                tabled_wait.entry(due).or_default().push(slot);
+            }
             for (kind, n) in kinds.iter_mut().zip(part.kinds) {
                 *kind += n;
             }
@@ -831,6 +852,12 @@ fn sync_heaps_marked() {
         spent[2] += since(began);
         if !wait.is_empty() {
             host.copied_wait(frame, std::mem::take(&mut wait));
+        }
+        for (due, slots) in tabled_wait {
+            host.copied_wait_at(due, slots);
+        }
+        if !unmake.is_empty() {
+            host.defer_unmakes(unmake);
         }
     }
     drop(heaps);
@@ -890,26 +917,53 @@ fn sync_heaps_maintenance_step(pending: &mut Vec<(usize, Vec<u32>)>, preemptible
             return (0, 0);
         }
         let of_tables = std::sync::atomic::AtomicU64::new(0);
+        let redefer: std::sync::Mutex<Vec<(u64, u32)>> = std::sync::Mutex::new(Vec::new());
         let phase = crate::timeline::span("the heaps' records: those that waited");
         crate::land::each_view(true, slice.len().div_ceil(records_a_job), &|n| {
             let chunk = slice.chunks(records_a_job).nth(n).unwrap_or_default();
             let mut to_mirror = Vec::with_capacity(chunk.len());
+            let mut local_redefer = Vec::new();
             let mut tabled_n = 0u64;
             for &index in chunk {
-                if host.copied_tabled(index, frame) {
+                let handle = start + u64::from(index) * step;
+                if let Some([_, i, generation]) = record_at(handle) {
+                    let key = u64::from(generation) << 32 | u64::from(i);
+                    if host.quick_matches(index, key) {
+                        tabled_n += 1;
+                        continue;
+                    }
+                    if let Some(due) = host.copied_tabled_until(index, frame) {
+                        local_redefer.push((due, index));
+                        tabled_n += 1;
+                        continue;
+                    }
+                } else if host.shows_none(index) {
                     tabled_n += 1;
-                } else {
-                    to_mirror.push(index);
+                    continue;
                 }
+                to_mirror.push(index);
             }
             if tabled_n > 0 {
                 of_tables.fetch_add(tabled_n, Relaxed);
+            }
+            if !local_redefer.is_empty() {
+                redefer.lock().unwrap_or_else(|e| e.into_inner()).extend(local_redefer);
             }
             if !to_mirror.is_empty() {
                 host.mirror_batch(&to_mirror, start, step, false);
             }
         });
         phase.end();
+        let redefer = redefer.into_inner().unwrap_or_else(|e| e.into_inner());
+        if !redefer.is_empty() {
+            let mut by_due: std::collections::BTreeMap<u64, Vec<u32>> = std::collections::BTreeMap::new();
+            for (due, slot) in redefer {
+                by_due.entry(due).or_default().push(slot);
+            }
+            for (due, slots) in by_due {
+                host.copied_wait_at(due, slots);
+            }
+        }
         let of_tables = of_tables.into_inner();
         (of_tables, slice.len() as u64 - of_tables)
     };
@@ -980,6 +1034,26 @@ fn sync_heaps_maintenance_step(pending: &mut Vec<(usize, Vec<u32>)>, preemptible
             if demanded() {
                 break;
             }
+            // Drain deferred non-view unmakes (`CPU-02`), re-checking
+            // `word(0) != VIEW_TAG` before clearing so live overwrites survive.
+            let unmakes = host.take_deferred_unmakes(if preemptible { MAINT_CHUNK } else { usize::MAX });
+            if !unmakes.is_empty() {
+                let mut still_non_view = Vec::with_capacity(unmakes.len());
+                for index in unmakes {
+                    if !host.shows_none(index)
+                        && record_at(start + u64::from(index) * step).is_none()
+                    {
+                        still_non_view.push(index);
+                    }
+                }
+                if !still_non_view.is_empty() {
+                    mirrored += still_non_view.len() as u64;
+                    host.mirror_batch(&still_non_view, start, step, false);
+                }
+            }
+            if demanded() {
+                break;
+            }
             let port = crate::port_descriptors::adopted(start);
             if !port {
                 continue;
@@ -995,58 +1069,78 @@ fn sync_heaps_maintenance_step(pending: &mut Vec<(usize, Vec<u32>)>, preemptible
             if demanded() {
                 break;
             }
-            let mut check_parts: Vec<(usize, usize, bool)> = Vec::new();
-            for page in crate::port_descriptors::to_check(frame) {
-                check_parts.push((page.max(start as usize), (page + crate::watch::PAGE).min(end as usize), true));
-            }
-            if check_parts.is_empty() {
+            let check_pages = crate::port_descriptors::to_check(frame);
+            if check_pages.is_empty() {
                 continue;
             }
-            let began = std::time::Instant::now();
-            let found = scan_heap_parts(
-                host,
-                start,
-                step,
-                mirrored_count,
-                heap.samplers(),
-                port,
-                frame,
-                &check_parts,
-                pages_a_job,
-            );
-            let mut make: Vec<u32> = Vec::new();
-            for mut part in found {
-                pages += part.pages;
-                views += part.views;
-                bytes += part.bytes;
-                looked += part.looked;
-                short += part.short;
-                tabled += part.tabled;
-                kinds[0] += part.nothing;
-                later += part.wait.len() as u64;
-                mirrored += part.make.len() as u64;
-                wait.append(&mut part.wait);
-                make.append(&mut part.make);
-                for (kind, n) in kinds.iter_mut().zip(part.kinds) {
-                    *kind += n;
+            // Preemptible fallback page scan (`CPU-10`): check `demanded()`
+            // per page so `victory-submit` never stalls behind a 16-page burst.
+            let mut tabled_wait: std::collections::BTreeMap<u64, Vec<u32>> = std::collections::BTreeMap::new();
+            for (pi, &page) in check_pages.iter().enumerate() {
+                if demanded() {
+                    crate::port_descriptors::put_back_pages(&check_pages[pi..]);
+                    break;
                 }
-                for (ns, n) in job_ns.iter_mut().zip(part.ns) {
-                    *ns += n;
+                let one_page = [(
+                    page.max(start as usize),
+                    (page + crate::watch::PAGE).min(end as usize),
+                    true,
+                )];
+                let began = std::time::Instant::now();
+                let found = scan_heap_parts(
+                    host,
+                    start,
+                    step,
+                    mirrored_count,
+                    heap.samplers(),
+                    port,
+                    frame,
+                    &one_page,
+                    pages_a_job,
+                    false,
+                );
+                let mut make: Vec<u32> = Vec::new();
+                for mut part in found {
+                    pages += part.pages;
+                    views += part.views;
+                    bytes += part.bytes;
+                    looked += part.looked;
+                    short += part.short;
+                    tabled += part.tabled;
+                    kinds[0] += part.nothing;
+                    later += part.wait.len() as u64;
+                    mirrored += part.make.len() as u64;
+                    wait.append(&mut part.wait);
+                    make.append(&mut part.make);
+                    for (due, slot) in part.tabled_wait {
+                        tabled_wait.entry(due).or_default().push(slot);
+                    }
+                    for (kind, n) in kinds.iter_mut().zip(part.kinds) {
+                        *kind += n;
+                    }
+                    for (ns, n) in job_ns.iter_mut().zip(part.ns) {
+                        *ns += n;
+                    }
+                }
+                spent[1] += since(began);
+                if !make.is_empty() {
+                    let began = std::time::Instant::now();
+                    let phase = crate::timeline::span("the heaps' records: made");
+                    crate::land::each_view(true, make.len().div_ceil(records_a_job), &|n| {
+                        let chunk = make.chunks(records_a_job).nth(n).unwrap_or_default();
+                        if !chunk.is_empty() {
+                            host.mirror_batch(chunk, start, step, false);
+                        }
+                    });
+                    phase.end();
+                    spent[2] += since(began);
                 }
             }
-            spent[1] += since(began);
-            let began = std::time::Instant::now();
-            let phase = crate::timeline::span("the heaps' records: made");
-            crate::land::each_view(true, make.len().div_ceil(records_a_job), &|n| {
-                let chunk = make.chunks(records_a_job).nth(n).unwrap_or_default();
-                if !chunk.is_empty() {
-                    host.mirror_batch(chunk, start, step, false);
-                }
-            });
-            phase.end();
-            spent[2] += since(began);
             if !wait.is_empty() {
                 host.copied_wait(frame, std::mem::take(&mut wait));
+            }
+            for (due, slots) in tabled_wait {
+                host.copied_wait_at(due, slots);
             }
             if demanded() {
                 break;
@@ -1142,6 +1236,8 @@ struct SyncPart {
     nothing: u64,
     make: Vec<u32>,
     wait: Vec<u32>,
+    tabled_wait: Vec<(u64, u32)>,
+    unmake: Vec<u32>,
     kinds: [u64; 5],
     /// Nanoseconds reading, comparing, sorting out ([`SYNC_JOBS_NS`]).
     ns: [u64; 3],
@@ -1591,6 +1687,49 @@ impl View {
 /// without the address: as many as the title has kinds of textures and
 /// buffers, however often it moves them).
 /// `VICTORY_VIEW_INLINE=0`: every view is an entry, as before.
+/// Fast non-cryptographic FxHash-style hasher for `VIEWS.shape_index` (`CPU-30`).
+#[derive(Default)]
+struct ShapeHash(u64);
+
+impl std::hash::Hasher for ShapeHash {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        const K: u64 = 0x517c_c1b7_2722_0a95;
+        let mut h = self.0;
+        let mut chunks = bytes.chunks_exact(8);
+        for c in &mut chunks {
+            let v = u64::from_ne_bytes(c.try_into().unwrap());
+            h = (h.rotate_left(5) ^ v).wrapping_mul(K);
+        }
+        let rem = chunks.remainder();
+        if !rem.is_empty() {
+            let mut tail = 0u64;
+            for (i, &b) in rem.iter().enumerate() {
+                tail |= u64::from(b) << (i * 8);
+            }
+            h = (h.rotate_left(5) ^ tail).wrapping_mul(K);
+        }
+        self.0 = h;
+    }
+
+    #[inline]
+    fn write_u32(&mut self, i: u32) {
+        const K: u64 = 0x517c_c1b7_2722_0a95;
+        self.0 = (self.0.rotate_left(5) ^ u64::from(i)).wrapping_mul(K);
+    }
+
+    #[inline]
+    fn write_u8(&mut self, i: u8) {
+        const K: u64 = 0x517c_c1b7_2722_0a95;
+        self.0 = (self.0.rotate_left(5) ^ u64::from(i)).wrapping_mul(K);
+    }
+}
+
 struct Views {
     /// Each entry's view and generation.
     list: Vec<(View, u32)>,
@@ -1600,20 +1739,22 @@ struct Views {
     free: Vec<u32>,
     /// The shapes of views of placed memory, and where each is.
     shapes: Vec<Shape>,
-    shape_index: std::collections::BTreeMap<Shape, u32>,
+    shape_index: std::collections::HashMap<Shape, u32, std::hash::BuildHasherDefault<ShapeHash>>,
 }
 
 /// Read far more often than written: every slot a draw reads through a
 /// table is looked up here, on several recording threads at once in the
 /// world. Readers share it; only a view not seen before (a new table entry
 /// or shape) and a released resource take it alone.
-static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
-    list: Vec::new(),
-    index: std::collections::BTreeMap::new(),
-    by_resource: std::collections::BTreeMap::new(),
-    free: Vec::new(),
-    shapes: Vec::new(),
-    shape_index: std::collections::BTreeMap::new(),
+static VIEWS: std::sync::LazyLock<std::sync::RwLock<Views>> = std::sync::LazyLock::new(|| {
+    std::sync::RwLock::new(Views {
+        list: Vec::new(),
+        index: std::collections::BTreeMap::new(),
+        by_resource: std::collections::BTreeMap::new(),
+        free: Vec::new(),
+        shapes: Vec::new(),
+        shape_index: std::collections::HashMap::default(),
+    })
 });
 pub(crate) const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
 
@@ -1638,10 +1779,11 @@ const CONSTANT_ADDRESS_BITS: u32 = 47;
 const PLACED_ADDRESS_BITS: u32 = 40;
 const SHAPES: usize = 1 << (62 - PLACED_ADDRESS_BITS);
 
-/// A view of placed memory without its address: whether it is unordered
-/// access, the resource description, and the view's words but the two that
-/// hold the address (10 and 11).
-type Shape = (bool, [u32; 14], [u32; 14]);
+/// A view of placed memory without its address or 6 unused padding/filler words
+/// (`resource[1]`, `resource[13]`, `desc[12..16]`, `CPU-30`): whether it is
+/// unordered access, the 12 semantic resource words (`resource[0]`, `resource[2..13]`),
+/// and the 10 semantic view description words (`desc[0..10]`).
+type Shape = (bool, [u32; 12], [u32; 10]);
 
 /// Whether constant buffer views and views of placed memory are named whole
 /// in their records ([`Views`]). On by default; `VICTORY_VIEW_INLINE=0`
@@ -1692,13 +1834,16 @@ fn constant_of(i: u32, generation: u32) -> View {
     View::Constant(payload & ((1 << CONSTANT_ADDRESS_BITS) - 1), size)
 }
 
-/// A placed view's shape and its address.
+/// A placed view's canonical shape (stripping padding `resource[1]`,
+/// `resource[13]`, `desc[12..16]`) and its address.
 fn shape_of(unordered: bool, resource: &[u32; 14], desc: &[u32; 16]) -> (Shape, u64) {
-    let mut rest = [0u32; 14];
-    rest[..10].copy_from_slice(&desc[..10]);
-    rest[10..].copy_from_slice(&desc[12..]);
+    let mut res = [0u32; 12];
+    res[0] = resource[0];
+    res[1..12].copy_from_slice(&resource[2..13]);
+    let mut view = [0u32; 10];
+    view.copy_from_slice(&desc[..10]);
     (
-        (unordered, *resource, rest),
+        (unordered, res, view),
         u64::from(desc[10]) | u64::from(desc[11]) << 32,
     )
 }
@@ -1729,11 +1874,13 @@ impl Views {
     fn placed_of(&self, i: u32, generation: u32) -> Option<View> {
         let payload = payload(i, generation);
         let address = payload & ((1 << PLACED_ADDRESS_BITS) - 1);
-        let &(unordered, resource, rest) = self.shapes.get((payload >> PLACED_ADDRESS_BITS) as usize)?;
+        let &(unordered, res, view) = self.shapes.get((payload >> PLACED_ADDRESS_BITS) as usize)?;
+        let mut resource = [0u32; 14];
+        resource[0] = res[0];
+        resource[2..13].copy_from_slice(&res[1..12]);
         let mut desc = [0u32; 16];
-        desc[..10].copy_from_slice(&rest[..10]);
+        desc[..10].copy_from_slice(&view);
         (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
-        desc[12..].copy_from_slice(&rest[10..]);
         Some(View::Placed(unordered, resource, desc))
     }
 
@@ -2598,23 +2745,33 @@ mod tests {
         let null = std::ptr::null();
         let slots = [0u64; 4];
         let at = slots.as_ptr() as u64;
-        // A resource description and a view no other test uses.
-        let resource: [u32; 14] = std::array::from_fn(|k| 0x5ee0_0000 + k as u32);
+        // A resource description and a view no other test uses (zeroed filler
+        // words `resource[1]`, `resource[13]`, `desc[12..16]` stripped by `shape_of`).
+        let mut resource: [u32; 14] = std::array::from_fn(|k| 0x5ee0_0000 + k as u32);
+        resource[1] = 0;
+        resource[13] = 0;
         let mut desc: [u32; 16] = std::array::from_fn(|k| 0x7a70_0000 + k as u32);
+        desc[12..16].fill(0);
         let mine = |v: &View| match v {
             View::Constant(address, _) => (0x6_0000_0000..0x6_1000_0000).contains(address),
             View::Placed(_, r, _) => *r == resource,
             _ => false,
         };
         let entries = || VIEWS.read().unwrap().list.iter().filter(|(v, _)| mine(v)).count();
-        let shapes = || VIEWS.read().unwrap().shapes.iter().filter(|s| s.1 == resource).count();
+        let shapes = || VIEWS.read().unwrap().shapes.iter().filter(|s| s.1[0] == resource[0] && s.1[1..12] == resource[2..13]).count();
         for n in 0..20_000u64 {
             let address = 0x6_0000_0000 + n * 0x100;
             create_cbv(null, &[address as u32, (address >> 32) as u32, 512, 0], at);
             assert_eq!(view(at), Some(View::Constant(address, 512)));
             let placed = 0xd_4940_0000 + n * 0x1_0000;
             (desc[10], desc[11]) = (placed as u32, (placed >> 32) as u32);
-            create_placed_srv(null, &resource, &desc, at);
+            // Differing filler/padding words must coalesce to the same single shape (`CPU-30`).
+            let mut with_filler = resource;
+            with_filler[1] = n as u32;
+            with_filler[13] = (n as u32).wrapping_mul(7);
+            let mut desc_filler = desc;
+            desc_filler[12] = n as u32;
+            create_placed_srv(null, &with_filler, &desc_filler, at);
             assert_eq!(view(at), Some(View::Placed(false, resource, desc)));
         }
         assert_eq!(entries(), 0, "no table entries");

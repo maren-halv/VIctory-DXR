@@ -48,24 +48,98 @@ fn stage() -> u32 {
     *STAGE.get_or_init(|| std::env::var("VICTORY_FAST_CORES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(2))
 }
 
+/// Maximum number of Tier-0 threads permitted to hold `ABOVE_NORMAL` priority
+/// (`victory-submit`, `victory-heap-sync`, `victory-relay`, `victory-aside-0`).
+pub(crate) const MAX_TIER0_ABOVE_NORMAL: usize = 4;
+
+static TIER0_ABOVE_NORMAL_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Returns true iff `what` is one of the bounded Tier-0 serial-spine threads
+/// eligible for `THREAD_PRIORITY_ABOVE_NORMAL`.
+pub(crate) fn is_tier0_primary(what: &str) -> bool {
+    matches!(
+        what,
+        "victory-submit" | "victory-heap-sync" | "victory-relay" | "victory-aside" | "victory-aside-0"
+    )
+}
+
+/// Sets the calling thread's scheduling priority.
+fn set_thread_priority(priority: i32) {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority};
+    // SAFETY: adjusts only the calling thread's scheduling priority.
+    unsafe { SetThreadPriority(GetCurrentThread(), priority) };
+}
+
+/// Enforces `THREAD_PRIORITY_NORMAL` on burst/helper worker threads so they
+/// never preempt Tier-0 threads, title render threads, or DirectStorage.
+pub(crate) fn enforce_normal_priority() {
+    use windows_sys::Win32::System::Threading::THREAD_PRIORITY_NORMAL;
+    set_thread_priority(THREAD_PRIORITY_NORMAL);
+}
+
+/// Enforces the 3-tier priority ceiling for Tier-0 callers: promotes only the
+/// primary serial-spine threads up to [`MAX_TIER0_ABOVE_NORMAL`] and keeps any
+/// overflow or secondary thread at `THREAD_PRIORITY_NORMAL`.
+fn enforce_tier0_priority(what: &str) {
+    use std::sync::atomic::Ordering::AcqRel;
+    use windows_sys::Win32::System::Threading::{THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_NORMAL};
+    if !is_tier0_primary(what) {
+        set_thread_priority(THREAD_PRIORITY_NORMAL);
+        return;
+    }
+    let mut cur = TIER0_ABOVE_NORMAL_COUNT.load(std::sync::atomic::Ordering::Acquire);
+    while cur < MAX_TIER0_ABOVE_NORMAL {
+        match TIER0_ABOVE_NORMAL_COUNT.compare_exchange_weak(
+            cur,
+            cur + 1,
+            AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                set_thread_priority(THREAD_PRIORITY_ABOVE_NORMAL);
+                return;
+            }
+            Err(actual) => cur = actual,
+        }
+    }
+    set_thread_priority(THREAD_PRIORITY_NORMAL);
+}
+
+/// Bounded worker count for the unified Tier-1 burst pool (`VICTORY_TIER1_THREADS`,
+/// default `6`, sized to physical cores rather than SMT logical threads).
+pub(crate) fn tier1_worker_count() -> usize {
+    static COUNT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *COUNT.get_or_init(|| {
+        if let Some(asked) = std::env::var("VICTORY_TIER1_THREADS").ok().and_then(|v| v.trim().parse::<usize>().ok()) {
+            return asked.clamp(1, 16);
+        }
+        let logical = std::thread::available_parallelism().map(usize::from).unwrap_or(8);
+        logical.min(6).max(1)
+    })
+}
+
 /// Asks the system to run the calling thread, which a frame waits for, on
 /// the fast cores only, where the processor has two kinds. That fork's submit
 /// thread was found on a slow one in 1,529 looks of 24,021. (A selection of
 /// processors is a preference the scheduler keeps unless nothing of it is
 /// free.) The title's threads are not asked for.
 pub(crate) fn keep_on_fast_cores(what: &str) {
+    enforce_tier0_priority(what);
     ask(what, 1);
 }
 
 /// [`keep_on_fast_cores`] for one of the threads a submission's preparing or
-/// a landing shares its work with.
+/// a landing shares its work with. Always keeps burst helpers at
+/// `THREAD_PRIORITY_NORMAL` (never `ABOVE_NORMAL`).
 pub(crate) fn keep_helper_on_fast_cores(what: &str) {
+    enforce_normal_priority();
     ask(what, 2);
 }
 
 /// [`keep_on_fast_cores`] for one of many threads whose work is ahead of what
-/// a frame waits for.
+/// a frame waits for. Always keeps burst helpers at `THREAD_PRIORITY_NORMAL`.
 pub(crate) fn keep_many_on_fast_cores(what: &str) {
+    enforce_normal_priority();
     ask(what, 3);
 }
 
@@ -103,5 +177,46 @@ mod tests {
         assert!(fast_of(&[]).is_empty());
         assert!(!cpu_sets().is_empty());
         std::thread::spawn(|| keep_on_fast_cores("test")).join().unwrap();
+    }
+
+    #[test]
+    fn burst_helpers_are_kept_at_normal_priority() {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, GetThreadPriority, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
+            THREAD_PRIORITY_NORMAL,
+        };
+        assert!(is_tier0_primary("victory-submit"));
+        assert!(is_tier0_primary("victory-heap-sync"));
+        assert!(is_tier0_primary("victory-relay"));
+        assert!(is_tier0_primary("victory-aside-0"));
+        assert!(!is_tier0_primary("victory-aside-1"));
+        assert!(!is_tier0_primary("victory-wide"));
+        assert!(!is_tier0_primary("victory-tier1"));
+        assert!((1..=6).contains(&tier1_worker_count()));
+
+        // A helper that had ABOVE_NORMAL set beforehand is normalized to NORMAL.
+        let prio = std::thread::spawn(|| {
+            // SAFETY: queries and updates only this test thread's priority.
+            unsafe {
+                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+                keep_helper_on_fast_cores("victory-wide");
+                GetThreadPriority(GetCurrentThread())
+            }
+        })
+        .join()
+        .unwrap();
+        assert_eq!(prio, THREAD_PRIORITY_NORMAL);
+
+        let many_prio = std::thread::spawn(|| {
+            // SAFETY: queries and updates only this test thread's priority.
+            unsafe {
+                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+                keep_many_on_fast_cores("victory-list");
+                GetThreadPriority(GetCurrentThread())
+            }
+        })
+        .join()
+        .unwrap();
+        assert_eq!(many_prio, THREAD_PRIORITY_NORMAL);
     }
 }

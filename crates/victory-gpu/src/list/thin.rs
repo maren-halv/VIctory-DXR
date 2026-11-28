@@ -239,6 +239,10 @@ static BACKS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 /// recordings let go of in the middle.
 static CHUNKS: AtomicU64 = AtomicU64::new(0);
 static STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+#[cfg(feature = "diagnostics")]
+static OP_NS: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64];
+#[cfg(feature = "diagnostics")]
+static OP_CNT: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64];
 
 fn held<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -372,7 +376,7 @@ impl Drop for Recording {
                 super::close(inner.back as This);
             }
             let mut backs = held(&BACKS);
-            if backs.len() < 64 {
+            if backs.len() < 384 {
                 backs.push(inner.back);
             } else {
                 drop(backs);
@@ -394,16 +398,14 @@ fn give_back(streams: Vec<Vec<u64>>) {
     }
 }
 
-/// A list of ours, closed.
+/// A backing list of ours, without an open host list until `RESET` runs.
 fn back_list(kind: u32) -> This {
     if let Some(back) = held(&BACKS).pop() {
         // SAFETY: a list of ours nobody uses.
         unsafe { (*(back as *mut List)).kind = kind };
         return back as This;
     }
-    let list: This = Box::into_raw(super::boxed(kind, std::ptr::null(), false)).cast_const().cast();
-    super::close(list);
-    list
+    Box::into_raw(super::boxed_closed(kind)).cast_const().cast()
 }
 
 fn start() {
@@ -464,6 +466,31 @@ pub(crate) fn line(frames: f64) {
         CHUNKS.swap(0, Relaxed) as f64 / frames,
         s[3]
     );
+    #[cfg(feature = "diagnostics")]
+    {
+        let mut ops: Vec<(u64, u64, usize)> = (0..64)
+            .filter_map(|op| {
+                let ns = OP_NS[op].swap(0, Relaxed);
+                let cnt = OP_CNT[op].swap(0, Relaxed);
+                (ns > 0).then_some((ns, cnt, op))
+            })
+            .collect();
+        ops.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        let top: Vec<String> = ops
+            .into_iter()
+            .take(8)
+            .map(|(ns, cnt, op)| {
+                format!(
+                    "op{op}={:.1}ms({:.0}/f)",
+                    ns as f64 / (frames * 1e6),
+                    cnt as f64 / frames
+                )
+            })
+            .collect();
+        if !top.is_empty() {
+            tracing::info!("list::thin top ops/f: {}", top.join(", "));
+        }
+    }
 }
 
 #[inline]
@@ -1097,6 +1124,21 @@ fn translate(
         if calls % 64 == 0 {
             skip = left();
         }
+        #[cfg(feature = "diagnostics")]
+        let op_t0 = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
+        let op_idx = (op as usize).min(63);
+        #[cfg(feature = "diagnostics")]
+        struct OpTimer(usize, std::time::Instant);
+        #[cfg(feature = "diagnostics")]
+        impl Drop for OpTimer {
+            fn drop(&mut self) {
+                OP_NS[self.0].fetch_add(self.1.elapsed().as_nanos() as u64, Relaxed);
+                OP_CNT[self.0].fetch_add(1, Relaxed);
+            }
+        }
+        #[cfg(feature = "diagnostics")]
+        let _op_timer = OpTimer(op_idx, op_t0);
         if op == UPLOAD {
             // SAFETY: made by `allocate_upload`, named once.
             let block = *unsafe { Box::from_raw(w[0] as *mut Upload) };

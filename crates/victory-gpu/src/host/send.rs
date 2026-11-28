@@ -117,6 +117,7 @@ pub(super) struct Memory {
     buffer: ID3D12Resource,
     data: usize,
     size: u64,
+    last_used: u64,
 }
 
 // SAFETY: a D3D12 object (free-threaded) and its mapping, with one owner.
@@ -124,16 +125,89 @@ unsafe impl Send for Memory {}
 
 /// What submissions that have run gave back.
 static SPARE: Mutex<Vec<Memory>> = Mutex::new(Vec::new());
+/// Monotonic recency counter for size-bucketed LRU eviction in [`SPARE`].
+static SPARE_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+/// Total bytes currently retained in [`SPARE`] (lock-free diagnostic accessor).
+static SPARE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Number of buffers currently retained in [`SPARE`].
+static SPARE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// At most this much is kept (of the card's memory, with [`on_card`]).
+/// Default [`SPARE`] retention cap in MiB (`64 MiB` for both BAR and L0,
+/// replacing the `192–256 MiB` largest-first cache; `ARCH-05`).
+const DEFAULT_SPARE_MB: u64 = 64;
+
+fn resolve_kept_bytes(env: Option<&str>) -> u64 {
+    let mb = env
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SPARE_MB);
+    mb.saturating_mul(1 << 20)
+}
+
+/// At most this much is kept (of the card's memory with [`on_card`], or L0 upload memory).
+/// Override with `VICTORY_SEND_SPARE_MB` (default `64` MiB).
 fn kept() -> u64 {
-    if on_card() {
-        192 << 20
-    } else if crate::residency::limited_host_ram() {
-        192 << 20
-    } else {
-        256 << 20
+    static CAP: OnceLock<u64> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        let env = std::env::var("VICTORY_SEND_SPARE_MB").ok();
+        resolve_kept_bytes(env.as_deref())
+    })
+}
+
+/// Total bytes currently held in `send::SPARE` (for `host.rs` `memory summary:`).
+#[allow(dead_code)]
+pub(crate) fn spare_bytes() -> u64 {
+    SPARE_BYTES.load(Ordering::Relaxed)
+}
+
+/// `(bytes, buffer_count)` currently held in `send::SPARE`.
+#[allow(dead_code)]
+pub(crate) fn spare_info() -> (u64, usize) {
+    (
+        SPARE_BYTES.load(Ordering::Relaxed),
+        SPARE_COUNT.load(Ordering::Relaxed),
+    )
+}
+
+/// Selects indices to evict from `items` (`(size, last_used)`) until the
+/// remaining total size fits within `cap`, using size-bucketed LRU retention:
+/// excess duplicates within a power-of-two size bucket are evicted oldest-first
+/// before evicting the sole resident of any active size bucket (globally LRU),
+/// avoiding largest-first SHR sawtooths (`ARCH-05`).
+fn select_spare_evictions(items: &[(u64, u64)], cap: u64) -> Vec<usize> {
+    let mut total: u64 = items.iter().map(|&(s, _)| s).sum();
+    if total <= cap {
+        return Vec::new();
     }
+    let mut alive = vec![true; items.len()];
+    let mut evicted = Vec::new();
+    while total > cap {
+        // Count surviving entries per exact size bucket.
+        let mut victim: Option<(usize, bool, u64)> = None;
+        for (i, &(size, tick)) in items.iter().enumerate() {
+            if !alive[i] {
+                continue;
+            }
+            let dup = items
+                .iter()
+                .enumerate()
+                .any(|(j, &(s2, _))| j != i && alive[j] && s2 == size);
+            let better = match victim {
+                None => true,
+                // Prefer evicting duplicates over sole bucket residents, then oldest `last_used`.
+                Some((_, v_dup, v_tick)) => (dup && !v_dup) || (dup == v_dup && tick < v_tick),
+            };
+            if better {
+                victim = Some((i, dup, tick));
+            }
+        }
+        let Some((idx, _, _)) = victim else {
+            break;
+        };
+        alive[idx] = false;
+        total = total.saturating_sub(items[idx].0);
+        evicted.push(idx);
+    }
+    evicted
 }
 
 /// Whether the memory lies in the card's memory, written by the CPU through
@@ -151,9 +225,18 @@ fn on_card() -> bool {
 fn memory(host: &Host, size: u64) -> Option<Memory> {
     {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
-        let fit = spare.iter().enumerate().filter(|(_, m)| m.size >= size).min_by_key(|(_, m)| m.size).map(|(i, _)| i);
+        // Smallest fitting size bucket; break ties by most-recently-used for cache warmth.
+        let fit = spare
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.size >= size)
+            .min_by_key(|(_, m)| (m.size, std::cmp::Reverse(m.last_used)))
+            .map(|(i, _)| i);
         if let Some(i) = fit {
-            return Some(spare.swap_remove(i));
+            let mem = spare.swap_remove(i);
+            SPARE_BYTES.fetch_sub(mem.size, Ordering::Relaxed);
+            SPARE_COUNT.store(spare.len(), Ordering::Relaxed);
+            return Some(mem);
         }
     }
     // By doubles from 512 KiB (average flight sends ~1-2 MiB), so small flights
@@ -169,16 +252,36 @@ fn memory(host: &Host, size: u64) -> Option<Memory> {
         buffer,
         data: data as usize,
         size,
+        last_used: SPARE_TICK.fetch_add(1, Ordering::Relaxed),
     })
 }
 
 /// The submission has run.
-pub(super) fn give_back(memory: Memory) {
-    let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
-    spare.push(memory);
-    spare.sort_by_key(|m| std::cmp::Reverse(m.size));
-    while spare.iter().map(|m| m.size).sum::<u64>() > kept() {
-        spare.remove(0);
+pub(super) fn give_back(mut memory: Memory) {
+    memory.last_used = SPARE_TICK.fetch_add(1, Ordering::Relaxed);
+    let evicted: Vec<Memory> = {
+        let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        let added = memory.size;
+        spare.push(memory);
+        let mut total = SPARE_BYTES.fetch_add(added, Ordering::Relaxed).saturating_add(added);
+        let cap = kept();
+        let mut out = Vec::new();
+        if total > cap {
+            let meta: Vec<(u64, u64)> = spare.iter().map(|m| (m.size, m.last_used)).collect();
+            let mut victims = select_spare_evictions(&meta, cap);
+            victims.sort_unstable_by(|a, b| b.cmp(a));
+            for idx in victims {
+                let removed = spare.swap_remove(idx);
+                total = total.saturating_sub(removed.size);
+                SPARE_BYTES.fetch_sub(removed.size, Ordering::Relaxed);
+                out.push(removed);
+            }
+        }
+        SPARE_COUNT.store(spare.len(), Ordering::Relaxed);
+        out
+    };
+    if !evicted.is_empty() {
+        crate::host::retire_com_async(evicted);
     }
 }
 
@@ -256,6 +359,16 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
     for (((shadow, _), copy), (short_span, chunk_span)) in
         dirty.iter().zip(&copies).zip(copy_short_spans)
     {
+        for &(a, _, n) in &copy.runs {
+            if !shadow.ensure_staging_committed(a, a + n) {
+                return None;
+            }
+        }
+        for &(a, b) in &all_shorts[short_span.clone()] {
+            if !shadow.ensure_staging_committed(a, b) {
+                return None;
+            }
+        }
         let from = shadow.card_data() as usize;
         moves.extend(copy.runs.iter().map(|&(a, to, n)| (from + a, memory.data + to as usize, n)));
         if !short_span.is_empty() {
@@ -367,5 +480,41 @@ impl Own {
     /// The memory, to be kept until the submission has run.
     pub(super) fn memory(self) -> Memory {
         self.memory
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DEFAULT_SPARE_MB, resolve_kept_bytes, select_spare_evictions};
+
+    #[test]
+    fn spare_cap_defaults_to_64_mib_and_evicts_duplicates_then_lru() {
+        const MIB: u64 = 1 << 20;
+        assert_eq!(resolve_kept_bytes(None), DEFAULT_SPARE_MB * MIB);
+        assert_eq!(DEFAULT_SPARE_MB, 64);
+        assert_eq!(resolve_kept_bytes(Some("128")), 128 * MIB);
+        assert_eq!(resolve_kept_bytes(Some("0")), 0);
+        assert_eq!(resolve_kept_bytes(Some("bad")), 64 * MIB);
+
+        // Two 16 MiB duplicates (ticks 1, 5), one recent 32 MiB bucket (tick 9),
+        // and one 8 MiB bucket (tick 2): total 72 MiB > 64 MiB cap.
+        // Largest-first would wrongly evict the fresh 32 MiB buffer; size-bucketed
+        // LRU evicts the oldest duplicate 16 MiB (index 0) and retains all 3 active buckets!
+        let items = [
+            (16 * MIB, 1),
+            (8 * MIB, 2),
+            (16 * MIB, 5),
+            (32 * MIB, 9),
+        ];
+        assert_eq!(select_spare_evictions(&items, 64 * MIB), vec![0]);
+
+        // When all remaining buckets are unique and still exceed cap (32 + 16 + 8 = 56 > 40),
+        // evict globally oldest (LRU: 8 MiB at tick 2, then 16 MiB at tick 5), keeping recent 32 MiB!
+        let unique = [
+            (8 * MIB, 2),
+            (16 * MIB, 5),
+            (32 * MIB, 9),
+        ];
+        assert_eq!(select_spare_evictions(&unique, 40 * MIB), vec![0, 1]);
     }
 }

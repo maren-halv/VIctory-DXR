@@ -22,6 +22,24 @@ use windows_sys::Win32::System::Memory as mem;
 use crate::inplace::{From, Placed, committed_run, open, place};
 
 const K64: u64 = 64 << 10;
+const MIB: u64 = 1 << 20;
+const DEFAULT_SECTION_HEAP_MAX_MB: u64 = 1024;
+
+/// Maximum total bytes of live `OpenExistingHeapFromFileMapping` section heaps
+/// cached at once (`VICTORY_INPLACE_SECTION_MAX_MB`, default `1024` MiB).
+fn section_heap_max_bytes() -> u64 {
+    static MAX: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("VICTORY_INPLACE_SECTION_MAX_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(DEFAULT_SECTION_HEAP_MAX_MB)
+            .saturating_mul(MIB)
+    })
+}
+
+/// Live bytes currently covered by cached `OpenExistingHeapFromFileMapping` heaps.
+static LIVE_SECTION_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// Monotonic generation counter bumped whenever title memory views, sections,
 /// or allocations change.
@@ -70,6 +88,7 @@ pub(crate) fn section_evict(section: usize) {
         guard.as_mut().and_then(|map| map.remove(&section))
     };
     if let Some(entry) = evicted {
+        release_budget(&LIVE_SECTION_BYTES, entry.bytes);
         STATS[5].fetch_add(1, Ordering::Relaxed);
         crate::host::retire(entry.heap);
     }
@@ -100,9 +119,20 @@ fn open_or_get(device: &ID3D12Device, section: usize, section_bytes: u64, genera
         STATS[4].fetch_add(1, Ordering::Relaxed);
         return Err(SectionPlaceError::Remapped);
     }
-    let heap = open(device, From::Section(section)).map_err(SectionPlaceError::Host)?;
+    if !try_reserve_budget(&LIVE_SECTION_BYTES, section_bytes, section_heap_max_bytes()) {
+        return Err(SectionPlaceError::NotCommittedRun);
+    }
+    let heap = match open(device, From::Section(section)) {
+        Ok(heap) => heap,
+        Err(e) => {
+            release_budget(&LIVE_SECTION_BYTES, section_bytes);
+            return Err(SectionPlaceError::Host(e));
+        }
+    };
     if mapping_generation() != generation {
+        release_budget(&LIVE_SECTION_BYTES, section_bytes);
         STATS[4].fetch_add(1, Ordering::Relaxed);
+        crate::host::retire(heap);
         return Err(SectionPlaceError::Remapped);
     }
     let mut guard = SECTION_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
@@ -110,6 +140,7 @@ fn open_or_get(device: &ID3D12Device, section: usize, section_bytes: u64, genera
     // heap if `section_evict` ran between opening the handle and acquiring the lock.
     if mapping_generation() != generation {
         drop(guard);
+        release_budget(&LIVE_SECTION_BYTES, section_bytes);
         STATS[4].fetch_add(1, Ordering::Relaxed);
         crate::host::retire(heap);
         return Err(SectionPlaceError::Remapped);
@@ -118,9 +149,16 @@ fn open_or_get(device: &ID3D12Device, section: usize, section_bytes: u64, genera
     if let Some(existing) = map.get(&section)
         && existing.bytes == section_bytes
     {
-        return Ok(existing.heap.clone());
+        let existing_heap = existing.heap.clone();
+        drop(guard);
+        release_budget(&LIVE_SECTION_BYTES, section_bytes);
+        crate::host::retire(heap);
+        return Ok(existing_heap);
     }
-    if let Some(old) = map.insert(section, SectionHeap { heap: heap.clone(), bytes: section_bytes, generation }) {
+    let replaced = map.insert(section, SectionHeap { heap: heap.clone(), bytes: section_bytes, generation });
+    drop(guard);
+    if let Some(old) = replaced {
+        release_budget(&LIVE_SECTION_BYTES, old.bytes);
         STATS[5].fetch_add(1, Ordering::Relaxed);
         crate::host::retire(old.heap);
     }
@@ -129,6 +167,7 @@ fn open_or_get(device: &ID3D12Device, section: usize, section_bytes: u64, genera
     tracing::info!(
         section = format_args!("{section:#x}"),
         bytes_mb = section_bytes >> 20,
+        live_mb = LIVE_SECTION_BYTES.load(Ordering::Relaxed) >> 20,
         "in-place section heap opened via OpenExistingHeapFromFileMapping (0 MB locked working set)"
     );
     Ok(heap)

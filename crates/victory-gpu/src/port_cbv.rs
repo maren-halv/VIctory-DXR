@@ -46,6 +46,37 @@ pub(crate) fn in_place_on() -> bool {
     on() && crate::toggled!("VICTORY_PORT_CBV_PLACE")
 }
 
+/// Whether raw descriptor twins are active (`VICTORY_RAW_VIEWS != 0`).
+fn raw_twins_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RAW_VIEWS").is_none_or(|v| v != "0"))
+}
+
+/// Whether tables whose CBVs are all in-place bind directly through their
+/// title host-heap slots instead of lock-free batched dynamic snapshots.
+/// Opt-in (`VICTORY_PORT_CBV_DIRECT=1`, default OFF): title-slot mirroring
+/// takes per-slot locks and `ResourceTable` mutexes across recording threads,
+/// whereas batched dynamic snapshots (`TableBatch` + lock-free `DynamicKept`)
+/// cut `list::thin` CPU by ~63% (`+60%` FPS on both RT-Off and Native DXR).
+pub(crate) fn table_direct_on() -> bool {
+    in_place_on()
+        && raw_twins_on()
+        && std::env::var_os("VICTORY_PORT_CBV_DIRECT").is_some_and(|v| v == "1")
+}
+
+/// Pure eligibility gate enforcing all four V1 guards for bypassing dynamic
+/// table snapshots on CBV-bearing tables (`CPU-18`).
+#[inline]
+pub(crate) fn table_direct_eligible(
+    direct_on: bool,
+    has_half: bool,
+    has_indexed: bool,
+    fits_host: bool,
+    all_cbvs_in_place: bool,
+) -> bool {
+    direct_on && !has_half && !has_indexed && fits_host && all_cbvs_in_place
+}
+
 /// Maximum constant buffer size in D3D12 (64 KiB).
 pub(crate) const MAX_CBV_BYTES: u32 = 64 << 10;
 
@@ -92,40 +123,72 @@ pub(crate) fn raw_cbv_layout(base: u64, width: u64, gpu: u64, size: u32) -> Opti
     Some(RawCbvLayout { first_element, num_elements, cbv_location, cbv_size })
 }
 
+/// Cache-line-aligned per-shard counter bank (`CPU-26`) so concurrent
+/// recording threads never bounce a single shared stats cache line.
+#[repr(align(64))]
+struct PaddedStats([AtomicU64; 7]);
+
+const STAT_SHARDS: usize = 8;
+
 /// Since the last line: tables' constant buffers given in place, their bytes;
 /// copied as before because not in place, because not on 16 bytes; title
 /// slots' constant buffers whose twin is a raw view; copied because out of
 /// bounds or empty; root constant buffers bound in place.
-static STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+static STATS: [PaddedStats; STAT_SHARDS] =
+    [const { PaddedStats([const { AtomicU64::new(0) }; 7]) }; STAT_SHARDS];
+
+static NEXT_SHARD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+thread_local! {
+    static SHARD: usize = NEXT_SHARD.fetch_add(1, Relaxed) & (STAT_SHARDS - 1);
+}
+
+#[inline]
+fn shard_stats() -> &'static [AtomicU64; 7] {
+    let idx = SHARD.with(|&i| i);
+    &STATS[idx].0
+}
 
 /// A table's constant buffer of `size` bytes was given in place.
 pub(crate) fn in_place(size: u32) {
-    STATS[0].fetch_add(1, Relaxed);
-    STATS[1].fetch_add(u64::from(size), Relaxed);
+    let s = shard_stats();
+    s[0].fetch_add(1, Relaxed);
+    s[1].fetch_add(u64::from(size), Relaxed);
 }
 
 /// A table's constant buffer was copied as before: `aligned` false when it
 /// is in place but not on 16 bytes.
 pub(crate) fn copied(aligned: bool) {
-    STATS[if aligned { 2 } else { 3 }].fetch_add(1, Relaxed);
+    shard_stats()[if aligned { 2 } else { 3 }].fetch_add(1, Relaxed);
 }
 
 /// A title slot's constant buffer view got a raw twin.
 pub(crate) fn twinned() {
-    STATS[4].fetch_add(1, Relaxed);
+    shard_stats()[4].fetch_add(1, Relaxed);
 }
 
 /// A table's constant buffer in place fell back to copying because it was
 /// out of bounds or empty.
 #[allow(dead_code)]
 pub(crate) fn copied_oob_or_empty() {
-    STATS[5].fetch_add(1, Relaxed);
+    shard_stats()[5].fetch_add(1, Relaxed);
 }
 
 /// A root constant buffer was bound in place.
 #[allow(dead_code)]
 pub(crate) fn root_in_place() {
-    STATS[6].fetch_add(1, Relaxed);
+    shard_stats()[6].fetch_add(1, Relaxed);
+}
+
+/// Drains and sums all sharded stat counters.
+fn take_stats() -> [u64; 7] {
+    let mut totals = [0u64; 7];
+    for shard in &STATS {
+        for (dst, src) in totals.iter_mut().zip(&shard.0) {
+            *dst += src.swap(0, Relaxed);
+        }
+    }
+    totals
 }
 
 /// Whether a constant buffer at host address `gpu` can be a raw view of
@@ -153,7 +216,8 @@ pub(crate) fn log(frames: f64) {
     if !on() {
         return;
     }
-    let s: Vec<f64> = STATS.iter().map(|s| s.swap(0, Relaxed) as f64 / frames.max(1e-9)).collect();
+    let denom = frames.max(1e-9);
+    let s = take_stats().map(|v| v as f64 / denom);
     tracing::info!(
         "renderer port 5 (VICTORY_PORT_CBV=1) per frame: {:.0} tables' constant buffers read by the card in place ({:.1} KB not copied, \
          no step at submission), {:.0} root CBVs in place; copied as before: {:.0} not in place, {:.0} not on 16 bytes, {:.0} OOB/empty; \
@@ -201,6 +265,53 @@ mod tests {
         assert!(!root_cbv_ok(0x3500_0002));
         assert!(root_table_cbv_ok(0x3500_0010));
         assert!(!root_table_cbv_ok(0x3500_0004));
+    }
+
+    #[test]
+    fn table_direct_eligible_enforces_all_four_guards() {
+        // All guards satisfied -> bypasses dynamic snapshot.
+        assert!(table_direct_eligible(true, false, false, true, true));
+        // Guard 1: disabled via toggle / raw views off.
+        assert!(!table_direct_eligible(false, false, false, true, true));
+        // Guard 2: table has half-view slot.
+        assert!(!table_direct_eligible(true, true, false, true, true));
+        // Guard 3: table has indexed descriptor array.
+        assert!(!table_direct_eligible(true, false, true, true, true));
+        // Guard 4a: table exceeds host heap count.
+        assert!(!table_direct_eligible(true, false, false, false, true));
+        // Guard 4b: at least one CBV is not in-place / misaligned / OOB.
+        assert!(!table_direct_eligible(true, false, false, true, false));
+    }
+
+    #[test]
+    fn sharded_padded_stats_avoid_false_sharing_and_sum_across_threads() {
+        assert_eq!(std::mem::align_of::<PaddedStats>(), 64);
+        let _ = take_stats();
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    in_place(256);
+                    in_place(64);
+                    copied(true);
+                    copied(false);
+                    twinned();
+                    copied_oob_or_empty();
+                    root_in_place();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let totals = take_stats();
+        assert_eq!(totals[0], 8);
+        assert_eq!(totals[1], 4 * (256 + 64));
+        assert_eq!(totals[2], 4);
+        assert_eq!(totals[3], 4);
+        assert_eq!(totals[4], 4);
+        assert_eq!(totals[5], 4);
+        assert_eq!(totals[6], 4);
+        assert_eq!(take_stats(), [0; 7]);
     }
 
     #[test]

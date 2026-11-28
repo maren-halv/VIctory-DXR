@@ -14,7 +14,7 @@ use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::mem::{ManuallyDrop, offset_of, size_of};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -23,31 +23,37 @@ use windows::core::{Interface, s};
 use crate::host::{Host, HostList, Prelude, compile, host, mapped, name, not_resident, resident, transition};
 use crate::object::This;
 
-/// Size of each 256B-aligned AS backing slab (64 MiB).
-const AS_SLAB_SIZE: u64 = 64 << 20;
+/// Size of each 256B-aligned tiered AS backing slab (32 MiB, reclaimable when empty, `ARCH-10`).
+const AS_SLAB_SIZE: u64 = 32 << 20;
 /// Required DXR alignment for acceleration structures and scratch buffers.
 const AS_ALIGN: u64 = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT as u64;
 /// Default initial reservation for a pre-bound TLAS slot so `HostHeap` SRVs
 /// keep a stable GPU VA once the first `BuildTlas` runs.
 const DEFAULT_TLAS_RESERVE: u64 = 8 << 20;
-/// Minimum scratch buffer chunk allocated per pooled DXR submission.
-const MIN_SCRATCH_SIZE: u64 = 16 << 20;
+/// Default initial reservation for a cull-enabled mirror TLAS slot (`ARCH-13`).
+const DEFAULT_MIRROR_TLAS_RESERVE: u64 = 4 << 20;
+/// Minimum scratch buffer chunk allocated per pooled DXR submission (4 MiB).
+const MIN_SCRATCH_SIZE: u64 = 4 << 20;
 /// Upper bound on static BVH4 leaf nodes extracted per BLAS.
 const MAX_STATIC_NODES: u64 = 262_144;
 /// Maximum valid unpacked BVH4 size (matches `memory.rs::PACKED`).
 const MAX_PACKED_BVH_BYTES: u64 = 64 << 20;
-/// Maximum readback bytes copied per submission for async static BLAS upgrades (8 MiB).
-const MAX_READBACK_BYTES_PER_SUB: u64 = 8 << 20;
+/// Maximum readback bytes copied per submission for async static BLAS upgrades (16 MiB).
+const MAX_READBACK_BYTES_PER_SUB: u64 = 16 << 20;
 /// Maximum geometries accepted per upgraded static BLAS.
 const MAX_UPGRADE_GEOMS: usize = 2048;
 /// Maximum triangle slots (including sparse NaN holes) per upgraded static BLAS (524,288 tris = 18 MiB).
 const MAX_UPGRADE_TRIS: usize = 524_288;
 /// Maximum upgraded static BLASes drained per submission.
-const MAX_UPGRADES_PER_SUB: usize = 8;
+const MAX_UPGRADES_PER_SUB: usize = 16;
 /// Maximum vertex bytes uploaded in one multi-upgrade batch (16 MiB; a single valid upgrade up to 18 MiB still runs).
 const MAX_UPGRADE_BATCH_BYTES: u64 = 16 << 20;
-/// Maximum queued static upgrades awaiting GPU build (prevents unbounded RAM growth).
+/// Maximum active static upgrades in the primary GPU-build queue before spilling to overflow ring.
 const MAX_PENDING_UPGRADES: usize = 256;
+/// Maximum decoded upgrades buffered in the decode worker's bounded overflow re-queue ring (`ARCH-10`).
+const MAX_OVERFLOW_UPGRADES: usize = 4096;
+/// Maximum Frame-0 static BLASes awaiting deferred node readback re-queue when a single burst exceeds `MAX_READBACK_BYTES_PER_SUB`.
+const MAX_PENDING_READBACK_REQUEUE: usize = 2048;
 /// Maximum static BLAS compactions drained per submission.
 const MAX_COMPACTIONS_PER_SUB: usize = 16;
 /// Maximum queued static BLAS compactions awaiting GPU copy.
@@ -60,12 +66,24 @@ const COMPACT_INFO_BYTES: u64 = (COMPACT_INFO_SLOTS * 8) as u64;
 const TIMING_SLOTS: u32 = 1024;
 /// Pooled per-submission auxiliary buffers larger than this are dropped on fence completion.
 const MAX_POOLED_AUX_BYTES: u64 = 4 << 20;
-/// Pooled per-submission scratch buffers larger than this are dropped on fence completion.
-const MAX_POOLED_SCRATCH_BYTES: u64 = 32 << 20;
+/// Pooled per-submission scratch buffers larger than this are dropped on fence completion (`ARCH-10`: 8 MiB).
+const MAX_POOLED_SCRATCH_BYTES: u64 = 8 << 20;
 /// Pooled per-submission static-extraction vertex buffers larger than this are dropped on fence completion.
 const MAX_POOLED_EXTRACT_VERTS_BYTES: u64 = 4 << 20;
 /// Pooled per-submission patched host-instance buffers larger than this are dropped on fence completion.
 const MAX_POOLED_HOST_INSTANCES_BYTES: u64 = 2 << 20;
+/// Number of idle DXR submissions after which unused static staging buffers on a `DxrSubmission` are dropped asynchronously (`ARCH-10`).
+const IDLE_STAGING_TRIM_SUBS: u64 = 60;
+/// Evict BLASes unreachable from any scanned TLAS for more than this many TLAS epochs (`ARCH-10`).
+const BLAS_GC_UNREACHABLE_EPOCHS: u64 = 300;
+/// Minimum TLAS epochs between periodic `AS_MAP` reachability GC sweeps.
+const BLAS_GC_SWEEP_INTERVAL_EPOCHS: u64 = 60;
+/// Dynamic `dxr_room_kept()` steady-state Local VRAM headroom reserve (128 MiB).
+const DXR_STEADY_RESERVE_BYTES: u64 = 128 << 20;
+/// Dynamic `dxr_room_kept()` streaming Local VRAM headroom reserve (256 MiB).
+const DXR_STREAMING_RESERVE_BYTES: u64 = 256 << 20;
+/// Submissions after the last static BLAS build/upgrade/compaction that count as streaming.
+const DXR_STREAMING_WINDOW_SUBS: u64 = 120;
 /// Maximum pooled DXR command lists kept in `DxrState::free_lists`.
 const MAX_FREE_LISTS: usize = 16;
 /// Maximum pooled DXR submission containers kept in `DxrState::free_submissions`.
@@ -74,8 +92,8 @@ const MAX_FREE_SUBS: usize = 4;
 const MAX_PREBUILD_CACHE: usize = 4096;
 /// Maximum cached TLAS `GetRaytracingAccelerationStructurePrebuildInfo` entries.
 const MAX_TLAS_PREBUILD_CACHE: usize = 2048;
-/// Maximum queued async BVH4 readback decode batches (bounded RAM, non-blocking relay).
-const MAX_DECODE_QUEUE: usize = 16;
+/// Maximum queued async BVH4 readback decode batches in the bounded decode queue.
+const MAX_DECODE_QUEUE_JOBS: usize = 128;
 /// Maximum individual dirty hash-table slots tracked before falling back to `[min..=max]`.
 const MAX_DIRTY_HASH_SLOTS: usize = 64;
 /// Coalesce dirty hash-table runs separated by at most this many 16B slots (4 KiB).
@@ -209,22 +227,43 @@ fn parse_u8_mask(s: &str) -> Option<u8> {
     }
 }
 
-/// Default `cull_mask_cfg` when Native DXR is active and `VICTORY_NATIVE_RT_CULL_MASK` is
-/// unset: tags `TRIANGLE_CULL_DISABLE` instances with unused mask bit `0x02` (`tag:0x02`)
-/// to pair with `VICTORY_NATIVE_RT_FBT_SPLIT_MASK=0x02`.
+/// Whether cull-enabled mirror TLASes are built alongside primary TLASes
+/// (`VICTORY_NATIVE_RT_MIRROR_TLAS=0` disables; default ON, `ARCH-13`).
+pub(crate) fn mirror_tlas_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_NATIVE_RT_MIRROR_TLAS").is_none_or(|v| v != "0")
+    })
+}
+
+/// Clears `D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE` (bit 0 of the
+/// 8-bit `Flags` field packed in bits 24..31 of `r3.y`) while strictly preserving
+/// `TRIANGLE_FRONT_COUNTERCLOCKWISE` (bit 1 = `0x0200_0000`), all other instance
+/// flags, and the 24-bit `InstanceContributionToHitGroupIndex`.
+#[cfg(test)]
+#[inline]
+fn clear_cull_disable_flag(r3_y: u32) -> u32 {
+    r3_y & !0x0100_0000u32
+}
+
+/// Default `cull_mask_cfg` when Native DXR is active, mirror TLAS is disabled,
+/// and `VICTORY_NATIVE_RT_CULL_MASK` is unset: tags `TRIANGLE_CULL_DISABLE`
+/// instances with unused mask bit `0x02` (`tag:0x02`) to pair with
+/// `VICTORY_NATIVE_RT_FBT_SPLIT_MASK=0x02`.
 const DEFAULT_CULL_MASK_CFG: u32 = CULL_MASK_TAG_MODE | 0x02;
 
 /// Parses `VICTORY_NATIVE_RT_CULL_MASK` into the shader root constant `cull_mask_cfg`:
-/// - unset / empty -> `DEFAULT_CULL_MASK_CFG` (`tag:0x02`).
+/// - unset / empty -> `0` when `mirror_tlas` is enabled (preserving full 8-bit guest
+///   `InstanceInclusionMask`), else `DEFAULT_CULL_MASK_CFG` (`tag:0x02`).
 /// - `"0"` / `"off"` / `"false"` -> `0` (disabled; instances keep exact guest `InstanceMask`).
 /// - `"1"` / `"0x80"` / `"128"` / custom `u8` -> `mask` (clear `mask` bits from
 ///   `InstanceMask` on valid patched instances with `TRIANGLE_CULL_DISABLE`, keeping
 ///   the original non-zero mask if clearing would zero it).
 /// - `"tag:<mask>"` -> `0x100 | mask` (OR `mask` into `InstanceMask` on valid patched
 ///   instances with `TRIANGLE_CULL_DISABLE`).
-fn parse_cull_mask_cfg(raw: Option<&str>) -> u32 {
+fn parse_cull_mask_cfg_for(raw: Option<&str>, mirror_tlas: bool) -> u32 {
     let Some(s) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
-        return DEFAULT_CULL_MASK_CFG;
+        return if mirror_tlas { 0 } else { DEFAULT_CULL_MASK_CFG };
     };
     let (tag_mode, rest) = if let Some(r) = s.strip_prefix("tag:").or_else(|| s.strip_prefix("TAG:")) {
         (true, r)
@@ -241,9 +280,19 @@ fn parse_cull_mask_cfg(raw: Option<&str>) -> u32 {
     }
 }
 
+#[cfg(test)]
+fn parse_cull_mask_cfg(raw: Option<&str>) -> u32 {
+    parse_cull_mask_cfg_for(raw, false)
+}
+
 fn cull_mask_cfg() -> u32 {
     static CFG: OnceLock<u32> = OnceLock::new();
-    *CFG.get_or_init(|| parse_cull_mask_cfg(std::env::var("VICTORY_NATIVE_RT_CULL_MASK").ok().as_deref()))
+    *CFG.get_or_init(|| {
+        parse_cull_mask_cfg_for(
+            std::env::var("VICTORY_NATIVE_RT_CULL_MASK").ok().as_deref(),
+            mirror_tlas_enabled(),
+        )
+    })
 }
 
 /// Configured `InstanceMask` bitmask for separating `TRIANGLE_CULL_DISABLE` instances
@@ -569,7 +618,16 @@ enum AsKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlabTier {
+    /// Long-lived compacted static BLASes (`record_static_compactions`, `CopyAs(COMPACT)`).
+    StaticCompacted,
+    /// Dynamic BLASes, TLASes, mirror TLASes, clones, and uncompacted Frame-0/pre-compact static BLASes.
+    TransientDynamicTlas,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SlabSlice {
+    tier: SlabTier,
     slab_idx: usize,
     offset: u64,
     size: u64,
@@ -579,13 +637,23 @@ struct SlabSlice {
 struct RetiredSlice {
     release_after_tlas_epoch: u64,
     release_after_sub_seq: u64,
+    release_after_dxr_fence: u64,
     slice: SlabSlice,
+}
+
+struct MirrorTlas {
+    #[allow(dead_code)]
+    buffer: ID3D12Resource,
+    slice: SlabSlice,
+    gpu_va: u64,
 }
 
 struct HostAs {
     buffer: ID3D12Resource,
     slice: SlabSlice,
     gpu_va: u64,
+    /// Optional cull-enabled mirror TLAS (`ARCH-13`) stored alongside primary TLAS entries.
+    mirror_tlas: Option<MirrorTlas>,
     kind: AsKind,
     flags: u32,
     num_instances: u32,
@@ -594,6 +662,12 @@ struct HostAs {
     topo_hash: u64,
     update_scratch_bytes: u64,
     consecutive_refits: u32,
+    /// Compacted byte size read back from `POSTBUILD_INFO_COMPACTED_SIZE` (`0` if unknown).
+    compacted_size: u64,
+    /// Last `tlas_build_epoch` in which this AS was created, updated, or observed in a TLAS.
+    last_seen_tlas_epoch: AtomicU64,
+    /// Fingerprint of resolved dynamic BLAS VB/IB/transform GPU VAs & strides for safe `BUILD_NORMALS` skip.
+    geom_va_hash: u64,
     /// Word slice in `dxr_normals` Region 1 (per-geometry offsets; `0` = none).
     normals_geom_off: u32,
     normals_geom_len: u32,
@@ -609,7 +683,7 @@ struct WordPool {
     end: u32,
     used: u32,
     free: Vec<(u32, u32)>,
-    retired: VecDeque<(u64, u64, u32, u32)>,
+    retired: VecDeque<(u64, u64, u64, u32, u32)>,
 }
 
 impl WordPool {
@@ -654,10 +728,22 @@ impl WordPool {
         Some(off)
     }
 
-    fn retire(&mut self, off: u32, len: u32, release_tlas_epoch: u64, release_sub_seq: u64) {
+    fn retire(
+        &mut self,
+        off: u32,
+        len: u32,
+        release_tlas_epoch: u64,
+        release_sub_seq: u64,
+        release_dxr_fence: u64,
+    ) {
         if off >= self.base && len > 0 {
-            self.retired
-                .push_back((release_tlas_epoch, release_sub_seq, off, len));
+            self.retired.push_back((
+                release_tlas_epoch,
+                release_sub_seq,
+                release_dxr_fence,
+                off,
+                len,
+            ));
         }
     }
 
@@ -689,11 +775,19 @@ impl WordPool {
         }
     }
 
-    fn drain_retired(&mut self, completed_tlas_epoch: u64, completed_sub_seq: u64) {
+    fn drain_retired(
+        &mut self,
+        completed_tlas_epoch: u64,
+        completed_sub_seq: u64,
+        completed_dxr_fence: u64,
+    ) {
         let mut i = 0;
         while i < self.retired.len() {
-            let (t_ep, s_seq, off, len) = self.retired[i];
-            if completed_tlas_epoch >= t_ep && completed_sub_seq >= s_seq {
+            let (t_ep, s_seq, d_fence, off, len) = self.retired[i];
+            if completed_tlas_epoch >= t_ep
+                && completed_sub_seq >= s_seq
+                && completed_dxr_fence >= d_fence
+            {
                 self.retired.swap_remove_back(i);
                 self.free_now(off, len);
             } else {
@@ -709,6 +803,7 @@ impl WordPool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct AllocatedAs {
     gpu_va: u64,
+    mirror_gpu_va: Option<u64>,
     generation: u64,
     slice_size: u64,
 }
@@ -730,13 +825,21 @@ struct Slab<B = ID3D12Resource> {
 unsafe impl Send for Slab<ID3D12Resource> {}
 
 struct SlabAllocator<B = ID3D12Resource> {
-    slabs: Vec<Slab<B>>,
+    tier: SlabTier,
+    slabs: Vec<Option<Slab<B>>>,
     retired: VecDeque<RetiredSlice>,
 }
 
 impl<B> Default for SlabAllocator<B> {
     fn default() -> Self {
+        Self::new(SlabTier::TransientDynamicTlas)
+    }
+}
+
+impl<B> SlabAllocator<B> {
+    fn new(tier: SlabTier) -> Self {
         Self {
+            tier,
             slabs: Vec::new(),
             retired: VecDeque::new(),
         }
@@ -752,7 +855,8 @@ impl<B: Clone> SlabAllocator<B> {
 
         // Best-fit search across reclaimed free ranges before bump-allocating.
         let mut best: Option<(usize, usize, u64)> = None;
-        'search: for (slab_idx, slab) in self.slabs.iter().enumerate() {
+        'search: for (slab_idx, slot) in self.slabs.iter().enumerate() {
+            let Some(slab) = slot.as_ref() else { continue };
             for (free_idx, &(_, range_size)) in slab.free.iter().enumerate() {
                 if range_size >= need {
                     if best.is_none_or(|(_, _, best_sz)| range_size < best_sz) {
@@ -765,7 +869,7 @@ impl<B: Clone> SlabAllocator<B> {
             }
         }
         if let Some((slab_idx, free_idx, _)) = best {
-            let slab = &mut self.slabs[slab_idx];
+            let slab = self.slabs[slab_idx].as_mut()?;
             let (offset, range_size) = slab.free[free_idx];
             if range_size == need {
                 slab.free.remove(free_idx);
@@ -773,6 +877,7 @@ impl<B: Clone> SlabAllocator<B> {
                 slab.free[free_idx] = (offset + need, range_size - need);
             }
             let slice = SlabSlice {
+                tier: self.tier,
                 slab_idx,
                 offset,
                 size: need,
@@ -780,17 +885,17 @@ impl<B: Clone> SlabAllocator<B> {
             return Some((slab.buffer.clone(), slice, slab.gpu_base + offset));
         }
 
-        // Fall back to bump allocation in an existing slab's tail.
+        // Fall back to lowest-index-first bump allocation so upper slabs drain and empty.
         if let Some((slab_idx, slab)) = self
             .slabs
             .iter_mut()
             .enumerate()
-            .rev()
-            .find(|(_, s)| s.used + need <= s.size)
+            .find_map(|(i, slot)| slot.as_mut().filter(|s| s.used + need <= s.size).map(|s| (i, s)))
         {
             let offset = slab.used;
             slab.used += need;
             let slice = SlabSlice {
+                tier: self.tier,
                 slab_idx,
                 offset,
                 size: need,
@@ -798,18 +903,25 @@ impl<B: Clone> SlabAllocator<B> {
             return Some((slab.buffer.clone(), slice, slab.gpu_base + offset));
         }
 
-        // Allocate a fresh backing slab.
+        // Allocate a fresh 32 MiB (or oversized) backing slab, reusing any reclaimed slot index.
         let slab_size = need.max(AS_SLAB_SIZE).next_multiple_of(AS_ALIGN);
-        let slab_idx = self.slabs.len();
+        let reuse_idx = self.slabs.iter().position(Option::is_none);
+        let slab_idx = reuse_idx.unwrap_or(self.slabs.len());
         let (buffer, gpu_base) = make_slab(slab_size, slab_idx)?;
-        self.slabs.push(Slab {
+        let new_slab = Slab {
             buffer: buffer.clone(),
             gpu_base,
             size: slab_size,
             used: need,
             free: Vec::new(),
-        });
+        };
+        if let Some(slot) = reuse_idx.and_then(|i| self.slabs.get_mut(i)) {
+            *slot = Some(new_slab);
+        } else {
+            self.slabs.push(Some(new_slab));
+        }
         let slice = SlabSlice {
+            tier: self.tier,
             slab_idx,
             offset: 0,
             size: need,
@@ -817,22 +929,37 @@ impl<B: Clone> SlabAllocator<B> {
         Some((buffer, slice, gpu_base))
     }
 
-    fn retire(&mut self, slice: SlabSlice, release_after_tlas_epoch: u64, release_after_sub_seq: u64) {
+    fn retire(
+        &mut self,
+        slice: SlabSlice,
+        release_after_tlas_epoch: u64,
+        release_after_sub_seq: u64,
+        release_after_dxr_fence: u64,
+    ) {
         if slice.size == 0 {
             return;
         }
         self.retired.push_back(RetiredSlice {
             release_after_tlas_epoch,
             release_after_sub_seq,
+            release_after_dxr_fence,
             slice,
         });
     }
 
-    fn drain_retired(&mut self, completed_tlas_epoch: u64, completed_sub_seq: u64) -> usize {
+    fn drain_retired(
+        &mut self,
+        completed_tlas_epoch: u64,
+        completed_sub_seq: u64,
+        completed_dxr_fence: u64,
+    ) -> usize {
         let mut freed = 0usize;
         let slabs = &mut self.slabs;
         self.retired.retain(|r| {
-            if completed_tlas_epoch >= r.release_after_tlas_epoch && completed_sub_seq >= r.release_after_sub_seq {
+            if completed_tlas_epoch >= r.release_after_tlas_epoch
+                && completed_sub_seq >= r.release_after_sub_seq
+                && completed_dxr_fence >= r.release_after_dxr_fence
+            {
                 Self::free_in_slabs(slabs, r.slice);
                 freed += 1;
                 false
@@ -843,16 +970,38 @@ impl<B: Clone> SlabAllocator<B> {
         freed
     }
 
+    /// Reclaims any completely empty slab (`used == 0 && free.is_empty()`) that has no
+    /// pending retired slices referencing it, returning `(buffer, size)` pairs for async
+    /// COM + VRAM retirement.
+    fn reclaim_empty_slabs(&mut self) -> Vec<(B, u64)> {
+        let mut out = Vec::new();
+        for (idx, slot) in self.slabs.iter_mut().enumerate() {
+            let empty = slot
+                .as_ref()
+                .is_some_and(|s| s.used == 0 && s.free.is_empty());
+            if empty && !self.retired.iter().any(|r| r.slice.slab_idx == idx) {
+                if let Some(slab) = slot.take() {
+                    out.push((slab.buffer, slab.size));
+                }
+            }
+        }
+        out
+    }
+
+    fn free_now(&mut self, slice: SlabSlice) {
+        Self::free_in_slabs(&mut self.slabs, slice);
+    }
+
     #[cfg(test)]
     fn free(&mut self, slice: SlabSlice) {
         Self::free_in_slabs(&mut self.slabs, slice);
     }
 
-    fn free_in_slabs(slabs: &mut [Slab<B>], slice: SlabSlice) {
+    fn free_in_slabs(slabs: &mut [Option<Slab<B>>], slice: SlabSlice) {
         if slice.size == 0 {
             return;
         }
-        let Some(slab) = slabs.get_mut(slice.slab_idx) else {
+        let Some(slab) = slabs.get_mut(slice.slab_idx).and_then(Option::as_mut) else {
             return;
         };
         let mut start = slice.offset;
@@ -925,11 +1074,11 @@ impl<B: Clone> SlabAllocator<B> {
     }
 
     /// Returns `(total_allocated_bytes, available_bytes)` where `available_bytes`
-    /// is free-list ranges plus unused bump tails across all slabs.
+    /// is free-list ranges plus unused bump tails across all live slabs.
     fn stats(&self) -> (u64, u64) {
         let mut total = 0u64;
         let mut free = 0u64;
-        for s in &self.slabs {
+        for s in self.slabs.iter().flatten() {
             total = total.saturating_add(s.size);
             let tail = s.size.saturating_sub(s.used);
             let recycled: u64 = s.free.iter().map(|&(_, sz)| sz).sum();
@@ -939,39 +1088,200 @@ impl<B: Clone> SlabAllocator<B> {
     }
 }
 
-static DXR_SLAB_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Two-tier 32 MiB AS slab allocator separating long-lived compacted static BLASes
+/// from high-churn dynamic BLASes, TLASes, and uncompacted pre-compact BLASes (`ARCH-10`).
+struct TieredSlabAllocator<B = ID3D12Resource> {
+    static_compacted: SlabAllocator<B>,
+    transient_dynamic_tlas: SlabAllocator<B>,
+}
 
-/// Local VRAM reserved by the texture queue for Native DXR AS slabs not yet
-/// allocated (`VICTORY_CARD_ROOM_FOR_DXR_MB`, default 1,536 MiB when
-/// `VICTORY_NATIVE_RT=1`, 0 otherwise), releasing automatically as slabs grow.
+impl<B> Default for TieredSlabAllocator<B> {
+    fn default() -> Self {
+        Self {
+            static_compacted: SlabAllocator::new(SlabTier::StaticCompacted),
+            transient_dynamic_tlas: SlabAllocator::new(SlabTier::TransientDynamicTlas),
+        }
+    }
+}
+
+impl<B: Clone> TieredSlabAllocator<B> {
+    fn tier_mut(&mut self, tier: SlabTier) -> &mut SlabAllocator<B> {
+        match tier {
+            SlabTier::StaticCompacted => &mut self.static_compacted,
+            SlabTier::TransientDynamicTlas => &mut self.transient_dynamic_tlas,
+        }
+    }
+
+    fn retire(
+        &mut self,
+        slice: SlabSlice,
+        release_after_tlas_epoch: u64,
+        release_after_sub_seq: u64,
+        release_after_dxr_fence: u64,
+    ) {
+        self.tier_mut(slice.tier).retire(
+            slice,
+            release_after_tlas_epoch,
+            release_after_sub_seq,
+            release_after_dxr_fence,
+        );
+    }
+
+    fn free_now(&mut self, slice: SlabSlice) {
+        self.tier_mut(slice.tier).free_now(slice);
+    }
+
+    fn drain_retired(
+        &mut self,
+        completed_tlas_epoch: u64,
+        completed_sub_seq: u64,
+        completed_dxr_fence: u64,
+    ) -> usize {
+        self.static_compacted
+            .drain_retired(completed_tlas_epoch, completed_sub_seq, completed_dxr_fence)
+            + self.transient_dynamic_tlas.drain_retired(
+                completed_tlas_epoch,
+                completed_sub_seq,
+                completed_dxr_fence,
+            )
+    }
+
+    fn stats(&self) -> (u64, u64) {
+        let (t0, f0) = self.static_compacted.stats();
+        let (t1, f1) = self.transient_dynamic_tlas.stats();
+        (t0.saturating_add(t1), f0.saturating_add(f1))
+    }
+}
+
+static DXR_SLAB_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Local VRAM held by non-slab DXR buffers (`normals_gpu`, `hash_gpu`, pooled scratch/staging UAVs).
+static DXR_AUX_VRAM_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Monotonic DXR submission sequence number (mirrors `DxrState::sub_seq` for lock-free reserve sizing).
+static CURRENT_SUB_SEQ: AtomicU64 = AtomicU64::new(0);
+/// Submission sequence of the most recent static BLAS extract/upgrade/compaction activity.
+static LAST_STREAM_SUB_SEQ: AtomicU64 = AtomicU64::new(0);
+/// Highest `Host::dxr_fence` value submitted on `Host::compute_queue` (for Spec-Trap #16 retirement).
+static SUBMITTED_DXR_FENCE: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn note_submitted_dxr_fence(val: u64) {
+    if val > 0 {
+        SUBMITTED_DXR_FENCE.fetch_max(val, Ordering::AcqRel);
+    }
+}
+
+fn retire_dxr_fence_target() -> u64 {
+    if host().is_some_and(Host::dxr_async_compute) {
+        SUBMITTED_DXR_FENCE.load(Ordering::Acquire).saturating_add(2)
+    } else {
+        0
+    }
+}
+
+/// RAII wrapper tracking a DEFAULT-heap auxiliary DXR buffer in `DXR_AUX_VRAM_BYTES`.
+struct AuxVramBuf {
+    buf: ID3D12Resource,
+    size: u64,
+}
+
+// SAFETY: `ID3D12Resource` is free-threaded.
+unsafe impl Send for AuxVramBuf {}
+
+impl AuxVramBuf {
+    fn new(buf: ID3D12Resource, size: u64) -> Self {
+        DXR_AUX_VRAM_BYTES.fetch_add(size, Ordering::Relaxed);
+        Self { buf, size }
+    }
+}
+
+impl Drop for AuxVramBuf {
+    fn drop(&mut self) {
+        let _ = DXR_AUX_VRAM_BYTES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+            Some(cur.saturating_sub(self.size))
+        });
+    }
+}
+
+fn note_static_streaming(sub_seq: u64) {
+    LAST_STREAM_SUB_SEQ.fetch_max(sub_seq.max(1), Ordering::Relaxed);
+}
+
+fn dxr_room_kept_for(
+    enabled: bool,
+    override_mb: Option<u64>,
+    slab_bytes: u64,
+    aux_bytes: u64,
+    streaming: bool,
+) -> u64 {
+    if !enabled {
+        return 0;
+    }
+    if let Some(mb) = override_mb {
+        return (mb << 20).saturating_sub(slab_bytes.saturating_add(aux_bytes));
+    }
+    let base = if streaming {
+        DXR_STREAMING_RESERVE_BYTES
+    } else {
+        DXR_STEADY_RESERVE_BYTES
+    };
+    base.saturating_sub(aux_bytes).max(AS_SLAB_SIZE)
+}
+
+/// Dynamic Local VRAM headroom reserve for Native DXR (`128 MiB` steady / `256 MiB`
+/// streaming, accounting for `DXR_AUX_VRAM_BYTES` and floored at 1 slab = `32 MiB`,
+/// or `VICTORY_CARD_ROOM_FOR_DXR_MB` when explicitly overridden; `ARCH-10`).
 pub(crate) fn dxr_room_kept() -> u64 {
     if !enabled() {
         return 0;
     }
-    static MOST: OnceLock<u64> = OnceLock::new();
-    let most = *MOST.get_or_init(|| {
+    static OVERRIDE_MB: OnceLock<Option<u64>> = OnceLock::new();
+    let override_mb = *OVERRIDE_MB.get_or_init(|| {
         std::env::var("VICTORY_CARD_ROOM_FOR_DXR_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(1536)
-            << 20
     });
-    most.saturating_sub(DXR_SLAB_BYTES.load(Ordering::Relaxed))
+    let slab_bytes = DXR_SLAB_BYTES.load(Ordering::Relaxed);
+    let aux_bytes = DXR_AUX_VRAM_BYTES.load(Ordering::Relaxed);
+    let cur_sub = CURRENT_SUB_SEQ.load(Ordering::Relaxed);
+    let last_stream = LAST_STREAM_SUB_SEQ.load(Ordering::Relaxed);
+    let streaming = slab_bytes == 0
+        || (last_stream > 0 && cur_sub.saturating_sub(last_stream) <= DXR_STREAMING_WINDOW_SUBS);
+    dxr_room_kept_for(true, override_mb, slab_bytes, aux_bytes, streaming)
 }
 
-impl SlabAllocator<ID3D12Resource> {
-    fn alloc(&mut self, host: &Host, size: u64) -> Option<(ID3D12Resource, SlabSlice, u64)> {
-        self.alloc_with(size, |slab_size, slab_idx| {
-            let buffer = create_as_slab(host, slab_size, slab_idx)?;
+impl TieredSlabAllocator<ID3D12Resource> {
+    fn alloc(&mut self, host: &Host, tier: SlabTier, size: u64) -> Option<(ID3D12Resource, SlabSlice, u64)> {
+        let label = match tier {
+            SlabTier::StaticCompacted => "static",
+            SlabTier::TransientDynamicTlas => "transient",
+        };
+        self.tier_mut(tier).alloc_with(size, |slab_size, slab_idx| {
+            let buffer = create_as_slab(host, slab_size, slab_idx, label)?;
             DXR_SLAB_BYTES.fetch_add(slab_size, Ordering::Relaxed);
             // SAFETY: live committed buffer resource.
             let gpu_base = unsafe { buffer.GetGPUVirtualAddress() };
             Some((buffer, gpu_base))
         })
     }
+
+    fn reclaim_empty_slabs(&mut self) -> u64 {
+        let mut freed = 0u64;
+        for (buf, sz) in self
+            .static_compacted
+            .reclaim_empty_slabs()
+            .into_iter()
+            .chain(self.transient_dynamic_tlas.reclaim_empty_slabs())
+        {
+            let _ = DXR_SLAB_BYTES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                Some(cur.saturating_sub(sz))
+            });
+            crate::host::retire_vram(buf, sz);
+            freed = freed.saturating_add(sz);
+        }
+        freed
+    }
 }
 
-fn create_as_slab(host: &Host, size: u64, index: usize) -> Option<ID3D12Resource> {
+fn create_as_slab(host: &Host, size: u64, index: usize, tier: &str) -> Option<ID3D12Resource> {
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
@@ -1005,7 +1315,7 @@ fn create_as_slab(host: &Host, size: u64, index: usize) -> Option<ID3D12Resource
     match made {
         Ok(()) => {
             let buf = buffer?;
-            name(&buf, || format!("victory dxr as slab {index} ({} MiB)", size >> 20));
+            name(&buf, || format!("victory dxr as slab {tier} {index} ({} MiB)", size >> 20));
             Some(buf)
         }
         Err(e) => {
@@ -1027,6 +1337,10 @@ struct CompactQueryRecord {
     generation: u64,
     uncompacted_size: u64,
     slot: u32,
+    /// When `true`, `finish_submission` queues async compaction into `pending_compactions`;
+    /// when `false` (guest dynamic `BuildBlas` with `ALLOW_COMPACTION`), records `compacted_size`
+    /// in `AS_MAP` so a subsequent guest `CopyAs(COMPACT)` sizes its destination accurately.
+    auto_compact: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1042,30 +1356,60 @@ struct PendingStaticUpgrade {
     generation: u64,
     geometries: Vec<UpgradedGeom>,
     vertices: Vec<[f32; 3]>,
+    /// Per-geometry relative primitive offset table precomputed on `victory-dxr-decode` (`ARCH-14`).
+    geom_table: Vec<u32>,
+    /// Packed octahedral geometric triangle normals precomputed on `victory-dxr-decode` (`ARCH-14`).
+    normals_data: Vec<u32>,
 }
+
+/// Async-compute DXR command-list batch scheduled alongside a `Host::submit` call.
+pub(crate) struct DxrAsyncBatch {
+    /// Index into `runs` after which these compute lists execute (via `skin_fence`),
+    /// or `None` for pre-run work (`empty_tlas_init`, `requeued_readbacks`, `static_upgrades`,
+    /// `static_compactions`) executed ahead of `runs[0]`.
+    pub(crate) after_run: Option<usize>,
+    /// Closed `D3D12_COMMAND_LIST_TYPE_COMPUTE` lists to run on `Host::compute_queue`.
+    pub(crate) lists: Vec<Option<ID3D12CommandList>>,
+    /// Whether `DirectQ` must wait on `dxr_fence` before subsequent Direct shaders.
+    pub(crate) blocks_direct_shaders: bool,
+    /// Whether any op in this batch wrote a guest postbuild buffer read back by `card.check`.
+    pub(crate) wrote_guest_postbuild: bool,
+}
+
+// SAFETY: D3D12 command lists are free-threaded; each batch is consumed once on `victory-submit`.
+unsafe impl Send for DxrAsyncBatch {}
 
 /// Host resources and pooled command lists owned by one in-flight submission.
 pub(crate) struct DxrSubmission {
     lists: Vec<Prelude>,
-    scratch: Option<(ID3D12Resource, u64)>,
-    host_instances: Option<(ID3D12Resource, u64)>,
-    extract_verts: Option<(ID3D12Resource, u64)>,
+    /// Pending async-compute DXR batches taken by `Host::submit` right before execution.
+    async_batches: Vec<DxrAsyncBatch>,
+    /// `Host::dxr_fence` value signalled on `compute_queue` for this submission (0 if Direct).
+    dxr_fence_val: u64,
+    /// Whether `lists` were recorded as `COMPUTE` lists on `Host::compute_queue`.
+    ran_on_compute: bool,
+    scratch: Option<AuxVramBuf>,
+    host_instances: Option<AuxVramBuf>,
+    extract_verts: Option<(AuxVramBuf, u64)>,
     hash_upload: Option<(ID3D12Resource, usize)>,
-    /// Temporary `DEFAULT` UAV buffer for unpacked 64-byte TriangleNode dumps.
-    node_staging: Option<(ID3D12Resource, u64)>,
-    /// `READBACK` buffer receiving packed per-BLAS node dumps for this submission.
-    node_readback: Option<(ID3D12Resource, u64)>,
+    /// Temporary `DEFAULT` UAV buffer for unpacked 64-byte TriangleNode dumps + last-used sub_seq.
+    node_staging: Option<(AuxVramBuf, u64)>,
+    /// `READBACK` buffer receiving packed per-BLAS node dumps for this submission + last-used sub_seq.
+    node_readback: Option<(ID3D12Resource, u64, u64)>,
     readback_used: u64,
     readback_cap: u64,
     readbacks: Vec<StaticReadbackRecord>,
-    /// Pooled upload + default vertex buffers for draining `pending_static_upgrades`.
-    upgrade_upload: Option<(ID3D12Resource, usize, u64)>,
-    upgrade_verts: Option<(ID3D12Resource, u64)>,
-    /// Pooled upload buffer for static BLAS octahedral normal uploads + word-0 fallback init.
-    normals_upload: Option<(ID3D12Resource, usize, u64)>,
-    /// Pooled 64 KiB `DEFAULT` UAV and `READBACK` buffers for 8-byte compacted-size queries.
-    compact_info_uav: Option<(ID3D12Resource, u64)>,
-    compact_info_rb: Option<(ID3D12Resource, u64)>,
+    /// Static BVH4 `(dest_va, size_bytes)` ranges whose extraction + readback completes with this
+    /// submission so `finish_submission` can release their ephemeral `memory.rs` arena pages.
+    extracted_bvh4s: Vec<(u64, u64)>,
+    /// Pooled upload + default vertex buffers for draining `pending_static_upgrades` + last-used sub_seq.
+    upgrade_upload: Option<(ID3D12Resource, usize, u64, u64)>,
+    upgrade_verts: Option<(AuxVramBuf, u64)>,
+    /// Pooled upload buffer for static BLAS octahedral normal uploads + word-0 fallback init + last-used sub_seq.
+    normals_upload: Option<(ID3D12Resource, usize, u64, u64)>,
+    /// Pooled 64 KiB `DEFAULT` UAV and `READBACK` buffers for 8-byte compacted-size queries + last-used sub_seq.
+    compact_info_uav: Option<(AuxVramBuf, u64)>,
+    compact_info_rb: Option<(ID3D12Resource, u64, u64)>,
     compact_queries: Vec<CompactQueryRecord>,
     kept: Vec<ID3D12Resource>,
     /// Keeps full `Shadow` objects (including any backing `ID3D12Heap` for placed
@@ -1091,6 +1435,9 @@ impl DxrSubmission {
     fn new() -> Self {
         Self {
             lists: Vec::new(),
+            async_batches: Vec::new(),
+            dxr_fence_val: 0,
+            ran_on_compute: false,
             scratch: None,
             host_instances: None,
             extract_verts: None,
@@ -1100,6 +1447,7 @@ impl DxrSubmission {
             readback_used: 0,
             readback_cap: 0,
             readbacks: Vec::new(),
+            extracted_bvh4s: Vec::new(),
             upgrade_upload: None,
             upgrade_verts: None,
             normals_upload: None,
@@ -1117,6 +1465,14 @@ impl DxrSubmission {
             #[cfg(feature = "diagnostics")]
             timing_next: 0,
         }
+    }
+
+    pub(crate) fn take_async_batches(&mut self) -> Vec<DxrAsyncBatch> {
+        std::mem::take(&mut self.async_batches)
+    }
+
+    pub(crate) fn set_dxr_fence_val(&mut self, val: u64) {
+        self.dxr_fence_val = self.dxr_fence_val.max(val);
     }
 
     #[cfg(feature = "diagnostics")]
@@ -1219,8 +1575,13 @@ impl DxrSubmission {
         let Some(h) = host() else {
             return;
         };
-        // SAFETY: plain queue timestamp query.
-        let frequency = unsafe { h.queue().GetTimestampFrequency() }.unwrap_or(1).max(1);
+        let frequency = if self.ran_on_compute {
+            h.compute_timestamp_frequency()
+        } else {
+            h.timestamp_frequency()
+        }
+        .unwrap_or(1)
+        .max(1);
         let mut ptr = std::ptr::null_mut();
         let range = D3D12_RANGE { Begin: 0, End: count * 8 };
         // SAFETY: submission GPU fence has completed; readback buffer is idle.
@@ -1244,50 +1605,53 @@ impl DxrSubmission {
 
     fn ensure_scratch(&mut self, host: &Host, need: u64) -> Option<(&ID3D12Resource, u64, u64)> {
         let want = need.max(MIN_SCRATCH_SIZE).next_multiple_of(AS_ALIGN);
-        if self.scratch.as_ref().is_none_or(|(_, sz)| *sz < want) {
-            if let Some((old, _)) = self.scratch.take() {
-                self.kept.push(old);
+        if self.scratch.as_ref().is_none_or(|b| b.size < want) {
+            if let Some(old) = self.scratch.take() {
+                self.kept.push(old.buf.clone());
             }
             let buf = host.uav_buffer(want)?;
             name(&buf, || format!("victory dxr scratch ({} MiB)", want >> 20));
-            self.scratch = Some((buf, want));
+            self.scratch = Some(AuxVramBuf::new(buf, want));
         }
-        let (buf, cap) = self.scratch.as_ref()?;
+        let aux = self.scratch.as_ref()?;
         // SAFETY: live buffer.
-        let gpu = unsafe { buf.GetGPUVirtualAddress() };
-        Some((buf, gpu, *cap))
+        let gpu = unsafe { aux.buf.GetGPUVirtualAddress() };
+        Some((&aux.buf, gpu, aux.size))
     }
 
     fn ensure_host_instances(&mut self, host: &Host, need: u64) -> Option<(ID3D12Resource, u64)> {
         let want = need.max(64 * 1024).next_multiple_of(AS_ALIGN);
-        if self.host_instances.as_ref().is_none_or(|(_, sz)| *sz < want) {
-            if let Some((old, _)) = self.host_instances.take() {
-                self.kept.push(old);
+        if self.host_instances.as_ref().is_none_or(|b| b.size < want) {
+            if let Some(old) = self.host_instances.take() {
+                self.kept.push(old.buf.clone());
             }
             let buf = host.uav_buffer(want)?;
             name(&buf, || format!("victory dxr host instances ({} KiB)", want >> 10));
-            self.host_instances = Some((buf, want));
+            self.host_instances = Some(AuxVramBuf::new(buf, want));
         }
-        let (buf, _) = self.host_instances.as_ref()?;
+        let aux = self.host_instances.as_ref()?;
         // SAFETY: live buffer.
-        let gpu = unsafe { buf.GetGPUVirtualAddress() };
-        Some((buf.clone(), gpu))
+        let gpu = unsafe { aux.buf.GetGPUVirtualAddress() };
+        Some((aux.buf.clone(), gpu))
     }
 
     fn ensure_extract_verts(&mut self, host: &Host, need: u64) -> Option<(ID3D12Resource, u64)> {
+        let now_sub = CURRENT_SUB_SEQ.load(Ordering::Relaxed);
         let want = need.max(256 * 1024).next_multiple_of(AS_ALIGN);
-        if self.extract_verts.as_ref().is_none_or(|(_, sz)| *sz < want) {
+        if self.extract_verts.as_ref().is_none_or(|(b, _)| b.size < want) {
             if let Some((old, _)) = self.extract_verts.take() {
-                self.kept.push(old);
+                self.kept.push(old.buf.clone());
             }
             let buf = host.uav_buffer(want)?;
             name(&buf, || format!("victory dxr extracted verts ({} KiB)", want >> 10));
-            self.extract_verts = Some((buf, want));
+            self.extract_verts = Some((AuxVramBuf::new(buf, want), now_sub));
+        } else if let Some((_, last)) = self.extract_verts.as_mut() {
+            *last = now_sub;
         }
-        let (buf, _) = self.extract_verts.as_ref()?;
+        let (aux, _) = self.extract_verts.as_ref()?;
         // SAFETY: live buffer.
-        let gpu = unsafe { buf.GetGPUVirtualAddress() };
-        Some((buf.clone(), gpu))
+        let gpu = unsafe { aux.buf.GetGPUVirtualAddress() };
+        Some((aux.buf.clone(), gpu))
     }
 
     fn ensure_hash_upload(&mut self, host: &Host) -> Option<(ID3D12Resource, *mut u8)> {
@@ -1301,103 +1665,219 @@ impl DxrSubmission {
     }
 
     fn ensure_node_staging(&mut self, host: &Host, need: u64) -> Option<(ID3D12Resource, u64)> {
+        let now_sub = CURRENT_SUB_SEQ.load(Ordering::Relaxed);
         let want = need.max(64 * 1024).next_multiple_of(AS_ALIGN);
-        if self.node_staging.as_ref().is_none_or(|(_, sz)| *sz < want) {
+        if self.node_staging.as_ref().is_none_or(|(b, _)| b.size < want) {
             if let Some((old, _)) = self.node_staging.take() {
-                self.kept.push(old);
+                self.kept.push(old.buf.clone());
             }
             let buf = host.uav_buffer(want)?;
             name(&buf, || format!("victory dxr node staging ({} KiB)", want >> 10));
-            self.node_staging = Some((buf, want));
+            self.node_staging = Some((AuxVramBuf::new(buf, want), now_sub));
+        } else if let Some((_, last)) = self.node_staging.as_mut() {
+            *last = now_sub;
         }
-        let (buf, _) = self.node_staging.as_ref()?;
+        let (aux, _) = self.node_staging.as_ref()?;
         // SAFETY: live buffer.
-        let gpu = unsafe { buf.GetGPUVirtualAddress() };
-        Some((buf.clone(), gpu))
+        let gpu = unsafe { aux.buf.GetGPUVirtualAddress() };
+        Some((aux.buf.clone(), gpu))
     }
 
     fn prepare_node_readback(&mut self, host: &Host, need: u64) {
         self.readbacks.clear();
+        self.extracted_bvh4s.clear();
         self.readback_used = 0;
         self.readback_cap = 0;
         if need == 0 {
             return;
         }
+        let now_sub = CURRENT_SUB_SEQ.load(Ordering::Relaxed);
         let want = need.min(MAX_READBACK_BYTES_PER_SUB).max(64 * 1024).next_multiple_of(AS_ALIGN);
-        if self.node_readback.as_ref().is_none_or(|(_, sz)| *sz < want) {
-            if let Some((old, _)) = self.node_readback.take() {
+        if self.node_readback.as_ref().is_none_or(|(_, sz, _)| *sz < want) {
+            if let Some((old, _, _)) = self.node_readback.take() {
                 self.kept.push(old);
             }
             if let Some(buf) = host.read_back_buffer(want) {
                 name(&buf, || format!("victory dxr node readback ({} KiB)", want >> 10));
-                self.node_readback = Some((buf, want));
+                self.node_readback = Some((buf, want, now_sub));
             }
+        } else if let Some((_, _, last)) = self.node_readback.as_mut() {
+            *last = now_sub;
         }
-        if let Some((_, sz)) = self.node_readback.as_ref() {
+        if let Some((_, sz, _)) = self.node_readback.as_ref() {
             self.readback_cap = (*sz).min(MAX_READBACK_BYTES_PER_SUB);
         }
     }
 
     fn ensure_upgrade_upload(&mut self, host: &Host, need: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        let now_sub = CURRENT_SUB_SEQ.load(Ordering::Relaxed);
         let want = need.max(64 * 1024).next_multiple_of(AS_ALIGN);
-        if self.upgrade_upload.as_ref().is_none_or(|(_, _, sz)| *sz < want) {
-            if let Some((old, _, _)) = self.upgrade_upload.take() {
+        if self.upgrade_upload.as_ref().is_none_or(|(_, _, sz, _)| *sz < want) {
+            if let Some((old, _, _, _)) = self.upgrade_upload.take() {
                 self.kept.push(old);
             }
             let (buf, ptr) = host.upload_buffer(want)?;
             name(&buf, || format!("victory dxr upgrade upload ({} KiB)", want >> 10));
-            self.upgrade_upload = Some((buf, ptr as usize, want));
+            self.upgrade_upload = Some((buf, ptr as usize, want, now_sub));
+        } else if let Some((_, _, _, last)) = self.upgrade_upload.as_mut() {
+            *last = now_sub;
         }
-        let (buf, ptr, _) = self.upgrade_upload.as_ref()?;
+        let (buf, ptr, _, _) = self.upgrade_upload.as_ref()?;
         Some((buf.clone(), *ptr as *mut u8))
     }
 
     fn ensure_normals_upload(&mut self, host: &Host, need: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        let now_sub = CURRENT_SUB_SEQ.load(Ordering::Relaxed);
         let want = need.max(64 * 1024).next_multiple_of(AS_ALIGN);
-        if self.normals_upload.as_ref().is_none_or(|(_, _, sz)| *sz < want) {
-            if let Some((old, _, _)) = self.normals_upload.take() {
+        if self.normals_upload.as_ref().is_none_or(|(_, _, sz, _)| *sz < want) {
+            if let Some((old, _, _, _)) = self.normals_upload.take() {
                 self.kept.push(old);
             }
             let (buf, ptr) = host.upload_buffer(want)?;
             name(&buf, || format!("victory dxr normals upload ({} KiB)", want >> 10));
-            self.normals_upload = Some((buf, ptr as usize, want));
+            self.normals_upload = Some((buf, ptr as usize, want, now_sub));
+        } else if let Some((_, _, _, last)) = self.normals_upload.as_mut() {
+            *last = now_sub;
         }
-        let (buf, ptr, _) = self.normals_upload.as_ref()?;
+        let (buf, ptr, _, _) = self.normals_upload.as_ref()?;
         Some((buf.clone(), *ptr as *mut u8))
     }
 
     fn ensure_upgrade_verts(&mut self, host: &Host, need: u64) -> Option<(ID3D12Resource, u64)> {
+        let now_sub = CURRENT_SUB_SEQ.load(Ordering::Relaxed);
         let want = need.max(64 * 1024).next_multiple_of(AS_ALIGN);
-        if self.upgrade_verts.as_ref().is_none_or(|(_, sz)| *sz < want) {
+        if self.upgrade_verts.as_ref().is_none_or(|(b, _)| b.size < want) {
             if let Some((old, _)) = self.upgrade_verts.take() {
-                self.kept.push(old);
+                self.kept.push(old.buf.clone());
             }
             let buf = host.uav_buffer(want)?;
             name(&buf, || format!("victory dxr upgrade verts ({} KiB)", want >> 10));
-            self.upgrade_verts = Some((buf, want));
+            self.upgrade_verts = Some((AuxVramBuf::new(buf, want), now_sub));
+        } else if let Some((_, last)) = self.upgrade_verts.as_mut() {
+            *last = now_sub;
         }
-        let (buf, _) = self.upgrade_verts.as_ref()?;
+        let (aux, _) = self.upgrade_verts.as_ref()?;
         // SAFETY: live buffer.
-        let gpu = unsafe { buf.GetGPUVirtualAddress() };
-        Some((buf.clone(), gpu))
+        let gpu = unsafe { aux.buf.GetGPUVirtualAddress() };
+        Some((aux.buf.clone(), gpu))
     }
 
     fn ensure_compact_info(&mut self, host: &Host) -> Option<(ID3D12Resource, u64, ID3D12Resource)> {
+        let now_sub = CURRENT_SUB_SEQ.load(Ordering::Relaxed);
         if self.compact_info_uav.is_none() {
             let buf = host.uav_buffer(COMPACT_INFO_BYTES)?;
             name(&buf, || "victory dxr compact info uav".into());
-            self.compact_info_uav = Some((buf, COMPACT_INFO_BYTES));
+            self.compact_info_uav = Some((AuxVramBuf::new(buf, COMPACT_INFO_BYTES), now_sub));
+        } else if let Some((_, last)) = self.compact_info_uav.as_mut() {
+            *last = now_sub;
         }
         if self.compact_info_rb.is_none() {
             let buf = host.read_back_buffer(COMPACT_INFO_BYTES)?;
             name(&buf, || "victory dxr compact info readback".into());
-            self.compact_info_rb = Some((buf, COMPACT_INFO_BYTES));
+            self.compact_info_rb = Some((buf, COMPACT_INFO_BYTES, now_sub));
+        } else if let Some((_, _, last)) = self.compact_info_rb.as_mut() {
+            *last = now_sub;
         }
         let (uav, _) = self.compact_info_uav.as_ref()?;
-        let (rb, _) = self.compact_info_rb.as_ref()?;
+        let (rb, _, _) = self.compact_info_rb.as_ref()?;
         // SAFETY: live UAV buffer.
-        let uav_gpu = unsafe { uav.GetGPUVirtualAddress() };
-        Some((uav.clone(), uav_gpu, rb.clone()))
+        let uav_gpu = unsafe { uav.buf.GetGPUVirtualAddress() };
+        Some((uav.buf.clone(), uav_gpu, rb.clone()))
+    }
+
+    /// Drops oversized buffers and static staging buffers idle for `>= IDLE_STAGING_TRIM_SUBS`
+    /// submissions asynchronously via `crate::host::retire_com_async` (`ARCH-10`).
+    fn trim_pooled(&mut self, completed_sub_seq: u64) {
+        let mut drop_aux: Vec<AuxVramBuf> = Vec::new();
+        let mut drop_res: Vec<ID3D12Resource> = std::mem::take(&mut self.kept);
+        let is_idle = |last_used: u64| {
+            completed_sub_seq.saturating_sub(last_used) >= IDLE_STAGING_TRIM_SUBS
+        };
+
+        if self.scratch.as_ref().is_some_and(|b| b.size > MAX_POOLED_SCRATCH_BYTES)
+            && let Some(old) = self.scratch.take()
+        {
+            drop_aux.push(old);
+        }
+        if self
+            .host_instances
+            .as_ref()
+            .is_some_and(|b| b.size > MAX_POOLED_HOST_INSTANCES_BYTES)
+            && let Some(old) = self.host_instances.take()
+        {
+            drop_aux.push(old);
+        }
+        if self
+            .extract_verts
+            .as_ref()
+            .is_some_and(|(b, last)| b.size > MAX_POOLED_EXTRACT_VERTS_BYTES || is_idle(*last))
+            && let Some((old, _)) = self.extract_verts.take()
+        {
+            drop_aux.push(old);
+        }
+        if self
+            .node_staging
+            .as_ref()
+            .is_some_and(|(b, last)| b.size > MAX_POOLED_AUX_BYTES || is_idle(*last))
+            && let Some((old, _)) = self.node_staging.take()
+        {
+            drop_aux.push(old);
+        }
+        if self
+            .node_readback
+            .as_ref()
+            .is_some_and(|(_, sz, last)| *sz > MAX_POOLED_AUX_BYTES || is_idle(*last))
+            && let Some((old, _, _)) = self.node_readback.take()
+        {
+            drop_res.push(old);
+        }
+        if self
+            .upgrade_upload
+            .as_ref()
+            .is_some_and(|(_, _, sz, last)| *sz > MAX_POOLED_AUX_BYTES || is_idle(*last))
+            && let Some((old, _, _, _)) = self.upgrade_upload.take()
+        {
+            drop_res.push(old);
+        }
+        if self
+            .upgrade_verts
+            .as_ref()
+            .is_some_and(|(b, last)| b.size > MAX_POOLED_AUX_BYTES || is_idle(*last))
+            && let Some((old, _)) = self.upgrade_verts.take()
+        {
+            drop_aux.push(old);
+        }
+        if self
+            .normals_upload
+            .as_ref()
+            .is_some_and(|(_, _, sz, last)| *sz > MAX_POOLED_AUX_BYTES || is_idle(*last))
+            && let Some((old, _, _, _)) = self.normals_upload.take()
+        {
+            drop_res.push(old);
+        }
+        if self
+            .compact_info_uav
+            .as_ref()
+            .is_some_and(|(_, last)| is_idle(*last))
+            && let Some((old, _)) = self.compact_info_uav.take()
+        {
+            drop_aux.push(old);
+        }
+        if self
+            .compact_info_rb
+            .as_ref()
+            .is_some_and(|(_, _, last)| is_idle(*last))
+            && let Some((old, _, _)) = self.compact_info_rb.take()
+        {
+            drop_res.push(old);
+        }
+
+        if !drop_aux.is_empty() {
+            crate::host::retire_com_async(drop_aux);
+        }
+        if !drop_res.is_empty() {
+            crate::host::retire_com_async(drop_res);
+        }
     }
 }
 
@@ -1493,14 +1973,14 @@ impl HashDirtyTracker {
 }
 
 struct DxrState {
-    slabs: SlabAllocator,
+    slabs: TieredSlabAllocator,
     /// Open-addressed CPU mirror of `(guest_blas_va >> 8 -> (host_blas_va, normals_geom_off))`.
     /// Each 32-byte slot is `[key_lo, key_hi, val_lo, val_hi, geom_off, 0, 0, 0]`.
     blas_table: Vec<[u32; 8]>,
     hash_dirty: HashDirtyTracker,
-    hash_gpu: Option<ID3D12Resource>,
+    hash_gpu: Option<AuxVramBuf>,
     /// Shared 64 MiB default-heap `SLOT_DXR_NORMALS` lookup table (`t251` in `ROOT_CBV_SPACE`).
-    normals_gpu: Option<(ID3D12Resource, u64)>,
+    normals_gpu: Option<(AuxVramBuf, u64)>,
     normals_init_needed: bool,
     geom_pool: WordPool,
     data_pool: WordPool,
@@ -1514,6 +1994,14 @@ struct DxrState {
     /// Monotonic TLAS rebuild epochs (submitted vs GPU-completed) gating BLAS slice reclamation.
     tlas_build_epoch: u64,
     completed_tlas_epoch: u64,
+    /// Last `tlas_build_epoch` on which periodic unreachable-BLAS GC ran.
+    last_gc_tlas_epoch: u64,
+    /// Last `tlas_build_epoch` on which a CPU-readable TLAS instance array was scanned.
+    last_readable_tlas_scan_epoch: u64,
+    /// Last `tlas_build_epoch` on which a GPU-written (non-CPU-readable) TLAS was observed.
+    last_unreadable_tlas_epoch: u64,
+    /// Reusable scratch buffer for SEH-safe TLAS instance BLAS-reachability scanning.
+    inst_scan_buf: Vec<u8>,
     /// Cached dynamic BLAS `GetRaytracingAccelerationStructurePrebuildInfo` keyed by `(flags, topo_hash)`
     /// -> `(ResultDataMaxSizeInBytes, ScratchDataSizeInBytes, UpdateScratchDataSizeInBytes)`.
     prebuild_cache: HashMap<(u32, u64), (u64, u64, u64)>,
@@ -1523,12 +2011,16 @@ struct DxrState {
     /// Newly pre-allocated TLAS VAs that have not been built yet; initialized with an empty
     /// 0-instance TLAS before any shader can trace them.
     pending_empty_tlas: Vec<u64>,
+    /// Frame-0 static BLASes `(guest_key, size_bytes, generation)` whose node readback overflowed
+    /// a burst submission and will be re-extracted cleanly on a subsequent submission (`ARCH-10`).
+    pending_readback_requeue: VecDeque<(u64, u64, u64)>,
     /// Decoded multi-geometry static BLAS upgrades waiting for GPU build on the next submission.
     pending_static_upgrades: VecDeque<PendingStaticUpgrade>,
     /// Static BLASes `(guest_key, generation, compacted_size)` awaiting async compaction copy.
     pending_compactions: VecDeque<(u64, u64, u64)>,
-    /// Pooled command lists and reusable submission containers returned after GPU completion.
+    /// Pooled `DIRECT` and `COMPUTE` command lists and reusable submission containers returned after GPU completion.
     free_lists: Vec<Prelude>,
+    free_compute_lists: Vec<Prelude>,
     free_submissions: Vec<DxrSubmission>,
 }
 
@@ -1538,7 +2030,7 @@ unsafe impl Send for DxrState {}
 impl DxrState {
     fn new() -> Self {
         Self {
-            slabs: SlabAllocator::default(),
+            slabs: TieredSlabAllocator::default(),
             blas_table: vec![[0u32; 8]; HASH_CAPACITY],
             hash_dirty: HashDirtyTracker::full(),
             hash_gpu: None,
@@ -1558,12 +2050,18 @@ impl DxrState {
             completed_sub_seq: 0,
             tlas_build_epoch: 0,
             completed_tlas_epoch: 0,
+            last_gc_tlas_epoch: 0,
+            last_readable_tlas_scan_epoch: 0,
+            last_unreadable_tlas_epoch: 0,
+            inst_scan_buf: Vec::new(),
             prebuild_cache: HashMap::new(),
             tlas_prebuild_cache: HashMap::new(),
             pending_empty_tlas: Vec::new(),
+            pending_readback_requeue: VecDeque::new(),
             pending_static_upgrades: VecDeque::new(),
             pending_compactions: VecDeque::new(),
             free_lists: Vec::new(),
+            free_compute_lists: Vec::new(),
             free_submissions: Vec::new(),
         }
     }
@@ -1573,24 +2071,33 @@ impl DxrState {
         self.next_gen
     }
 
-    /// Defers reclamation of a replaced AS slab slice until it is guaranteed unreachable
-    /// on the GPU (at least 2 completed TLAS rebuild epochs for BLAS slices, or 2 completed
-    /// submissions for non-TLAS-referenced slices like replaced TLASes).
+    /// Defers reclamation of a replaced AS slab slice (and optional mirror TLAS slice)
+    /// until it is guaranteed unreachable on the GPU (`tlas_build_epoch + 2 && sub_seq + 2 && dxr_fence`).
     fn retire_as(&mut self, old: &HostAs) {
         let release_after_sub_seq = self.sub_seq.saturating_add(2);
-        let release_after_tlas_epoch = if old.kind == AsKind::Blas {
-            self.tlas_build_epoch.saturating_add(2)
-        } else {
-            0
-        };
-        self.slabs
-            .retire(old.slice, release_after_tlas_epoch, release_after_sub_seq);
+        let release_after_tlas_epoch = self.tlas_build_epoch.saturating_add(2);
+        let release_after_dxr_fence = retire_dxr_fence_target();
+        self.slabs.retire(
+            old.slice,
+            release_after_tlas_epoch,
+            release_after_sub_seq,
+            release_after_dxr_fence,
+        );
+        if let Some(mirror) = &old.mirror_tlas {
+            self.slabs.retire(
+                mirror.slice,
+                release_after_tlas_epoch,
+                release_after_sub_seq,
+                release_after_dxr_fence,
+            );
+        }
         if old.normals_geom_len > 0 {
             self.geom_pool.retire(
                 old.normals_geom_off,
                 old.normals_geom_len,
                 release_after_tlas_epoch,
                 release_after_sub_seq,
+                release_after_dxr_fence,
             );
         }
         if old.normals_data_len > 0 {
@@ -1599,37 +2106,25 @@ impl DxrState {
                 old.normals_data_len,
                 release_after_tlas_epoch,
                 release_after_sub_seq,
+                release_after_dxr_fence,
             );
         }
     }
 
     fn insert_blas_hash(&mut self, guest_va: u64, host_va: u64, normals_geom_off: u32) {
-        let key = guest_va >> 8;
-        if key == 0 {
-            return;
-        }
-        let key_lo = key as u32;
-        let key_hi = (key >> 32) as u32;
-        let val_lo = host_va as u32;
-        let val_hi = (host_va >> 32) as u32;
-        let new_entry = [key_lo, key_hi, val_lo, val_hi, normals_geom_off, 0, 0, 0];
-        let start = hash_key(key_lo, key_hi) & HASH_MASK;
-        for step in 0..64u32 {
-            let idx = ((start + step) & HASH_MASK) as usize;
-            let entry = &mut self.blas_table[idx];
-            if (entry[0] == key_lo && entry[1] == key_hi) || (entry[0] | entry[1]) == 0 {
-                if *entry != new_entry {
-                    *entry = new_entry;
-                    self.hash_dirty.mark_slot(idx);
-                }
-                return;
-            }
-        }
-        // shortcut: hash table saturated past 64-probe chain; overwrite initial bucket,
-        // upgrade to dynamic resize if active BLASes ever approach 48K.
-        let idx = start as usize;
-        self.blas_table[idx] = new_entry;
-        self.hash_dirty.mark_slot(idx);
+        insert_blas_hash_in(
+            &mut self.blas_table,
+            &mut self.hash_dirty,
+            guest_va,
+            host_va,
+            normals_geom_off,
+        );
+    }
+
+    /// Shift-deletes `guest_va` from the open-addressed 64-probe `blas_table` chain,
+    /// preserving all subsequent probe chains without leaving empty-slot breaks (`ARCH-10`).
+    fn remove_blas_hash(&mut self, guest_va: u64) -> bool {
+        shift_delete_blas_hash(&mut self.blas_table, &mut self.hash_dirty, guest_va)
     }
 
     fn ensure_normals_gpu(&mut self, host: &Host) -> Option<(ID3D12Resource, u64)> {
@@ -1640,21 +2135,21 @@ impl DxrState {
             let gpu = unsafe { buf.GetGPUVirtualAddress() };
             name(&buf, || "victory dxr normals table (64 MiB)".into());
             NORMALS_GPU_VA.store(gpu, Ordering::Release);
-            self.normals_gpu = Some((buf, gpu));
+            self.normals_gpu = Some((AuxVramBuf::new(buf, bytes), gpu));
             self.normals_init_needed = true;
         }
-        let (buf, gpu) = self.normals_gpu.as_ref()?;
-        Some((buf.clone(), *gpu))
+        let (aux, gpu) = self.normals_gpu.as_ref()?;
+        Some((aux.buf.clone(), *gpu))
     }
 
     fn ensure_hash_gpu(&mut self, host: &Host) -> Option<ID3D12Resource> {
         if self.hash_gpu.is_none() {
             let buf = host.uav_buffer(HASH_TABLE_BYTES)?;
             name(&buf, || "victory dxr blas hash table".into());
-            self.hash_gpu = Some(buf);
+            self.hash_gpu = Some(AuxVramBuf::new(buf, HASH_TABLE_BYTES));
             self.hash_dirty.mark_full();
         }
-        self.hash_gpu.clone()
+        self.hash_gpu.as_ref().map(|a| a.buf.clone())
     }
 
     #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
@@ -1672,8 +2167,27 @@ impl DxrState {
         Some((buf.clone(), *gpu))
     }
 
-    fn take_list(&mut self, host: &Host) -> Option<Prelude> {
-        self.free_lists.pop().or_else(|| host.make_prelude())
+    fn take_list(&mut self, host: &Host, compute: bool) -> Option<Prelude> {
+        if compute {
+            self.free_compute_lists
+                .pop()
+                .or_else(|| host.make_compute_prelude())
+        } else {
+            self.free_lists.pop().or_else(|| host.make_prelude())
+        }
+    }
+
+    fn return_list(&mut self, prelude: Prelude, compute: bool) {
+        let pool = if compute {
+            &mut self.free_compute_lists
+        } else {
+            &mut self.free_lists
+        };
+        if pool.len() < MAX_FREE_LISTS {
+            pool.push(prelude);
+        } else {
+            crate::host::retire_com_async(prelude);
+        }
     }
 
     fn take_submission(&mut self) -> DxrSubmission {
@@ -1734,6 +2248,199 @@ fn hash_key(lo: u32, hi: u32) -> u32 {
     x = x.wrapping_mul(0xC2B2_AE35);
     x ^= x >> 16;
     x
+}
+
+fn insert_blas_hash_in(
+    blas_table: &mut [[u32; 8]],
+    hash_dirty: &mut HashDirtyTracker,
+    guest_va: u64,
+    host_va: u64,
+    normals_geom_off: u32,
+) {
+    let key = guest_va >> 8;
+    if key == 0 {
+        return;
+    }
+    let key_lo = key as u32;
+    let key_hi = (key >> 32) as u32;
+    let val_lo = host_va as u32;
+    let val_hi = (host_va >> 32) as u32;
+    let new_entry = [key_lo, key_hi, val_lo, val_hi, normals_geom_off, 0, 0, 0];
+    let start = hash_key(key_lo, key_hi) & HASH_MASK;
+    for step in 0..64u32 {
+        let idx = ((start + step) & HASH_MASK) as usize;
+        let entry = &mut blas_table[idx];
+        if (entry[0] == key_lo && entry[1] == key_hi) || (entry[0] | entry[1]) == 0 {
+            if *entry != new_entry {
+                *entry = new_entry;
+                hash_dirty.mark_slot(idx);
+            }
+            return;
+        }
+    }
+    // shortcut: hash table saturated past 64-probe chain; overwrite initial bucket,
+    // upgrade to dynamic resize if active BLASes ever approach 48K.
+    let idx = start as usize;
+    blas_table[idx] = new_entry;
+    hash_dirty.mark_slot(idx);
+}
+
+/// Backward shift-deletion within the open-addressed 64-probe `blas_table` chain (`ARCH-10`).
+/// Never blind-zeros a slot mid-chain: shifts every subsequent entry whose natural home bucket
+/// precedes or equals the hole back toward its home so linear-probe lookups stay 100% intact.
+fn shift_delete_blas_hash(
+    blas_table: &mut [[u32; 8]],
+    hash_dirty: &mut HashDirtyTracker,
+    guest_va: u64,
+) -> bool {
+    let key = guest_va >> 8;
+    if key == 0 {
+        return false;
+    }
+    let key_lo = key as u32;
+    let key_hi = (key >> 32) as u32;
+    let mask = HASH_MASK as usize;
+    let start = (hash_key(key_lo, key_hi) as usize) & mask;
+    let mut hole = None;
+    for step in 0..64usize {
+        let idx = (start + step) & mask;
+        let entry = blas_table[idx];
+        if entry[0] == key_lo && entry[1] == key_hi {
+            hole = Some(idx);
+            break;
+        }
+        if (entry[0] | entry[1]) == 0 {
+            return false;
+        }
+    }
+    let Some(mut hole) = hole else {
+        return false;
+    };
+    let mut cur = (hole + 1) & mask;
+    for _ in 0..HASH_CAPACITY {
+        let entry = blas_table[cur];
+        if (entry[0] | entry[1]) == 0 {
+            break;
+        }
+        let home = (hash_key(entry[0], entry[1]) as usize) & mask;
+        let dist_cur = cur.wrapping_sub(home) & mask;
+        let dist_hole = hole.wrapping_sub(home) & mask;
+        if dist_hole < dist_cur {
+            blas_table[hole] = entry;
+            hash_dirty.mark_slot(hole);
+            hole = cur;
+        }
+        cur = (cur + 1) & mask;
+    }
+    blas_table[hole] = [0u32; 8];
+    hash_dirty.mark_slot(hole);
+    true
+}
+
+#[cfg(test)]
+fn lookup_blas_hash_in(blas_table: &[[u32; 8]], guest_va: u64) -> Option<(u64, u32)> {
+    let key = guest_va >> 8;
+    if key == 0 {
+        return None;
+    }
+    let key_lo = key as u32;
+    let key_hi = (key >> 32) as u32;
+    let start = hash_key(key_lo, key_hi) & HASH_MASK;
+    for step in 0..64u32 {
+        let idx = ((start + step) & HASH_MASK) as usize;
+        let e = blas_table[idx];
+        if e[0] == key_lo && e[1] == key_hi {
+            let host_va = u64::from(e[2]) | (u64::from(e[3]) << 32);
+            return Some((host_va, e[4]));
+        }
+        if (e[0] | e[1]) == 0 {
+            return None;
+        }
+    }
+    None
+}
+
+/// Evicts any resident host AS entries whose guest VA overlaps `[start, start + len)`
+/// (hook for `shadow::unregister` / `inplace` unmaps; `ARCH-10`).
+/// Shift-deletes evicted BLASes from `blas_table` and retires AS slices + `dxr_normals`
+/// words strictly behind `tlas_build_epoch + 2 && sub_seq + 2`.
+#[allow(dead_code)]
+pub(crate) fn evict_range(start: u64, len: u64) {
+    if len == 0 {
+        return;
+    }
+    let Some(map_lock) = AS_MAP.get() else {
+        return;
+    };
+    let lo = start & !0xFF;
+    let hi = start.saturating_add(len);
+    // Fast read-only pre-check to avoid taking `DXR_STATE` or write locks when no AS overlaps.
+    let has_overlap = {
+        let map = map_lock.read().unwrap_or_else(|e| e.into_inner());
+        map.keys().any(|&k| k != EMPTY_TLAS_KEY && k >= lo && k < hi)
+    };
+    if !has_overlap {
+        return;
+    }
+    let mut state_guard = lock_state();
+    let Some(state) = state_guard.as_mut() else {
+        return;
+    };
+    let mut map = map_lock.write().unwrap_or_else(|e| e.into_inner());
+    let dead_keys: Vec<u64> = map
+        .keys()
+        .copied()
+        .filter(|&k| k != EMPTY_TLAS_KEY && k >= lo && k < hi)
+        .collect();
+    for key in dead_keys {
+        if let Some(old) = map.remove(&key) {
+            if old.kind == AsKind::Blas {
+                state.remove_blas_hash(key);
+            }
+            state.retire_as(&old);
+        }
+    }
+}
+
+/// Periodic TLAS-reachability liveness sweep: evicts BLASes unreachable from any scanned
+/// TLAS for more than [`BLAS_GC_UNREACHABLE_EPOCHS`] (`300`) TLAS epochs, shift-deleting
+/// them from `blas_table` and retiring AS + `dxr_normals` slices behind `tlas_build_epoch + 2 && sub_seq + 2`.
+fn sweep_unreachable_blases(state: &mut DxrState) -> usize {
+    let epoch = state.tlas_build_epoch;
+    if epoch <= BLAS_GC_UNREACHABLE_EPOCHS
+        || epoch.saturating_sub(state.last_gc_tlas_epoch) < BLAS_GC_SWEEP_INTERVAL_EPOCHS
+    {
+        return 0;
+    }
+    // Require a recent CPU-readable TLAS scan and no recent unreadable GPU-written TLAS so
+    // we never falsely evict a live BLAS referenced only by a GPU-written TLAS.
+    if state.last_readable_tlas_scan_epoch == 0
+        || epoch.saturating_sub(state.last_readable_tlas_scan_epoch) >= BLAS_GC_UNREACHABLE_EPOCHS
+        || (state.last_unreadable_tlas_epoch > 0
+            && epoch.saturating_sub(state.last_unreadable_tlas_epoch) <= BLAS_GC_UNREACHABLE_EPOCHS)
+    {
+        return 0;
+    }
+    state.last_gc_tlas_epoch = epoch;
+    let cutoff = epoch.saturating_sub(BLAS_GC_UNREACHABLE_EPOCHS);
+    let mut map = as_map().write().unwrap_or_else(|e| e.into_inner());
+    let dead_keys: Vec<u64> = map
+        .iter()
+        .filter_map(|(&k, e)| {
+            (e.kind == AsKind::Blas
+                && e.built
+                && e.last_seen_tlas_epoch.load(Ordering::Relaxed) < cutoff)
+                .then_some(k)
+        })
+        .collect();
+    let evicted = dead_keys.len();
+    for key in dead_keys {
+        if let Some(old) = map.remove(&key) {
+            state.remove_blas_hash(key);
+            state.retire_as(&old);
+        }
+    }
+    evicted
 }
 
 static AS_MAP: OnceLock<RwLock<HashMap<u64, HostAs>>> = OnceLock::new();
@@ -1873,14 +2580,29 @@ pub(crate) fn ensure_tlas_slot(guest_va: u64, min_bytes: u64) -> Option<(u64, ID
     } else {
         min_bytes.max(DEFAULT_TLAS_RESERVE)
     };
-    let (buffer, slice, gpu_va) = state.slabs.alloc(host, reserve)?;
+    let (buffer, slice, gpu_va) = state.slabs.alloc(host, SlabTier::TransientDynamicTlas, reserve)?;
+    let mirror_tlas = if mirror_tlas_enabled() && key != EMPTY_TLAS_KEY {
+        let m_reserve = min_bytes.max(DEFAULT_MIRROR_TLAS_RESERVE);
+        state
+            .slabs
+            .alloc(host, SlabTier::TransientDynamicTlas, m_reserve)
+            .map(|(mbuf, mslice, mgpu)| MirrorTlas {
+                buffer: mbuf,
+                slice: mslice,
+                gpu_va: mgpu,
+            })
+    } else {
+        None
+    };
     let generation = state.bump_gen();
+    let cur_epoch = state.tlas_build_epoch;
     if let Some(old) = map.insert(
         key,
         HostAs {
             buffer: buffer.clone(),
             slice,
             gpu_va,
+            mirror_tlas,
             kind: AsKind::Tlas,
             flags: 0,
             num_instances: 0,
@@ -1889,6 +2611,9 @@ pub(crate) fn ensure_tlas_slot(guest_va: u64, min_bytes: u64) -> Option<(u64, ID
             topo_hash: 0,
             update_scratch_bytes: 0,
             consecutive_refits: 0,
+            compacted_size: 0,
+            last_seen_tlas_epoch: AtomicU64::new(cur_epoch),
+            geom_va_hash: 0,
             normals_geom_off: 0,
             normals_geom_len: 0,
             normals_data_off: 0,
@@ -1901,6 +2626,58 @@ pub(crate) fn ensure_tlas_slot(guest_va: u64, min_bytes: u64) -> Option<(u64, ID
         state.pending_empty_tlas.push(key);
     }
     Some((gpu_va, buffer))
+}
+
+/// Resolves the primary host TLAS GPU virtual address for `guest_tlas_va`
+/// (allocating a pre-bound empty TLAS slot on demand if not yet present).
+pub(crate) fn resolve_tlas_va(guest_tlas_va: u64) -> Option<u64> {
+    if !enabled() {
+        return None;
+    }
+    let key = if guest_tlas_va == 0 {
+        EMPTY_TLAS_KEY
+    } else {
+        guest_tlas_va & !0xFF
+    };
+    {
+        let map = as_map().read().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = map.get(&key)
+            && entry.kind == AsKind::Tlas
+        {
+            return Some(entry.gpu_va);
+        }
+    }
+    let reserve = if key == EMPTY_TLAS_KEY { 4096 } else { DEFAULT_TLAS_RESERVE };
+    ensure_tlas_slot(key, reserve).map(|(va, _)| va)
+}
+
+/// Resolves the cull-enabled mirror TLAS host GPU virtual address for `guest_tlas_va`
+/// (`ARCH-13`), falling back to [`resolve_tlas_va`] when mirror TLASes are disabled or
+/// unavailable (e.g. `EMPTY_TLAS_KEY`), so `HostHeap` twin slots always bind a valid TLAS SRV.
+#[allow(dead_code)]
+pub(crate) fn resolve_mirror_tlas_va(guest_tlas_va: u64) -> Option<u64> {
+    if !enabled() {
+        return None;
+    }
+    if !mirror_tlas_enabled() || guest_tlas_va == 0 {
+        return resolve_tlas_va(guest_tlas_va);
+    }
+    let key = guest_tlas_va & !0xFF;
+    {
+        let map = as_map().read().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = map.get(&key)
+            && entry.kind == AsKind::Tlas
+        {
+            return Some(entry.mirror_tlas.as_ref().map_or(entry.gpu_va, |m| m.gpu_va));
+        }
+    }
+    let (primary_va, _) = ensure_tlas_slot(key, DEFAULT_TLAS_RESERVE)?;
+    let map = as_map().read().unwrap_or_else(|e| e.into_inner());
+    Some(
+        map.get(&key)
+            .and_then(|e| e.mirror_tlas.as_ref().map(|m| m.gpu_va))
+            .unwrap_or(primary_va),
+    )
 }
 
 /// Lock-free cached GPU VA of the 64 MiB `SLOT_DXR_NORMALS` lookup buffer.
@@ -1982,6 +2759,7 @@ fn has_pending_work() -> bool {
         .as_ref()
         .is_some_and(|s| {
             !s.pending_empty_tlas.is_empty()
+                || !s.pending_readback_requeue.is_empty()
                 || !s.pending_static_upgrades.is_empty()
                 || !s.pending_compactions.is_empty()
         })
@@ -2008,7 +2786,7 @@ const PATCH_ENABLE_STATS: u32 = 0;
 /// to avoid per-thread PCIe atomics against the mapped shared buffer. When `enable_stats == 0`
 /// (release builds), all groupshared barriers and PCIe atomics are skipped.
 const PATCH_INSTANCES_HLSL: &str = r#"
-#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1), UAV(u2)"
+#define RS "RootConstants(num32BitConstants=7, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1), UAV(u2)"
 cbuffer Params : register(b0) {
     uint num_instances;
     uint src_offset;
@@ -2016,6 +2794,7 @@ cbuffer Params : register(b0) {
     uint cull_mask_cfg;
     uint enable_stats;
     uint tlas_inst_base;
+    uint mirror_offset;
 };
 ByteAddressBuffer guest_inst : register(t0);
 ByteAddressBuffer blas_table : register(t1);
@@ -2127,6 +2906,17 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         host_inst.Store4(dst + 16u, r1);
         host_inst.Store4(dst + 32u, r2);
         host_inst.Store4(dst + 48u, r3);
+        if (mirror_offset != 0u) {
+            uint mdst = mirror_offset + dst;
+            uint4 r3_m = r3;
+            // Clear bit 0 (TRIANGLE_CULL_DISABLE = 0x1) while preserving bit 1
+            // (TRIANGLE_FRONT_COUNTERCLOCKWISE = 0x2) and all other flags/masks.
+            r3_m.y &= ~0x01000000u;
+            host_inst.Store4(mdst + 0u, r0);
+            host_inst.Store4(mdst + 16u, r1);
+            host_inst.Store4(mdst + 32u, r2);
+            host_inst.Store4(mdst + 48u, r3_m);
+        }
         if (tlas_inst_base != 0u && i < 16384u) {
             dxr_normals.Store((tlas_inst_base + i) * 4u, found ? geom_off : 0u);
         }
@@ -2482,9 +3272,12 @@ fn build_normals_pass(host: &Host) -> Option<&'static ComputePass> {
 
 fn prebuild_flags(kind: u32, raw_flags: u32, refit_enabled: bool) -> u32 {
     const ALLOW_UPDATE: u32 = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE.0 as u32;
+    const ALLOW_COMPACTION: u32 =
+        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_COMPACTION.0 as u32;
     const PERFORM_UPDATE: u32 = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE.0 as u32;
     let mut flags = raw_flags & !PERFORM_UPDATE;
-    if kind == 1 && refit_enabled {
+    let compaction_only = (raw_flags & ALLOW_COMPACTION) != 0 && (raw_flags & ALLOW_UPDATE) == 0;
+    if kind == 1 && refit_enabled && !compaction_only {
         flags |= ALLOW_UPDATE;
     }
     flags
@@ -2919,7 +3712,12 @@ pub(crate) fn prepare_list_op(list: &HostList, op: &DxrOp) {
                             let stride = vertex_buffer_stride.max(12);
                             let len = u64::from(vertex_count).saturating_mul(stride);
                             if let Some(s) = crate::shadow::find(vertex_buffer_va, len) {
-                                s.refresh(list, vertex_buffer_va, len);
+                                // Skip CPU refresh on GPU-written dynamic BLAS vertex buffers (skinning/cloth output, `CPU-19`).
+                                if s.written() || s.gpu_only_skip() {
+                                    list.keep_shadow(s);
+                                } else {
+                                    s.refresh(list, vertex_buffer_va, len);
+                                }
                             }
                         }
                         if index_buffer != 0 && index_count > 0 {
@@ -2930,7 +3728,11 @@ pub(crate) fn prepare_list_op(list: &HostList, op: &DxrOp) {
                             };
                             let len = u64::from(index_count).saturating_mul(elem);
                             if let Some(s) = crate::shadow::find(index_buffer, len) {
-                                s.refresh(list, index_buffer, len);
+                                if s.written() || s.gpu_only_skip() {
+                                    list.keep_shadow(s);
+                                } else {
+                                    s.refresh(list, index_buffer, len);
+                                }
                             }
                         }
                         if transform3x4 != 0
@@ -3022,9 +3824,21 @@ pub(crate) fn record_submission(
 
     let mut state_guard = lock_state();
     let state = state_guard.as_mut()?;
+    let use_compute = host.dxr_async_compute();
     let mut sub = state.take_submission();
-    let mut new_lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(lists.len() + runs.len() + 2);
-    let mut new_firsts: Vec<usize> = Vec::with_capacity(firsts.len());
+    sub.async_batches.clear();
+    sub.dxr_fence_val = 0;
+    sub.ran_on_compute = use_compute;
+    let mut new_lists: Vec<Option<ID3D12CommandList>> = if use_compute {
+        Vec::new()
+    } else {
+        Vec::with_capacity(lists.len() + runs.len() + 2)
+    };
+    let mut new_firsts: Vec<usize> = if use_compute {
+        Vec::new()
+    } else {
+        Vec::with_capacity(firsts.len())
+    };
 
     // Clone queued ops once per run so we don't duplicate allocations between
     // readback pre-sizing and command recording.
@@ -3036,9 +3850,19 @@ pub(crate) fn record_submission(
         Vec::new()
     };
 
-    // Pre-size this submission's node readback buffer upfront (capped at 8 MiB) so
-    // `record_extract_static_blas` never reallocates the readback buffer mid-submission.
+    // Pre-size this submission's node readback buffer upfront (capped at MAX_READBACK_BYTES_PER_SUB)
+    // including any overflowed Frame-0 static BLASes queued in `pending_readback_requeue`.
     let mut need_readback = 0u64;
+    for &(key, size_bytes, _) in &state.pending_readback_requeue {
+        if let Some((_, max_nodes)) = probe_bvh_bounds(key, size_bytes) {
+            let dump = (16u64 + max_nodes.saturating_mul(64)).next_multiple_of(64);
+            if need_readback.saturating_add(dump) <= MAX_READBACK_BYTES_PER_SUB {
+                need_readback = need_readback.saturating_add(dump);
+            } else {
+                break;
+            }
+        }
+    }
     for ops in &run_ops {
         for op in ops {
             if let DxrOp::ExtractStaticBlas { dest_va, size_bytes } = *op {
@@ -3061,50 +3885,135 @@ pub(crate) fn record_submission(
     // a later list in the same submission also rebuilds it).
     let pending_init = std::mem::take(&mut state.pending_empty_tlas);
     let mut built_tlas = false;
+    let mut had_static_activity = false;
 
     for (i, run) in runs.iter().enumerate() {
         let old_start = firsts[i];
         let old_end = firsts.get(i + 1).copied().unwrap_or(lists.len());
-        new_firsts.push(new_lists.len());
-
-        if i == 0
-            && !pending_init.is_empty()
-            && let Some(init_list) = record_empty_tlas_init(host, &device5, state, &mut sub, &pending_init)
-        {
-            new_lists.push(Some(init_list));
+        if !use_compute {
+            new_firsts.push(new_lists.len());
         }
 
-        if i == 0
-            && !state.pending_static_upgrades.is_empty()
-            && let Some(upg_list) = record_static_upgrades(host, &device5, state, &mut sub)
-        {
-            new_lists.push(Some(upg_list));
-        }
+        if i == 0 {
+            if !pending_init.is_empty()
+                && let Some(init_list) =
+                    record_empty_tlas_init(host, &device5, state, &mut sub, &pending_init, use_compute)
+            {
+                if use_compute {
+                    sub.async_batches.push(DxrAsyncBatch {
+                        after_run: None,
+                        lists: vec![Some(init_list)],
+                        blocks_direct_shaders: true,
+                        wrote_guest_postbuild: false,
+                    });
+                } else {
+                    new_lists.push(Some(init_list));
+                }
+            }
 
-        if i == 0
-            && !state.pending_compactions.is_empty()
-            && let Some(cmp_list) = record_static_compactions(host, state, &mut sub)
-        {
-            new_lists.push(Some(cmp_list));
+            let mut bg_lists: Vec<Option<ID3D12CommandList>> = Vec::new();
+            let mut bg_inited_normals = false;
+
+            if !state.pending_readback_requeue.is_empty()
+                && let Some(rb_list) = record_requeued_readbacks(host, state, &mut sub, run, use_compute)
+            {
+                had_static_activity = true;
+                if use_compute {
+                    bg_lists.push(Some(rb_list));
+                } else {
+                    new_lists.push(Some(rb_list));
+                }
+            }
+
+            let normals_was_uninit = state.normals_init_needed;
+            if !state.pending_static_upgrades.is_empty()
+                && let Some(upg_list) =
+                    record_static_upgrades(host, &device5, state, &mut sub, use_compute)
+            {
+                had_static_activity = true;
+                if normals_was_uninit && !state.normals_init_needed {
+                    bg_inited_normals = true;
+                }
+                if use_compute {
+                    bg_lists.push(Some(upg_list));
+                } else {
+                    new_lists.push(Some(upg_list));
+                }
+            }
+
+            if !state.pending_compactions.is_empty()
+                && let Some(cmp_list) = record_static_compactions(host, state, &mut sub, use_compute)
+            {
+                had_static_activity = true;
+                if use_compute {
+                    bg_lists.push(Some(cmp_list));
+                } else {
+                    new_lists.push(Some(cmp_list));
+                }
+            }
+
+            if !bg_lists.is_empty() {
+                sub.async_batches.push(DxrAsyncBatch {
+                    after_run: None,
+                    lists: bg_lists,
+                    blocks_direct_shaders: bg_inited_normals,
+                    wrote_guest_postbuild: false,
+                });
+            }
         }
 
         let ops = run_ops.get(i).map(Vec::as_slice).unwrap_or(&[]);
         if ops.is_empty() || old_start >= old_end {
-            new_lists.extend(lists[old_start..old_end].iter().cloned());
+            if !use_compute {
+                new_lists.extend(lists[old_start..old_end].iter().cloned());
+            }
             continue;
+        }
+        if ops.iter().any(|op| matches!(op, DxrOp::ExtractStaticBlas { .. })) {
+            had_static_activity = true;
         }
 
         // Run all DXR ops after `run.list` so skinning, buffer copies, and
         // `XboxBvhBuilder.dll` rehydration dispatches in `run.list` have
         // completed before host DXR reads vertex/index/instance/BVH4 buffers.
-        new_lists.extend(lists[old_start..old_end].iter().cloned());
-        if let Some(cmd) = record_ops(host, &device5, state, &mut sub, run, ops, &mut built_tlas) {
-            new_lists.push(Some(cmd));
+        if !use_compute {
+            new_lists.extend(lists[old_start..old_end].iter().cloned());
+        }
+        let normals_was_uninit = state.normals_init_needed;
+        if let Some(cmd) =
+            record_ops(host, &device5, state, &mut sub, run, ops, &mut built_tlas, use_compute)
+        {
+            if use_compute {
+                let inited_normals = normals_was_uninit && !state.normals_init_needed;
+                let blocks_direct_shaders = inited_normals
+                    || ops.iter().any(|op| {
+                        matches!(
+                            op,
+                            DxrOp::BuildBlas { .. } | DxrOp::BuildTlas { .. } | DxrOp::CopyAs { .. }
+                        )
+                    });
+                let wrote_guest_postbuild = ops.iter().any(|op| match op {
+                    DxrOp::BuildBlas { postbuild, .. } | DxrOp::BuildTlas { postbuild, .. } => {
+                        !postbuild.is_empty()
+                    }
+                    DxrOp::CopyAs { .. } | DxrOp::ExtractStaticBlas { .. } => false,
+                });
+                sub.async_batches.push(DxrAsyncBatch {
+                    after_run: Some(i),
+                    lists: vec![Some(cmd)],
+                    blocks_direct_shaders,
+                    wrote_guest_postbuild,
+                });
+            } else {
+                new_lists.push(Some(cmd));
+            }
         }
     }
 
     if sub.lists.is_empty() {
+        sub.async_batches.clear();
         sub.readbacks.clear();
+        sub.extracted_bvh4s.clear();
         sub.readback_used = 0;
         sub.readback_cap = 0;
         sub.compact_queries.clear();
@@ -3112,6 +4021,7 @@ pub(crate) fn record_submission(
         sub.kept_shadows.clear();
         sub.sub_seq = 0;
         sub.tlas_epoch = 0;
+        sub.dxr_fence_val = 0;
         #[cfg(feature = "diagnostics")]
         {
             sub.timing_spans.clear();
@@ -3124,12 +4034,196 @@ pub(crate) fn record_submission(
     }
 
     state.sub_seq = state.sub_seq.saturating_add(1);
+    CURRENT_SUB_SEQ.store(state.sub_seq, Ordering::Relaxed);
+    if had_static_activity
+        || !state.pending_static_upgrades.is_empty()
+        || !state.pending_compactions.is_empty()
+        || !state.pending_readback_requeue.is_empty()
+    {
+        note_static_streaming(state.sub_seq);
+    }
     sub.sub_seq = state.sub_seq;
     sub.tlas_epoch = if built_tlas { state.tlas_build_epoch } else { 0 };
 
-    *lists = new_lists;
-    *firsts = new_firsts;
+    if !use_compute {
+        *lists = new_lists;
+        *firsts = new_firsts;
+    }
     Some(sub)
+}
+
+/// Drains Frame-0 static BLASes whose node readback overflowed an earlier burst
+/// submission (`pending_readback_requeue`) so 100% of static BLASes upgrade & compact (`ARCH-10`).
+fn record_requeued_readbacks(
+    host: &Host,
+    state: &mut DxrState,
+    sub: &mut DxrSubmission,
+    owner: &HostList,
+    use_compute: bool,
+) -> Option<ID3D12CommandList> {
+    let pass = extract_bvh4_pass(host)?;
+    let mem_binding = crate::descriptor::with_view_heap(|heap| {
+        let ready = crate::memory::ready(owner, heap, &[], &[], &[], crate::memory::Use::Reads, None)?;
+        Some((heap.heap.clone(), heap.gpu_handle(ready.base), ready.directory))
+    })
+    .flatten()?;
+    let (view_heap, mem_table_gpu, directory_gpu) = mem_binding;
+
+    struct RequeueJob {
+        key: u64,
+        size_bytes: u64,
+        max_nodes: u64,
+        generation: u64,
+        dump_bytes: u64,
+    }
+    let mut jobs: Vec<RequeueJob> = Vec::new();
+    let mut planned_rb = sub.readback_used;
+    let mut max_vert_bytes = 0u64;
+    let mut max_dump_bytes = 0u64;
+    {
+        let map = as_map().read().unwrap_or_else(|e| e.into_inner());
+        while let Some(&(key, size_bytes, generation)) = state.pending_readback_requeue.front() {
+            let still_live = map
+                .get(&key)
+                .is_some_and(|e| e.kind == AsKind::Blas && e.generation == generation);
+            if !still_live {
+                state.pending_readback_requeue.pop_front();
+                continue;
+            }
+            let Some((bounds_bytes, max_nodes)) = probe_bvh_bounds(key, size_bytes) else {
+                state.pending_readback_requeue.pop_front();
+                continue;
+            };
+            let dump_bytes = 16u64 + max_nodes.saturating_mul(64);
+            let next_rb = planned_rb.saturating_add(dump_bytes).next_multiple_of(64);
+            if next_rb > sub.readback_cap {
+                if dump_bytes > MAX_READBACK_BYTES_PER_SUB {
+                    // Single dump larger than cap can never fit; release its memory pages and drop.
+                    state.pending_readback_requeue.pop_front();
+                    sub.extracted_bvh4s.push((key, bounds_bytes));
+                    continue;
+                }
+                break;
+            }
+            state.pending_readback_requeue.pop_front();
+            planned_rb = next_rb;
+            max_vert_bytes = max_vert_bytes.max(max_nodes.saturating_mul(72));
+            max_dump_bytes = max_dump_bytes.max(dump_bytes);
+            jobs.push(RequeueJob {
+                key,
+                size_bytes: bounds_bytes,
+                max_nodes,
+                generation,
+                dump_bytes,
+            });
+        }
+    }
+    if jobs.is_empty() {
+        return None;
+    }
+    let (rb_buf, _) = sub.node_readback.as_ref().map(|(b, sz, _)| (b.clone(), *sz))?;
+    let (_, vert_gpu) = sub.ensure_extract_verts(host, max_vert_bytes)?;
+    let (staging_buf, staging_gpu) = sub.ensure_node_staging(host, max_dump_bytes)?;
+    let (allocator, list) = state.take_list(host, use_compute)?;
+    name(&list, || "victory dxr requeued readback".into());
+    let list7 = dxr_list7(host, &list);
+
+    let rb_start = sub.readbacks.len();
+    let rb_used_start = sub.readback_used;
+    let ext_start = sub.extracted_bvh4s.len();
+
+    // SAFETY: idle allocator/list; view_heap, directory, vert_gpu, staging_buf, and rb_buf live.
+    let recorded: windows::core::Result<()> = unsafe {
+        (|| {
+            allocator.Reset()?;
+            list.Reset(&allocator, None)?;
+            list.SetDescriptorHeaps(&[Some(view_heap)]);
+            list.SetComputeRootSignature(&pass.root);
+            list.SetPipelineState(&pass.pso);
+            list.SetComputeRootShaderResourceView(1, directory_gpu);
+            list.SetComputeRootUnorderedAccessView(2, vert_gpu);
+            list.SetComputeRootUnorderedAccessView(3, staging_gpu);
+            list.SetComputeRootDescriptorTable(4, mem_table_gpu);
+            let mut staging_in_copy_src = false;
+            for job in &jobs {
+                if staging_in_copy_src {
+                    emit_dxr_buffer_barrier(
+                        &list,
+                        list7.as_ref(),
+                        &staging_buf,
+                        D3D12_BARRIER_SYNC_COPY,
+                        D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+                        D3D12_BARRIER_ACCESS_COPY_SOURCE,
+                        D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        use_compute,
+                    );
+                } else {
+                    emit_dxr_buffer_legacy_only(
+                        &list,
+                        list7.as_ref(),
+                        &staging_buf,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    );
+                }
+                let constants = [
+                    job.key as u32,
+                    (job.key >> 32) as u32,
+                    job.max_nodes as u32,
+                    job.size_bytes.min(u64::from(u32::MAX)) as u32,
+                    job.max_nodes as u32,
+                ];
+                list.SetComputeRoot32BitConstants(0, 5, constants.as_ptr().cast(), 0);
+                list.Dispatch((job.max_nodes as u32).div_ceil(64), 1, 1);
+                emit_dxr_buffer_barrier(
+                    &list,
+                    list7.as_ref(),
+                    &staging_buf,
+                    D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+                    D3D12_BARRIER_SYNC_COPY,
+                    D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+                    D3D12_BARRIER_ACCESS_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    use_compute,
+                );
+                let rb_off = sub.readback_used;
+                sub.readback_used = rb_off.saturating_add(job.dump_bytes).next_multiple_of(64);
+                list.CopyBufferRegion(&rb_buf, rb_off, &staging_buf, 0, job.dump_bytes);
+                staging_in_copy_src = true;
+                sub.readbacks.push(StaticReadbackRecord {
+                    guest_key: job.key,
+                    generation: job.generation,
+                    offset: rb_off,
+                    len: job.dump_bytes,
+                });
+                sub.extracted_bvh4s.push((job.key, job.size_bytes));
+            }
+            if staging_in_copy_src {
+                emit_dxr_buffer_legacy_only(
+                    &list,
+                    list7.as_ref(),
+                    &staging_buf,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_COMMON,
+                );
+            }
+            list.Close()
+        })()
+    };
+    if let Err(e) = recorded {
+        tracing::warn!(error = %e, "dxr: requeued static readback list failed");
+        sub.readbacks.truncate(rb_start);
+        sub.readback_used = rb_used_start;
+        sub.extracted_bvh4s.truncate(ext_start);
+        state.return_list((allocator, list), use_compute);
+        return None;
+    }
+    let out: ID3D12CommandList = list.cast().ok()?;
+    sub.lists.push((allocator, list));
+    Some(out)
 }
 
 struct DecodeJob {
@@ -3137,16 +4231,67 @@ struct DecodeJob {
     bytes: Vec<u8>,
 }
 
-/// Returns the bounded single-worker channel that decodes static BVH4 readbacks off
-/// `victory-relay` / `victory-submit` without blocking GPU completion.
-fn decode_worker() -> &'static std::sync::mpsc::SyncSender<DecodeJob> {
-    static TX: OnceLock<std::sync::mpsc::SyncSender<DecodeJob>> = OnceLock::new();
-    TX.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::sync_channel::<DecodeJob>(MAX_DECODE_QUEUE);
+/// Non-blocking decode queue + bounded overflow re-queue ring so Frame-0 static BLAS
+/// bursts never drop upgrades on `try_send` or `MAX_PENDING_UPGRADES` (`ARCH-10`).
+struct DecodePipeline {
+    jobs: Mutex<VecDeque<DecodeJob>>,
+    wake: Condvar,
+}
+
+fn decode_pipeline() -> &'static DecodePipeline {
+    static PIPE: OnceLock<DecodePipeline> = OnceLock::new();
+    PIPE.get_or_init(|| {
         let _ = std::thread::Builder::new()
             .name("victory-dxr-decode".into())
-            .spawn(move || {
-                while let Ok(job) = rx.recv() {
+            .spawn(|| {
+                let pipe = decode_pipeline();
+                let mut overflow: VecDeque<PendingStaticUpgrade> = VecDeque::new();
+                loop {
+                    // First flush any previously overflowed decoded upgrades whenever
+                    // `pending_static_upgrades` has room.
+                    if !overflow.is_empty() {
+                        let mut guard = DXR_STATE.lock().unwrap_or_else(|e| e.into_inner());
+                        if let Some(state) = guard.as_mut() {
+                            while state.pending_static_upgrades.len() < MAX_PENDING_UPGRADES {
+                                let Some(upg) = overflow.pop_front() else {
+                                    break;
+                                };
+                                state.pending_static_upgrades.push_back(upg);
+                            }
+                        }
+                    }
+
+                    let job = {
+                        let mut q = pipe.jobs.lock().unwrap_or_else(|e| e.into_inner());
+                        loop {
+                            // If overflow ring is near full, wait briefly for submit thread to drain
+                            // `pending_static_upgrades` before decoding more jobs.
+                            if overflow.len() >= MAX_OVERFLOW_UPGRADES {
+                                let (g, _) = pipe
+                                    .wake
+                                    .wait_timeout(q, std::time::Duration::from_millis(8))
+                                    .unwrap_or_else(|e| e.into_inner());
+                                q = g;
+                                break None;
+                            }
+                            if let Some(job) = q.pop_front() {
+                                break Some(job);
+                            }
+                            if !overflow.is_empty() {
+                                let (g, _) = pipe
+                                    .wake
+                                    .wait_timeout(q, std::time::Duration::from_millis(8))
+                                    .unwrap_or_else(|e| e.into_inner());
+                                q = g;
+                                break None;
+                            }
+                            q = pipe.wake.wait(q).unwrap_or_else(|e| e.into_inner());
+                        }
+                    };
+                    let Some(job) = job else {
+                        continue;
+                    };
+
                     let live: Vec<StaticReadbackRecord> = {
                         let map = as_map().read().unwrap_or_else(|e| e.into_inner());
                         job.readbacks
@@ -3176,25 +4321,56 @@ fn decode_worker() -> &'static std::sync::mpsc::SyncSender<DecodeJob> {
                             for upg in decoded {
                                 if state.pending_static_upgrades.len() < MAX_PENDING_UPGRADES {
                                     state.pending_static_upgrades.push_back(upg);
+                                } else if overflow.len() < MAX_OVERFLOW_UPGRADES {
+                                    overflow.push_back(upg);
                                 }
                             }
                         }
                     }
                 }
             });
-        tx
+        DecodePipeline {
+            jobs: Mutex::new(VecDeque::new()),
+            wake: Condvar::new(),
+        }
     })
+}
+
+fn enqueue_decode_job(job: DecodeJob) {
+    let pipe = decode_pipeline();
+    let mut q = pipe.jobs.lock().unwrap_or_else(|e| e.into_inner());
+    if q.len() < MAX_DECODE_QUEUE_JOBS {
+        q.push_back(job);
+        pipe.wake.notify_one();
+    }
+}
+
+fn wake_decode_worker() {
+    let pipe = decode_pipeline();
+    pipe.wake.notify_one();
 }
 
 /// Returns pooled DXR command allocators and scratch resources once the
 /// submission's GPU fence has completed, reclaims eligible retired AS slab slices,
+/// releases extracted ephemeral `memory.rs` arena pages, trims idle staging buffers,
 /// and offloads any completed static BVH4 node readbacks to the background decoder.
 pub(crate) fn finish_submission(mut sub: DxrSubmission) {
+    // Ensure async-compute DXR work (if any) has completed on `compute_queue` before
+    // reading back GPU timestamps, compaction sizes, node dumps, or recycling lists/slices.
+    let dxr_fence_val = sub.dxr_fence_val;
+    let ran_on_compute = sub.ran_on_compute;
+    sub.dxr_fence_val = 0;
+    sub.async_batches.clear();
+    if dxr_fence_val > 0
+        && let Some(h) = host()
+    {
+        h.wait_dxr_fence_cpu(dxr_fence_val);
+    }
     #[cfg(feature = "diagnostics")]
     sub.report_timing();
-    sub.kept.clear();
     sub.kept_shadows.clear();
     let readbacks = std::mem::take(&mut sub.readbacks);
+    let extracted_bvh4s = std::mem::take(&mut sub.extracted_bvh4s);
     let readback_used = sub.readback_used;
     sub.readback_used = 0;
     sub.readback_cap = 0;
@@ -3206,7 +4382,7 @@ pub(crate) fn finish_submission(mut sub: DxrSubmission) {
 
     let mut new_compactions: Vec<(u64, u64, u64)> = Vec::new();
     if !compact_queries.is_empty()
-        && let Some((rb_buf, rb_size)) = sub.compact_info_rb.as_ref()
+        && let Some((rb_buf, rb_size, _)) = sub.compact_info_rb.as_ref()
     {
         let max_slots = compact_queries
             .iter()
@@ -3239,20 +4415,24 @@ pub(crate) fn finish_submission(mut sub: DxrSubmission) {
 
                 const ALLOW_COMPACTION: u32 =
                     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_COMPACTION.0 as u32;
-                let map = as_map().read().unwrap_or_else(|e| e.into_inner());
+                let mut map = as_map().write().unwrap_or_else(|e| e.into_inner());
                 for (q, compacted_size) in compact_queries.into_iter().zip(sizes) {
-                    if !should_compact(q.uncompacted_size, compacted_size) {
+                    if compacted_size == 0 {
                         continue;
                     }
-                    let live = map.get(&q.guest_key).is_some_and(|e| {
-                        e.kind == AsKind::Blas
-                            && e.built
-                            && e.generation == q.generation
-                            && (e.flags & ALLOW_COMPACTION) != 0
+                    if let Some(e) = map.get_mut(&q.guest_key)
+                        && e.kind == AsKind::Blas
+                        && e.built
+                        && e.generation == q.generation
+                        && (e.flags & ALLOW_COMPACTION) != 0
+                    {
+                        e.compacted_size = compacted_size;
+                        if q.auto_compact
+                            && should_compact(q.uncompacted_size, compacted_size)
                             && should_compact(e.slice.size, compacted_size)
-                    });
-                    if live {
-                        new_compactions.push((q.guest_key, q.generation, compacted_size));
+                        {
+                            new_compactions.push((q.guest_key, q.generation, compacted_size));
+                        }
                     }
                 }
             }
@@ -3260,7 +4440,7 @@ pub(crate) fn finish_submission(mut sub: DxrSubmission) {
     }
 
     if !readbacks.is_empty()
-        && let Some((rb_buf, rb_size)) = sub.node_readback.as_ref()
+        && let Some((rb_buf, rb_size, _)) = sub.node_readback.as_ref()
     {
         let map_end = (readback_used.min(*rb_size)) as usize;
         if map_end >= 16 {
@@ -3274,74 +4454,57 @@ pub(crate) fn finish_submission(mut sub: DxrSubmission) {
                 let written_none = D3D12_RANGE { Begin: 0, End: 0 };
                 // SAFETY: matches successful `Map(0, ...)`.
                 unsafe { rb_buf.Unmap(0, Some(&written_none)) };
-                // Non-blocking enqueue so `victory-relay` never stalls if decode queue is saturated.
-                let _ = decode_worker().try_send(DecodeJob { readbacks, bytes });
+                enqueue_decode_job(DecodeJob { readbacks, bytes });
             }
         }
     }
 
-    // Release unusually large temporary buffers once the GPU fence is done so
-    // pooled submissions stay small in steady state.
-    if sub.scratch.as_ref().is_some_and(|(_, sz)| *sz > MAX_POOLED_SCRATCH_BYTES) {
-        sub.scratch = None;
-    }
-    if sub
-        .extract_verts
-        .as_ref()
-        .is_some_and(|(_, sz)| *sz > MAX_POOLED_EXTRACT_VERTS_BYTES)
-    {
-        sub.extract_verts = None;
-    }
-    if sub
-        .host_instances
-        .as_ref()
-        .is_some_and(|(_, sz)| *sz > MAX_POOLED_HOST_INSTANCES_BYTES)
-    {
-        sub.host_instances = None;
-    }
-    if sub.node_staging.as_ref().is_some_and(|(_, sz)| *sz > MAX_POOLED_AUX_BYTES) {
-        sub.node_staging = None;
-    }
-    if sub.node_readback.as_ref().is_some_and(|(_, sz)| *sz > MAX_POOLED_AUX_BYTES) {
-        sub.node_readback = None;
-    }
-    if sub.upgrade_upload.as_ref().is_some_and(|(_, _, sz)| *sz > MAX_POOLED_AUX_BYTES) {
-        sub.upgrade_upload = None;
-    }
-    if sub.upgrade_verts.as_ref().is_some_and(|(_, sz)| *sz > MAX_POOLED_AUX_BYTES) {
-        sub.upgrade_verts = None;
-    }
-    if sub.normals_upload.as_ref().is_some_and(|(_, _, sz)| *sz > MAX_POOLED_AUX_BYTES) {
-        sub.normals_upload = None;
+    // Release ephemeral `memory.rs` BVH4 rehydration arena pages once extraction + node
+    // readback has completed on the GPU (strictly gated on `VICTORY_NATIVE_RT=1 && VICTORY_BVH_BUILDER=0`).
+    for (dest_va, size_bytes) in extracted_bvh4s {
+        crate::memory::release_extracted(dest_va, size_bytes);
     }
 
+    // Drop oversized temporary buffers and static staging buffers idle for >= 60 submissions
+    // asynchronously on `victory-bury` so `victory-relay` never stalls on COM drops.
+    sub.trim_pooled(completed_sub_seq);
+
+    let completed_dxr_fence = host().map_or(u64::MAX, Host::dxr_fence_completed);
     let mut guard = DXR_STATE.lock().unwrap_or_else(|e| e.into_inner());
     let Some(state) = guard.as_mut() else {
         return;
     };
     state.completed_sub_seq = state.completed_sub_seq.max(completed_sub_seq);
     state.completed_tlas_epoch = state.completed_tlas_epoch.max(completed_tlas_epoch);
-    state
-        .slabs
-        .drain_retired(state.completed_tlas_epoch, state.completed_sub_seq);
-    state
-        .geom_pool
-        .drain_retired(state.completed_tlas_epoch, state.completed_sub_seq);
-    state
-        .data_pool
-        .drain_retired(state.completed_tlas_epoch, state.completed_sub_seq);
+    state.slabs.drain_retired(
+        state.completed_tlas_epoch,
+        state.completed_sub_seq,
+        completed_dxr_fence,
+    );
+    state.slabs.reclaim_empty_slabs();
+    state.geom_pool.drain_retired(
+        state.completed_tlas_epoch,
+        state.completed_sub_seq,
+        completed_dxr_fence,
+    );
+    state.data_pool.drain_retired(
+        state.completed_tlas_epoch,
+        state.completed_sub_seq,
+        completed_dxr_fence,
+    );
+    sweep_unreachable_blases(state);
     for item in new_compactions {
         if state.pending_compactions.len() < MAX_PENDING_COMPACTIONS {
             state.pending_compactions.push_back(item);
         }
     }
     for prelude in sub.lists.drain(..) {
-        if state.free_lists.len() < MAX_FREE_LISTS {
-            state.free_lists.push(prelude);
-        }
+        state.return_list(prelude, ran_on_compute);
     }
     if state.free_submissions.len() < MAX_FREE_SUBS {
         state.free_submissions.push(sub);
+    } else {
+        crate::host::retire_com_async(sub);
     }
 }
 
@@ -3352,6 +4515,7 @@ fn record_static_upgrades(
     device5: &ID3D12Device5,
     state: &mut DxrState,
     sub: &mut DxrSubmission,
+    use_compute: bool,
 ) -> Option<ID3D12CommandList> {
     let mut batch: Vec<(PendingStaticUpgrade, u64)> = Vec::new();
     let mut batch_bytes = 0u64;
@@ -3381,8 +4545,10 @@ fn record_static_upgrades(
         }
     }
     if batch.is_empty() || batch_bytes == 0 {
+        wake_decode_worker();
         return None;
     }
+    wake_decode_worker();
 
     let (upload_buf, upload_ptr) = sub.ensure_upgrade_upload(host, batch_bytes)?;
     let (verts_buf, verts_gpu) = sub.ensure_upgrade_verts(host, batch_bytes)?;
@@ -3399,20 +4565,18 @@ fn record_static_upgrades(
     let mut prepared = Vec::with_capacity(batch.len());
     let mut max_scratch = AS_ALIGN;
     let mut sum_scratch = 0u64;
-    for (upg, batch_off) in &batch {
+    for (upg, batch_off) in batch {
         let byte_len = upg.vertices.len() * 12;
         // SAFETY: `upload_ptr` is mapped for at least `batch_bytes >= batch_off + byte_len`.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 upg.vertices.as_ptr().cast::<u8>(),
-                upload_ptr.add(*batch_off as usize),
+                upload_ptr.add(batch_off as usize),
                 byte_len,
             );
         }
-        let base_gpu = verts_gpu + *batch_off;
+        let base_gpu = verts_gpu + batch_off;
         let mut host_geoms = Vec::with_capacity(upg.geometries.len());
-        let mut geom_tri_counts = Vec::with_capacity(upg.geometries.len());
-        let mut total_tris = 0u32;
         for g in &upg.geometries {
             let flags = static_geom_flags(g.opaque);
             let (start_addr, stride) = if g.vert_count > 0 {
@@ -3420,9 +4584,6 @@ fn record_static_upgrades(
             } else {
                 (0, 0)
             };
-            let g_tris = g.vert_count / 3;
-            geom_tri_counts.push((g.vert_offset as usize, g_tris));
-            total_tris = total_tris.saturating_add(g_tris);
             host_geoms.push(D3D12_RAYTRACING_GEOMETRY_DESC {
                 Type: D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES,
                 Flags: flags,
@@ -3457,40 +4618,17 @@ fn record_static_upgrades(
         if pre.ResultDataMaxSizeInBytes == 0 {
             continue;
         }
-        let mut geom_table = Vec::with_capacity(geom_tri_counts.len());
-        let mut normals_data = Vec::with_capacity(total_tris as usize);
-        let mut tri_cursor = 0u32;
-        for (v_off, g_tris) in geom_tri_counts {
-            geom_table.push(if g_tris > 0 { tri_cursor } else { u32::MAX });
-            for t in 0..(g_tris as usize) {
-                let b = v_off + t * 3;
-                let packed = if b + 2 < upg.vertices.len() {
-                    let v0 = upg.vertices[b];
-                    let v1 = upg.vertices[b + 1];
-                    let v2 = upg.vertices[b + 2];
-                    let e1 = [v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]];
-                    let e2 = [v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]];
-                    let nx = e1[1] * e2[2] - e1[2] * e2[1];
-                    let ny = e1[2] * e2[0] - e1[0] * e2[2];
-                    let nz = e1[0] * e2[1] - e1[1] * e2[0];
-                    victory_shader::emit::pack_oct_normal_u32(nx, ny, nz)
-                } else {
-                    victory_shader::emit::DXR_NORMALS_FALLBACK
-                };
-                normals_data.push(packed);
-            }
-            tri_cursor = tri_cursor.saturating_add(g_tris);
-        }
         let scratch_bytes = pre.ScratchDataSizeInBytes.max(AS_ALIGN).next_multiple_of(AS_ALIGN);
         max_scratch = max_scratch.max(scratch_bytes);
         sum_scratch = sum_scratch.saturating_add(scratch_bytes);
+        // Reuse pre-packed octahedral normals computed off-thread on `victory-dxr-decode` (`ARCH-14`).
         prepared.push(PreparedUpgrade {
             guest_key: upg.guest_key,
             host_geoms,
             result_bytes: pre.ResultDataMaxSizeInBytes,
             scratch_bytes,
-            geom_table,
-            normals_data,
+            geom_table: upg.geom_table,
+            normals_data: upg.normals_data,
         });
     }
     if prepared.is_empty() {
@@ -3510,12 +4648,15 @@ fn record_static_upgrades(
         normals_upload_words.push(victory_shader::emit::DXR_NORMALS_FALLBACK);
     }
     {
+        let cur_epoch = state.tlas_build_epoch;
         let mut map = as_map().write().unwrap_or_else(|e| e.into_inner());
         for (idx, item) in prepared.iter().enumerate() {
-            // Allocate a fresh slab slice so any already-built TLAS tracing the
+            // Allocate a fresh transient slab slice so any already-built TLAS tracing the
             // previous frame-0 1-geometry BLAS never sees an in-place overwrite
             // before the next `BuildTlas` switches instances to the upgraded VA.
-            let Some((buffer, slice, gpu_va)) = state.slabs.alloc(host, item.result_bytes) else {
+            let Some((buffer, slice, gpu_va)) =
+                state.slabs.alloc(host, SlabTier::TransientDynamicTlas, item.result_bytes)
+            else {
                 continue;
             };
             let (ng_off, ng_len, nd_off, nd_len) = if normals_gpu_buf.is_some()
@@ -3547,6 +4688,7 @@ fn record_static_upgrades(
                 buffer,
                 slice,
                 gpu_va,
+                mirror_tlas: None,
                 kind: AsKind::Blas,
                 flags: build_flags.0 as u32,
                 num_instances: 0,
@@ -3555,6 +4697,9 @@ fn record_static_upgrades(
                 topo_hash: 0,
                 update_scratch_bytes: 0,
                 consecutive_refits: 0,
+                compacted_size: 0,
+                last_seen_tlas_epoch: AtomicU64::new(cur_epoch),
+                geom_va_hash: 0,
                 normals_geom_off: ng_off,
                 normals_geom_len: ng_len,
                 normals_data_off: nd_off,
@@ -3597,7 +4742,7 @@ fn record_static_upgrades(
     } else {
         None
     };
-    let (allocator, list) = state.take_list(host)?;
+    let (allocator, list) = state.take_list(host, use_compute)?;
     name(&list, || "victory dxr static upgrade".into());
     let list4: ID3D12GraphicsCommandList4 = list.cast().ok()?;
     let list7 = dxr_list7(host, &list);
@@ -3620,30 +4765,46 @@ fn record_static_upgrades(
                 for &(dst_off, src_off, len) in &normal_copies {
                     list.CopyBufferRegion(n_dst, dst_off, n_src, src_off, len);
                 }
-                list.ResourceBarrier(&[transition(
+                emit_dxr_buffer_barrier(
+                    &list,
+                    list7.as_ref(),
                     n_dst,
+                    D3D12_BARRIER_SYNC_COPY,
+                    D3D12_BARRIER_SYNC_ALL_SHADING,
+                    D3D12_BARRIER_ACCESS_COPY_DEST,
+                    D3D12_BARRIER_ACCESS_SHADER_RESOURCE | D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
                     D3D12_RESOURCE_STATE_COPY_DEST,
                     D3D12_RESOURCE_STATE_COMMON,
-                )]);
+                    use_compute,
+                );
             }
-            list.ResourceBarrier(&[transition(
+            emit_dxr_buffer_barrier(
+                &list,
+                list7.as_ref(),
                 &verts_buf,
+                D3D12_BARRIER_SYNC_COPY,
+                D3D12_BARRIER_SYNC_BUILD_RAYTRACING_ACCELERATION_STRUCTURE,
+                D3D12_BARRIER_ACCESS_COPY_DEST,
+                D3D12_BARRIER_ACCESS_SHADER_RESOURCE,
                 D3D12_RESOURCE_STATE_COPY_DEST,
                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-            )]);
+                use_compute,
+            );
             if let Some((uav_buf, _, _)) = &compact_info {
-                list.ResourceBarrier(&[transition(
+                emit_dxr_buffer_legacy_only(
+                    &list,
+                    list7.as_ref(),
                     uav_buf,
                     D3D12_RESOURCE_STATE_COMMON,
                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                )]);
+                );
             }
             for &(idx, guest_key, gpu_va, generation, slice_size, _, _) in &built_items {
                 let item = &prepared[idx];
                 let (need_barrier, scratch_off) =
                     scratch_batch.alloc(scratch_id, scratch_cap, item.scratch_bytes, gpu_va, 0);
                 if need_barrier {
-                    emit_as_build_barrier(&list, list7.as_ref());
+                    emit_as_build_barrier(&list, list7.as_ref(), use_compute);
                 }
                 let inputs = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
                     Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL,
@@ -3669,6 +4830,7 @@ fn record_static_upgrades(
                         generation,
                         uncompacted_size: slice_size,
                         slot,
+                        auto_compact: true,
                     });
                     Some([D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC {
                         DestBuffer: uav_gpu + u64::from(slot) * 8,
@@ -3682,35 +4844,48 @@ fn record_static_upgrades(
                     postbuild.as_ref().map(|p| p.as_slice()),
                 );
             }
-            scratch_batch.flush(&list, list7.as_ref());
+            scratch_batch.flush(&list, list7.as_ref(), use_compute);
             if let Some((uav_buf, _, rb_buf)) = &compact_info {
                 if !new_queries.is_empty() {
-                    list.ResourceBarrier(&[transition(
+                    emit_dxr_buffer_barrier(
+                        &list,
+                        list7.as_ref(),
                         uav_buf,
+                        D3D12_BARRIER_SYNC_BUILD_RAYTRACING_ACCELERATION_STRUCTURE,
+                        D3D12_BARRIER_SYNC_COPY,
+                        D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+                        D3D12_BARRIER_ACCESS_COPY_SOURCE,
                         D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                         D3D12_RESOURCE_STATE_COPY_SOURCE,
-                    )]);
+                        use_compute,
+                    );
                     let off = (first_slot as u64) * 8;
                     let len = (new_queries.len() as u64) * 8;
                     list.CopyBufferRegion(rb_buf, off, uav_buf, off, len);
-                    list.ResourceBarrier(&[transition(
+                    emit_dxr_buffer_legacy_only(
+                        &list,
+                        list7.as_ref(),
                         uav_buf,
                         D3D12_RESOURCE_STATE_COPY_SOURCE,
                         D3D12_RESOURCE_STATE_COMMON,
-                    )]);
+                    );
                 } else {
-                    list.ResourceBarrier(&[transition(
+                    emit_dxr_buffer_legacy_only(
+                        &list,
+                        list7.as_ref(),
                         uav_buf,
                         D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                         D3D12_RESOURCE_STATE_COMMON,
-                    )]);
+                    );
                 }
             }
-            list.ResourceBarrier(&[transition(
+            emit_dxr_buffer_legacy_only(
+                &list,
+                list7.as_ref(),
                 &verts_buf,
                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                 D3D12_RESOURCE_STATE_COMMON,
-            )]);
+            );
             #[cfg(feature = "diagnostics")]
             if let Some((h, rb)) = timing.as_ref() {
                 let t_end = sub.stamp(&list, h);
@@ -3729,7 +4904,7 @@ fn record_static_upgrades(
             sub.timing_next = timing_base;
             sub.timing_spans.truncate(spans_base);
         }
-        state.free_lists.push((allocator, list));
+        state.return_list((allocator, list), use_compute);
         return None;
     }
     if normals_upload.is_some() {
@@ -3763,6 +4938,7 @@ fn record_static_compactions(
     host: &Host,
     state: &mut DxrState,
     sub: &mut DxrSubmission,
+    use_compute: bool,
 ) -> Option<ID3D12CommandList> {
     const ALLOW_COMPACTION: u32 =
         D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_COMPACTION.0 as u32;
@@ -3796,11 +4972,13 @@ fn record_static_compactions(
             {
                 continue;
             }
-            let Some((dst_buf, dst_slice, dst_va)) = state.slabs.alloc(host, compacted_size) else {
+            let Some((dst_buf, dst_slice, dst_va)) =
+                state.slabs.alloc(host, SlabTier::StaticCompacted, compacted_size)
+            else {
                 break;
             };
             if dst_slice.size >= entry.slice.size {
-                SlabAllocator::free_in_slabs(&mut state.slabs.slabs, dst_slice);
+                state.slabs.free_now(dst_slice);
                 continue;
             }
             batch.push(PreparedCompaction {
@@ -3818,18 +4996,18 @@ fn record_static_compactions(
         return None;
     }
 
-    let Some((allocator, list)) = state.take_list(host) else {
+    let Some((allocator, list)) = state.take_list(host, use_compute) else {
         for item in batch {
-            SlabAllocator::free_in_slabs(&mut state.slabs.slabs, item.dst_slice);
+            state.slabs.free_now(item.dst_slice);
         }
         return None;
     };
     name(&list, || "victory dxr static compact".into());
     let Ok(list4) = list.cast::<ID3D12GraphicsCommandList4>() else {
         for item in batch {
-            SlabAllocator::free_in_slabs(&mut state.slabs.slabs, item.dst_slice);
+            state.slabs.free_now(item.dst_slice);
         }
-        state.free_lists.push((allocator, list));
+        state.return_list((allocator, list), use_compute);
         return None;
     };
     let list7 = dxr_list7(host, &list);
@@ -3852,7 +5030,7 @@ fn record_static_compactions(
                     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_COMPACT,
                 );
             }
-            emit_as_copy_barrier(&list, list7.as_ref());
+            emit_as_copy_barrier(&list, list7.as_ref(), use_compute);
             #[cfg(feature = "diagnostics")]
             if let Some((h, rb)) = timing.as_ref() {
                 let t_end = sub.stamp(&list, h);
@@ -3872,13 +5050,14 @@ fn record_static_compactions(
             sub.timing_spans.truncate(spans_base);
         }
         for item in batch {
-            SlabAllocator::free_in_slabs(&mut state.slabs.slabs, item.dst_slice);
+            state.slabs.free_now(item.dst_slice);
         }
-        state.free_lists.push((allocator, list));
+        state.return_list((allocator, list), use_compute);
         return None;
     }
 
     let mut swapped = 0u64;
+    let cur_epoch = state.tlas_build_epoch;
     {
         let mut map = as_map().write().unwrap_or_else(|e| e.into_inner());
         for item in batch {
@@ -3897,7 +5076,7 @@ fn record_static_compactions(
                         )
                     })
             else {
-                SlabAllocator::free_in_slabs(&mut state.slabs.slabs, item.dst_slice);
+                state.slabs.free_now(item.dst_slice);
                 continue;
             };
             // Preserve `generation` and normals table ownership across compaction.
@@ -3907,6 +5086,7 @@ fn record_static_compactions(
                     buffer: item.dst_buf,
                     slice: item.dst_slice,
                     gpu_va: item.dst_va,
+                    mirror_tlas: None,
                     kind: AsKind::Blas,
                     flags: item.flags,
                     num_instances: 0,
@@ -3915,6 +5095,9 @@ fn record_static_compactions(
                     topo_hash: old_topo_hash,
                     update_scratch_bytes: old_update_scratch,
                     consecutive_refits: 0,
+                    compacted_size: 0,
+                    last_seen_tlas_epoch: AtomicU64::new(cur_epoch),
+                    geom_va_hash: 0,
                     normals_geom_off: ng_off,
                     normals_geom_len: ng_len,
                     normals_data_off: nd_off,
@@ -3955,6 +5138,141 @@ fn uav_barrier(resource: Option<&ID3D12Resource>) -> D3D12_RESOURCE_BARRIER {
     }
 }
 
+/// Strips graphics-only `D3D12_BARRIER_SYNC_*` bits when emitting onto a
+/// `D3D12_COMMAND_LIST_TYPE_COMPUTE` command list so the D3D12 Debug Layer never
+/// observes illegal graphics sync bits (`PIXEL_SHADING`, `VERTEX_SHADING`,
+/// `RENDER_TARGET`, `DEPTH_STENCIL`, `ALL_SHADING`, `NON_PIXEL_SHADING`, `DRAW`,
+/// `INDEX_INPUT`, `RESOLVE`) on `Host::compute_queue`.
+fn sanitize_sync_for_queue(sync: D3D12_BARRIER_SYNC, is_compute_queue: bool) -> D3D12_BARRIER_SYNC {
+    if !is_compute_queue || sync.0 == 0 {
+        return sync;
+    }
+    let raw = sync.0 as u32;
+    let compute_legal: u32 = (D3D12_BARRIER_SYNC_COMPUTE_SHADING.0 as u32)
+        | (D3D12_BARRIER_SYNC_COPY.0 as u32)
+        | (D3D12_BARRIER_SYNC_BUILD_RAYTRACING_ACCELERATION_STRUCTURE.0 as u32)
+        | (D3D12_BARRIER_SYNC_COPY_RAYTRACING_ACCELERATION_STRUCTURE.0 as u32)
+        | (D3D12_BARRIER_SYNC_EMIT_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO.0 as u32)
+        | (D3D12_BARRIER_SYNC_EXECUTE_INDIRECT.0 as u32)
+        | (D3D12_BARRIER_SYNC_CLEAR_UNORDERED_ACCESS_VIEW.0 as u32);
+    let shading_any: u32 = (D3D12_BARRIER_SYNC_ALL_SHADING.0 as u32)
+        | (D3D12_BARRIER_SYNC_NON_PIXEL_SHADING.0 as u32)
+        | (D3D12_BARRIER_SYNC_PIXEL_SHADING.0 as u32)
+        | (D3D12_BARRIER_SYNC_VERTEX_SHADING.0 as u32)
+        | (D3D12_BARRIER_SYNC_DRAW.0 as u32)
+        | (D3D12_BARRIER_SYNC_RAYTRACING.0 as u32);
+    let mut out = raw & compute_legal;
+    if (raw & shading_any) != 0 {
+        out |= D3D12_BARRIER_SYNC_COMPUTE_SHADING.0 as u32;
+    }
+    if out == 0 {
+        out = D3D12_BARRIER_SYNC_COMPUTE_SHADING.0 as u32;
+    }
+    D3D12_BARRIER_SYNC(out as i32)
+}
+
+/// Computes the narrowed Enhanced prelude barrier `(sync_before, sync_after, access_before, access_after)`
+/// for a batch of `ops` on `DirectQ` (`None` on `ComputeQ`, where `skin_fence` already provides
+/// full Direct -> Compute synchronization and L2 flush).
+fn prelude_barrier_for_ops(
+    has_build_blas: bool,
+    has_build_tlas: bool,
+    has_extract: bool,
+    has_copy: bool,
+    is_compute_queue: bool,
+) -> Option<(
+    D3D12_BARRIER_SYNC,
+    D3D12_BARRIER_SYNC,
+    D3D12_BARRIER_ACCESS,
+    D3D12_BARRIER_ACCESS,
+)> {
+    if is_compute_queue || !(has_build_blas || has_build_tlas || has_extract || has_copy) {
+        return None;
+    }
+    // Preceding `run.list` work on DirectQ is skinning/rehydration compute (`COMPUTE_SHADING`)
+    // and buffer copies (`COPY`); never drain graphics/raster stages or already-flushed AS builds.
+    let mut sync_before = D3D12_BARRIER_SYNC_COMPUTE_SHADING | D3D12_BARRIER_SYNC_COPY;
+    let mut access_before =
+        D3D12_BARRIER_ACCESS_UNORDERED_ACCESS | D3D12_BARRIER_ACCESS_COPY_DEST;
+    if has_copy {
+        sync_before |= D3D12_BARRIER_SYNC_BUILD_RAYTRACING_ACCELERATION_STRUCTURE;
+        access_before |= D3D12_BARRIER_ACCESS_RAYTRACING_ACCELERATION_STRUCTURE_WRITE;
+    }
+    let mut sync_after = D3D12_BARRIER_SYNC_NONE;
+    let mut access_after = D3D12_BARRIER_ACCESS(0);
+    if has_build_blas || has_build_tlas || has_extract {
+        sync_after |= D3D12_BARRIER_SYNC_BUILD_RAYTRACING_ACCELERATION_STRUCTURE
+            | D3D12_BARRIER_SYNC_COMPUTE_SHADING;
+        access_after |= D3D12_BARRIER_ACCESS_SHADER_RESOURCE
+            | D3D12_BARRIER_ACCESS_UNORDERED_ACCESS
+            | D3D12_BARRIER_ACCESS_RAYTRACING_ACCELERATION_STRUCTURE_READ
+            | D3D12_BARRIER_ACCESS_RAYTRACING_ACCELERATION_STRUCTURE_WRITE;
+    }
+    if has_copy {
+        sync_after |= D3D12_BARRIER_SYNC_COPY_RAYTRACING_ACCELERATION_STRUCTURE;
+        access_after |= D3D12_BARRIER_ACCESS_RAYTRACING_ACCELERATION_STRUCTURE_READ
+            | D3D12_BARRIER_ACCESS_RAYTRACING_ACCELERATION_STRUCTURE_WRITE;
+    }
+    Some((sync_before, sync_after, access_before, access_after))
+}
+
+/// Emits a scoped Enhanced `D3D12_BUFFER_BARRIER` on `list7` (sanitizing sync bits for
+/// `ComputeQ`), or falls back to a legacy `D3D12_RESOURCE_BARRIER_TYPE_TRANSITION` when
+/// Enhanced Barriers are unavailable.
+#[allow(clippy::too_many_arguments)]
+unsafe fn emit_dxr_buffer_barrier(
+    list: &ID3D12GraphicsCommandList,
+    list7: Option<&ID3D12GraphicsCommandList7>,
+    resource: &ID3D12Resource,
+    sync_before: D3D12_BARRIER_SYNC,
+    sync_after: D3D12_BARRIER_SYNC,
+    access_before: D3D12_BARRIER_ACCESS,
+    access_after: D3D12_BARRIER_ACCESS,
+    legacy_before: D3D12_RESOURCE_STATES,
+    legacy_after: D3D12_RESOURCE_STATES,
+    is_compute_queue: bool,
+) {
+    if let Some(l7) = list7 {
+        let barrier = [D3D12_BUFFER_BARRIER {
+            SyncBefore: sanitize_sync_for_queue(sync_before, is_compute_queue),
+            SyncAfter: sanitize_sync_for_queue(sync_after, is_compute_queue),
+            AccessBefore: access_before,
+            AccessAfter: access_after,
+            // SAFETY: borrowed COM pointer valid for the `Barrier` call; caller keeps resource alive.
+            pResource: unsafe { std::mem::transmute_copy(resource) },
+            Offset: 0,
+            Size: u64::MAX,
+        }];
+        let group = [D3D12_BARRIER_GROUP {
+            Type: D3D12_BARRIER_TYPE_BUFFER,
+            NumBarriers: 1,
+            Anonymous: D3D12_BARRIER_GROUP_0 {
+                pBufferBarriers: barrier.as_ptr(),
+            },
+        }];
+        // SAFETY: caller guarantees an open command list and spec-valid sync/access flags.
+        unsafe { l7.Barrier(&group) };
+    } else if legacy_before != legacy_after {
+        // SAFETY: caller guarantees an open command list and live buffer.
+        unsafe { list.ResourceBarrier(&[transition(resource, legacy_before, legacy_after)]) };
+    }
+}
+
+/// Emits a legacy buffer state transition ONLY when Enhanced Barriers (`list7`) are unavailable
+/// (under Enhanced Barriers, buffers remain in `COMMON` and need no `COMMON <-> state` noise).
+unsafe fn emit_dxr_buffer_legacy_only(
+    list: &ID3D12GraphicsCommandList,
+    list7: Option<&ID3D12GraphicsCommandList7>,
+    resource: &ID3D12Resource,
+    legacy_before: D3D12_RESOURCE_STATES,
+    legacy_after: D3D12_RESOURCE_STATES,
+) {
+    if list7.is_none() && legacy_before != legacy_after {
+        // SAFETY: caller guarantees an open command list and live buffer.
+        unsafe { list.ResourceBarrier(&[transition(resource, legacy_before, legacy_after)]) };
+    }
+}
+
 /// Emits a scoped Enhanced `D3D12_GLOBAL_BARRIER` on `list7`, or falls back to
 /// a legacy `uav_barrier(None)` when Enhanced Barriers / `ID3D12GraphicsCommandList7`
 /// are unavailable or disabled via `VICTORY_DXR_ENHANCED_BARRIERS=0`.
@@ -3965,11 +5283,12 @@ unsafe fn emit_as_barrier(
     sync_after: D3D12_BARRIER_SYNC,
     access_before: D3D12_BARRIER_ACCESS,
     access_after: D3D12_BARRIER_ACCESS,
+    is_compute_queue: bool,
 ) {
     if let Some(l7) = list7 {
         let barrier = [D3D12_GLOBAL_BARRIER {
-            SyncBefore: sync_before,
-            SyncAfter: sync_after,
+            SyncBefore: sanitize_sync_for_queue(sync_before, is_compute_queue),
+            SyncAfter: sanitize_sync_for_queue(sync_after, is_compute_queue),
             AccessBefore: access_before,
             AccessAfter: access_after,
         }];
@@ -3988,39 +5307,32 @@ unsafe fn emit_as_barrier(
     }
 }
 
-/// Orders prior compute/copy/AS work before DXR compute extraction, instance patching,
-/// and AS builds/copies in `record_ops`.
+/// Orders prior compute/copy work on `DirectQ` before DXR ops in `record_ops`
+/// (skipped on `ComputeQ` where `skin_fence` already ordered Direct -> Compute).
 unsafe fn emit_as_prelude_barrier(
     list: &ID3D12GraphicsCommandList,
     list7: Option<&ID3D12GraphicsCommandList7>,
+    ops: &[DxrOp],
+    is_compute_queue: bool,
 ) {
+    let has_build_blas = ops.iter().any(|op| matches!(op, DxrOp::BuildBlas { .. }));
+    let has_build_tlas = ops.iter().any(|op| matches!(op, DxrOp::BuildTlas { .. }));
+    let has_extract = ops.iter().any(|op| matches!(op, DxrOp::ExtractStaticBlas { .. }));
+    let has_copy = ops.iter().any(|op| matches!(op, DxrOp::CopyAs { .. }));
+    let Some((sb, sa, ab, aa)) =
+        prelude_barrier_for_ops(has_build_blas, has_build_tlas, has_extract, has_copy, is_compute_queue)
+    else {
+        return;
+    };
     // SAFETY: valid D3D12 Enhanced Barrier sync/access pairing.
-    unsafe {
-        emit_as_barrier(
-            list,
-            list7,
-            D3D12_BARRIER_SYNC_ALL_SHADING
-                | D3D12_BARRIER_SYNC_COPY
-                | D3D12_BARRIER_SYNC_BUILD_RAYTRACING_ACCELERATION_STRUCTURE
-                | D3D12_BARRIER_SYNC_COPY_RAYTRACING_ACCELERATION_STRUCTURE,
-            D3D12_BARRIER_SYNC_COMPUTE_SHADING
-                | D3D12_BARRIER_SYNC_BUILD_RAYTRACING_ACCELERATION_STRUCTURE
-                | D3D12_BARRIER_SYNC_COPY_RAYTRACING_ACCELERATION_STRUCTURE,
-            D3D12_BARRIER_ACCESS_UNORDERED_ACCESS
-                | D3D12_BARRIER_ACCESS_COPY_DEST
-                | D3D12_BARRIER_ACCESS_RAYTRACING_ACCELERATION_STRUCTURE_WRITE,
-            D3D12_BARRIER_ACCESS_SHADER_RESOURCE
-                | D3D12_BARRIER_ACCESS_UNORDERED_ACCESS
-                | D3D12_BARRIER_ACCESS_RAYTRACING_ACCELERATION_STRUCTURE_READ
-                | D3D12_BARRIER_ACCESS_RAYTRACING_ACCELERATION_STRUCTURE_WRITE,
-        );
-    }
+    unsafe { emit_as_barrier(list, list7, sb, sa, ab, aa, is_compute_queue) };
 }
 
 /// Orders mid-batch scratch reuse or overlapping dest/src AS VAs between AS builds.
 unsafe fn emit_as_build_barrier(
     list: &ID3D12GraphicsCommandList,
     list7: Option<&ID3D12GraphicsCommandList7>,
+    is_compute_queue: bool,
 ) {
     // SAFETY: valid D3D12 Enhanced Barrier sync/access pairing.
     unsafe {
@@ -4036,6 +5348,7 @@ unsafe fn emit_as_build_barrier(
             D3D12_BARRIER_ACCESS_RAYTRACING_ACCELERATION_STRUCTURE_READ
                 | D3D12_BARRIER_ACCESS_RAYTRACING_ACCELERATION_STRUCTURE_WRITE
                 | D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+            is_compute_queue,
         );
     }
 }
@@ -4045,6 +5358,7 @@ unsafe fn emit_as_build_barrier(
 unsafe fn emit_as_flush_barrier(
     list: &ID3D12GraphicsCommandList,
     list7: Option<&ID3D12GraphicsCommandList7>,
+    is_compute_queue: bool,
 ) {
     // SAFETY: valid D3D12 Enhanced Barrier sync/access pairing.
     unsafe {
@@ -4064,6 +5378,7 @@ unsafe fn emit_as_flush_barrier(
                 | D3D12_BARRIER_ACCESS_RAYTRACING_ACCELERATION_STRUCTURE_WRITE
                 | D3D12_BARRIER_ACCESS_UNORDERED_ACCESS
                 | D3D12_BARRIER_ACCESS_SHADER_RESOURCE,
+            is_compute_queue,
         );
     }
 }
@@ -4073,6 +5388,7 @@ unsafe fn emit_as_flush_barrier(
 unsafe fn emit_as_copy_barrier(
     list: &ID3D12GraphicsCommandList,
     list7: Option<&ID3D12GraphicsCommandList7>,
+    is_compute_queue: bool,
 ) {
     // SAFETY: valid D3D12 Enhanced Barrier sync/access pairing.
     unsafe {
@@ -4087,8 +5403,58 @@ unsafe fn emit_as_copy_barrier(
             D3D12_BARRIER_ACCESS_RAYTRACING_ACCELERATION_STRUCTURE_WRITE,
             D3D12_BARRIER_ACCESS_RAYTRACING_ACCELERATION_STRUCTURE_READ
                 | D3D12_BARRIER_ACCESS_RAYTRACING_ACCELERATION_STRUCTURE_WRITE,
+            is_compute_queue,
         );
     }
+}
+
+/// Orders contiguous dynamic BLAS builds/refits before the batched `BUILD_NORMALS_HLSL`
+/// compute pass (`ARCH-14`).
+unsafe fn emit_blas_to_compute_barrier(
+    list: &ID3D12GraphicsCommandList,
+    list7: Option<&ID3D12GraphicsCommandList7>,
+    is_compute_queue: bool,
+) {
+    // SAFETY: valid D3D12 Enhanced Barrier sync/access pairing.
+    unsafe {
+        emit_as_barrier(
+            list,
+            list7,
+            D3D12_BARRIER_SYNC_BUILD_RAYTRACING_ACCELERATION_STRUCTURE,
+            D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+            D3D12_BARRIER_ACCESS_RAYTRACING_ACCELERATION_STRUCTURE_WRITE
+                | D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+            D3D12_BARRIER_ACCESS_SHADER_RESOURCE
+                | D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+            is_compute_queue,
+        );
+    }
+}
+
+/// Splits a contiguous run of `BuildBlas` `(dest_key, src_key)` pairs into maximal
+/// sub-batches with no destination/source VA overlap within a sub-batch so each sub-batch
+/// takes `AS_MAP` once, records all AS builds contiguously, emits 1 barrier, and binds
+/// `BUILD_NORMALS_HLSL` once (`ARCH-14`).
+fn plan_blas_sub_batches(pairs: &[(u64, u64)]) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    let mut seen_dests: Vec<u64> = Vec::new();
+    for (idx, &(dst, src)) in pairs.iter().enumerate() {
+        let hazard = (dst != 0 && seen_dests.contains(&dst))
+            || (src != 0 && src != dst && seen_dests.contains(&src));
+        if hazard {
+            ranges.push(start..idx);
+            start = idx;
+            seen_dests.clear();
+        }
+        if dst != 0 {
+            seen_dests.push(dst);
+        }
+    }
+    if start < pairs.len() {
+        ranges.push(start..pairs.len());
+    }
+    ranges
 }
 
 /// Splits a contiguous run of `BuildTlas` destination keys into maximal contiguous
@@ -4163,10 +5529,11 @@ impl ScratchBatcher {
         &mut self,
         list: &ID3D12GraphicsCommandList,
         list7: Option<&ID3D12GraphicsCommandList7>,
+        is_compute_queue: bool,
     ) {
         if self.has_pending() {
             // SAFETY: open command list.
-            unsafe { emit_as_flush_barrier(list, list7) };
+            unsafe { emit_as_flush_barrier(list, list7, is_compute_queue) };
             self.reset();
         }
     }
@@ -4178,6 +5545,7 @@ fn record_empty_tlas_init(
     state: &mut DxrState,
     sub: &mut DxrSubmission,
     tlas_vas: &[u64],
+    use_compute: bool,
 ) -> Option<ID3D12CommandList> {
     const EMPTY_TLAS_FLAGS: u32 =
         D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD.0 as u32;
@@ -4192,7 +5560,7 @@ fn record_empty_tlas_init(
     };
     let (result_bytes, scratch_bytes) = state.tlas_prebuild_info(device5, EMPTY_TLAS_FLAGS, 0);
 
-    let (allocator, list) = state.take_list(host)?;
+    let (allocator, list) = state.take_list(host, use_compute)?;
     name(&list, || "victory dxr ops".into());
     let list4: ID3D12GraphicsCommandList4 = list.cast().ok()?;
     let list7 = dxr_list7(host, &list);
@@ -4225,7 +5593,7 @@ fn record_empty_tlas_init(
                 let (need_barrier, scratch_off) =
                     scratch_batch.alloc(scratch_id, scratch_cap, one_scratch, entry.gpu_va, 0);
                 if need_barrier {
-                    emit_as_build_barrier(&list, list7.as_ref());
+                    emit_as_build_barrier(&list, list7.as_ref(), use_compute);
                 }
                 let desc = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC {
                     DestAccelerationStructureData: entry.gpu_va,
@@ -4234,8 +5602,24 @@ fn record_empty_tlas_init(
                     ScratchAccelerationStructureData: scratch_gpu + scratch_off,
                 };
                 list4.BuildRaytracingAccelerationStructure(&desc, None);
+                if let Some(mirror) = &entry.mirror_tlas
+                    && mirror.slice.size >= result_bytes
+                {
+                    let (m_barrier, m_scratch_off) =
+                        scratch_batch.alloc(scratch_id, scratch_cap, one_scratch, mirror.gpu_va, 0);
+                    if m_barrier {
+                        emit_as_build_barrier(&list, list7.as_ref(), use_compute);
+                    }
+                    let m_desc = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC {
+                        DestAccelerationStructureData: mirror.gpu_va,
+                        Inputs: inputs,
+                        SourceAccelerationStructureData: 0,
+                        ScratchAccelerationStructureData: scratch_gpu + m_scratch_off,
+                    };
+                    list4.BuildRaytracingAccelerationStructure(&m_desc, None);
+                }
             }
-            scratch_batch.flush(&list, list7.as_ref());
+            scratch_batch.flush(&list, list7.as_ref(), use_compute);
             #[cfg(feature = "diagnostics")]
             if let Some((h, rb)) = timing.as_ref() {
                 let t_end = sub.stamp(&list, h);
@@ -4254,7 +5638,7 @@ fn record_empty_tlas_init(
             sub.timing_next = timing_base;
             sub.timing_spans.truncate(spans_base);
         }
-        state.free_lists.push((allocator, list));
+        state.return_list((allocator, list), use_compute);
         return None;
     }
     {
@@ -4272,6 +5656,7 @@ fn record_empty_tlas_init(
     Some(out)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_ops(
     host: &Host,
     device5: &ID3D12Device5,
@@ -4280,8 +5665,9 @@ fn record_ops(
     owner: &HostList,
     ops: &[DxrOp],
     built_tlas: &mut bool,
+    use_compute: bool,
 ) -> Option<ID3D12CommandList> {
-    let (allocator, list) = state.take_list(host)?;
+    let (allocator, list) = state.take_list(host, use_compute)?;
     name(&list, || "victory dxr ops".into());
     let list4: ID3D12GraphicsCommandList4 = list.cast().ok()?;
     let list7 = dxr_list7(host, &list);
@@ -4321,8 +5707,9 @@ fn record_ops(
             list.Reset(&allocator, None)?;
             #[cfg(feature = "diagnostics")]
             let mut prev_stamp: Option<(&'static str, u32)> = None;
-            // Ensure prior GPU compute/copy work (e.g. skinning or BVH4 rehydration) is visible.
-            emit_as_prelude_barrier(&list, list7.as_ref());
+            // Ensure prior GPU compute/copy work on DirectQ is visible (skipped on ComputeQ
+            // where `skin_fence` already ordered Direct -> Compute).
+            emit_as_prelude_barrier(&list, list7.as_ref(), ops, use_compute);
             if let (Some((n_dst, _)), Some(n_src)) = (&normals_gpu_entry, &normals_init_src) {
                 list.CopyBufferRegion(n_dst, 0, n_src, 0, 4);
                 normals_state = D3D12_RESOURCE_STATE_COPY_DEST;
@@ -4346,12 +5733,35 @@ fn record_ops(
                     sub.timing_spans.push((prev_label, s, e));
                 }
                 let mut did_op = false;
-                if matches!(op, DxrOp::BuildTlas { .. }) {
+                if matches!(op, DxrOp::BuildBlas { .. }) {
+                    let start_idx = op_idx;
+                    while op_idx < ops.len() && matches!(ops[op_idx], DxrOp::BuildBlas { .. }) {
+                        op_idx += 1;
+                    }
+                    if record_build_blas_batch(
+                        host,
+                        device5,
+                        state,
+                        sub,
+                        &list,
+                        &list4,
+                        list7.as_ref(),
+                        &mut scratch_batch,
+                        &ops[start_idx..op_idx],
+                        normals_gpu_entry.as_ref(),
+                        &mut normals_state,
+                        &mut compact_uav_active,
+                        use_compute,
+                    ) {
+                        recorded_any = true;
+                        did_op = true;
+                    }
+                } else if matches!(op, DxrOp::BuildTlas { .. }) {
                     let start_idx = op_idx;
                     while op_idx < ops.len() && matches!(ops[op_idx], DxrOp::BuildTlas { .. }) {
                         op_idx += 1;
                     }
-                    scratch_batch.flush(&list, list7.as_ref());
+                    scratch_batch.flush(&list, list7.as_ref(), use_compute);
                     if record_build_tlas_batch(
                         host,
                         device5,
@@ -4367,6 +5777,7 @@ fn record_ops(
                         normals_gpu_entry.as_ref(),
                         &mut normals_state,
                         built_tlas,
+                        use_compute,
                     ) {
                         recorded_any = true;
                         did_op = true;
@@ -4374,40 +5785,12 @@ fn record_ops(
                 } else {
                     op_idx += 1;
                     match op {
-                        DxrOp::BuildBlas {
-                            dest_va,
-                            source_va,
-                            flags,
-                            geometries,
-                            postbuild,
-                        } => {
-                            if record_build_blas(
-                                host,
-                                device5,
-                                state,
-                                sub,
-                                &list,
-                                &list4,
-                                list7.as_ref(),
-                                &mut scratch_batch,
-                                *dest_va,
-                                *source_va,
-                                *flags,
-                                geometries,
-                                postbuild,
-                                normals_gpu_entry.as_ref(),
-                                &mut normals_state,
-                            ) {
-                                recorded_any = true;
-                                did_op = true;
-                            }
-                        }
                         DxrOp::CopyAs {
                             dest_va,
                             source_va,
                             mode,
                         } => {
-                            scratch_batch.flush(&list, list7.as_ref());
+                            scratch_batch.flush(&list, list7.as_ref(), use_compute);
                             if record_copy_as(
                                 host,
                                 state,
@@ -4417,6 +5800,7 @@ fn record_ops(
                                 *dest_va,
                                 *source_va,
                                 *mode,
+                                use_compute,
                             ) {
                                 recorded_any = true;
                                 did_op = true;
@@ -4441,12 +5825,13 @@ fn record_ops(
                                 &mut extract_in_srv,
                                 &mut staging_in_copy_src,
                                 &mut compact_uav_active,
+                                use_compute,
                             ) {
                                 recorded_any = true;
                                 did_op = true;
                             }
                         }
-                        DxrOp::BuildTlas { .. } => unreachable!(),
+                        DxrOp::BuildBlas { .. } | DxrOp::BuildTlas { .. } => unreachable!(),
                     }
                 }
                 #[cfg(feature = "diagnostics")]
@@ -4456,55 +5841,85 @@ fn record_ops(
                 #[cfg(not(feature = "diagnostics"))]
                 let _ = did_op;
             }
-            scratch_batch.flush(&list, list7.as_ref());
+            scratch_batch.flush(&list, list7.as_ref(), use_compute);
             if let Some((n_buf, _)) = &normals_gpu_entry
                 && normals_state != D3D12_RESOURCE_STATE_COMMON
             {
-                list.ResourceBarrier(&[transition(
+                let (sync_b, acc_b) = if normals_state == D3D12_RESOURCE_STATE_COPY_DEST {
+                    (D3D12_BARRIER_SYNC_COPY, D3D12_BARRIER_ACCESS_COPY_DEST)
+                } else {
+                    (
+                        D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+                        D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+                    )
+                };
+                emit_dxr_buffer_barrier(
+                    &list,
+                    list7.as_ref(),
                     n_buf,
+                    sync_b,
+                    D3D12_BARRIER_SYNC_ALL_SHADING,
+                    acc_b,
+                    D3D12_BARRIER_ACCESS_SHADER_RESOURCE | D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
                     normals_state,
                     D3D12_RESOURCE_STATE_COMMON,
-                )]);
+                    use_compute,
+                );
                 normals_state = D3D12_RESOURCE_STATE_COMMON;
             }
             if hash_in_srv
-                && let Some(hash_buf) = state.hash_gpu.as_ref()
+                && let Some(hash_aux) = state.hash_gpu.as_ref()
             {
-                list.ResourceBarrier(&[transition(
-                    hash_buf,
+                emit_dxr_buffer_legacy_only(
+                    &list,
+                    list7.as_ref(),
+                    &hash_aux.buf,
                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                     D3D12_RESOURCE_STATE_COMMON,
-                )]);
+                );
             }
             if let Some(staging_buf) = staging_in_copy_src.take() {
-                list.ResourceBarrier(&[transition(
+                emit_dxr_buffer_legacy_only(
+                    &list,
+                    list7.as_ref(),
                     &staging_buf,
                     D3D12_RESOURCE_STATE_COPY_SOURCE,
                     D3D12_RESOURCE_STATE_COMMON,
-                )]);
+                );
             }
             if let Some((uav_buf, rb_buf)) = compact_uav_active.take() {
                 let count = sub.compact_queries.len().saturating_sub(compact_start_slot);
                 if count > 0 {
-                    list.ResourceBarrier(&[transition(
+                    emit_dxr_buffer_barrier(
+                        &list,
+                        list7.as_ref(),
                         &uav_buf,
+                        D3D12_BARRIER_SYNC_BUILD_RAYTRACING_ACCELERATION_STRUCTURE,
+                        D3D12_BARRIER_SYNC_COPY,
+                        D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+                        D3D12_BARRIER_ACCESS_COPY_SOURCE,
                         D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                         D3D12_RESOURCE_STATE_COPY_SOURCE,
-                    )]);
+                        use_compute,
+                    );
                     let off = (compact_start_slot as u64) * 8;
                     let len = (count as u64) * 8;
                     list.CopyBufferRegion(&rb_buf, off, &uav_buf, off, len);
-                    list.ResourceBarrier(&[transition(
+                    emit_dxr_buffer_legacy_only(
+                        &list,
+                        list7.as_ref(),
                         &uav_buf,
                         D3D12_RESOURCE_STATE_COPY_SOURCE,
                         D3D12_RESOURCE_STATE_COMMON,
-                    )]);
+                    );
                 } else {
-                    list.ResourceBarrier(&[transition(
+                    emit_dxr_buffer_legacy_only(
+                        &list,
+                        list7.as_ref(),
                         &uav_buf,
                         D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                         D3D12_RESOURCE_STATE_COMMON,
-                    )]);
+                    );
                 }
             }
             #[cfg(feature = "diagnostics")]
@@ -4528,7 +5943,7 @@ fn record_ops(
             sub.timing_spans.truncate(spans_base);
         }
         sub.compact_queries.truncate(compact_start_slot);
-        state.free_lists.push((allocator, list));
+        state.return_list((allocator, list), use_compute);
         return None;
     }
     if !recorded_any {
@@ -4538,7 +5953,7 @@ fn record_ops(
             sub.timing_spans.truncate(spans_base);
         }
         sub.compact_queries.truncate(compact_start_slot);
-        state.free_lists.push((allocator, list));
+        state.return_list((allocator, list), use_compute);
         return None;
     }
     if normals_init_src.is_some() {
@@ -4584,6 +5999,8 @@ fn decide_blas_refit(
     refit_period: u32,
 ) -> BlasRefitDecision {
     const ALLOW_UPDATE: u32 = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE.0 as u32;
+    const ALLOW_COMPACTION: u32 =
+        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_COMPACTION.0 as u32;
     const PERFORM_UPDATE: u32 = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE.0 as u32;
     const PREFER_FAST_BUILD: u32 =
         D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD.0 as u32;
@@ -4592,9 +6009,14 @@ fn decide_blas_refit(
     const PREF_MASK: u32 = PREFER_FAST_BUILD | PREFER_FAST_TRACE;
     const OTHER_MASK: u32 = !(ALLOW_UPDATE | PERFORM_UPDATE | PREF_MASK);
 
+    // Never OR `ALLOW_UPDATE` onto `ALLOW_COMPACTION`-only BLASes: doing so bloats
+    // compacted builds by 30-50% and defeats compaction (`ARCH-10`).
+    let compaction_only = (raw_flags & ALLOW_COMPACTION) != 0 && (raw_flags & ALLOW_UPDATE) == 0;
+    let effective_refit = refit_enabled && !compaction_only;
+
     let is_compatible = |entry: &ExistingBlasRefitInfo| -> bool {
         let pref_ok = (entry.flags & PREF_MASK) == (raw_flags & PREF_MASK)
-            || (refit_enabled
+            || (effective_refit
                 && (entry.flags & PREF_MASK) == PREFER_FAST_TRACE
                 && (raw_flags & PREFER_FAST_TRACE) == 0);
         entry.built
@@ -4604,7 +6026,7 @@ fn decide_blas_refit(
             && entry.topo_hash == topo_hash
             && topo_hash != 0
     };
-    let full_flags = (raw_flags & !PERFORM_UPDATE) | if refit_enabled { ALLOW_UPDATE } else { 0 };
+    let full_flags = (raw_flags & !PERFORM_UPDATE) | if effective_refit { ALLOW_UPDATE } else { 0 };
     // Periodic full rebuilds upgrade to PREFER_FAST_TRACE | ALLOW_UPDATE so the
     // subsequent 63 refits trace a higher-quality BVH topology.
     let periodic_full_flags = (raw_flags & !(PERFORM_UPDATE | PREFER_FAST_BUILD)) | PREFER_FAST_TRACE | ALLOW_UPDATE;
@@ -4615,7 +6037,7 @@ fn decide_blas_refit(
         if let Some(src) = candidate
             && is_compatible(&src)
         {
-            if refit_enabled && refit_period > 0 && src.consecutive_refits >= refit_period {
+            if effective_refit && refit_period > 0 && src.consecutive_refits >= refit_period {
                 return BlasRefitDecision {
                     flags: periodic_full_flags,
                     host_src_va: 0,
@@ -4624,7 +6046,7 @@ fn decide_blas_refit(
                     is_refit: false,
                 };
             }
-            let update_flags = if refit_enabled {
+            let update_flags = if effective_refit {
                 (src.flags & !PERFORM_UPDATE) | ALLOW_UPDATE | PERFORM_UPDATE
             } else {
                 raw_flags
@@ -4651,7 +6073,7 @@ fn decide_blas_refit(
         };
     }
 
-    if refit_enabled
+    if effective_refit
         && let Some(dst) = existing_dst
         && is_compatible(&dst)
         && dst.update_scratch_bytes > 0
@@ -4683,8 +6105,13 @@ fn decide_blas_refit(
     }
 }
 
+/// Records a contiguous batch of dynamic `DxrOp::BuildBlas` operations (`ARCH-14`):
+/// acquires `AS_MAP` once per sub-batch, records all `BuildRaytracingAccelerationStructure`
+/// calls contiguously with zero interleaved compute PSO switches, emits one
+/// `BUILD_AS -> COMPUTE` barrier, and binds `BUILD_NORMALS_HLSL` once for all dirty dynamic
+/// BLASes (skipping unskinned/unchanged refits where safe).
 #[allow(clippy::too_many_arguments)]
-unsafe fn record_build_blas(
+unsafe fn record_build_blas_batch(
     host: &Host,
     device5: &ID3D12Device5,
     state: &mut DxrState,
@@ -4693,195 +6120,63 @@ unsafe fn record_build_blas(
     list4: &ID3D12GraphicsCommandList4,
     list7: Option<&ID3D12GraphicsCommandList7>,
     scratch_batch: &mut ScratchBatcher,
-    dest_va: u64,
-    source_va: u64,
-    raw_flags: u32,
-    geometries: &[GeometrySpec],
-    postbuild: &[PostbuildSpec],
+    blas_ops: &[DxrOp],
     normals_gpu: Option<&(ID3D12Resource, u64)>,
     normals_state: &mut D3D12_RESOURCE_STATES,
+    compact_uav_active: &mut Option<(ID3D12Resource, ID3D12Resource)>,
+    use_compute: bool,
 ) -> bool {
-    let key = dest_va & !0xFF;
-    if key == 0 || geometries.is_empty() {
-        STATS[STAT_SKIPPED].fetch_add(1, Ordering::Relaxed);
-        return false;
-    }
-    let mut host_geoms = Vec::with_capacity(geometries.len());
-    for g in geometries {
-        match g.kind {
-            GeometryKind::Triangles {
-                transform3x4,
-                index_format,
-                vertex_format,
-                index_count,
-                vertex_count,
-                index_buffer,
-                vertex_buffer_va,
-                vertex_buffer_stride,
-            } => {
-                let pc_vtx_fmt = crate::resource::pc_format(vertex_format);
-                let (vtx_align, vtx_min_bytes, vtx_fmt_ok) = match DXGI_FORMAT(pc_vtx_fmt as i32) {
-                    DXGI_FORMAT_R32G32B32_FLOAT => (4u64, 12u64, true),
-                    DXGI_FORMAT_R32G32_FLOAT => (4, 8, true),
-                    DXGI_FORMAT_R16G16B16A16_FLOAT | DXGI_FORMAT_R16G16B16A16_SNORM => (2, 8, true),
-                    DXGI_FORMAT_R16G16_FLOAT | DXGI_FORMAT_R16G16_SNORM => (2, 4, true),
-                    _ => (4, 12, false),
-                };
-                let (vb_gpu, vc, vb_stride) = if vtx_fmt_ok
-                    && vertex_buffer_va != 0
-                    && vertex_count > 0
-                    && vertex_buffer_stride % vtx_align == 0
-                {
-                    let stride = vertex_buffer_stride.max(vtx_min_bytes);
-                    let len = u64::from(vertex_count)
-                        .saturating_sub(1)
-                        .saturating_mul(stride)
-                        .saturating_add(vtx_min_bytes);
-                    match crate::shadow::find(vertex_buffer_va, len) {
-                        Some(s) if s.left(vertex_buffer_va) >= len => {
-                            let gpu = s.gpu(vertex_buffer_va);
-                            if gpu % vtx_align == 0 {
-                                sub.kept_shadows.push(s);
-                                (gpu, vertex_count, vertex_buffer_stride)
-                            } else {
-                                (0, 0, 0)
-                            }
-                        }
-                        _ => (0, 0, 0),
-                    }
-                } else {
-                    (0, 0, 0)
-                };
-                let pc_idx_fmt = crate::resource::pc_format(index_format);
-                let (ib_gpu, ic, idx_fmt) = if index_buffer != 0 && index_count >= 3 && vc > 0 {
-                    let elem = match DXGI_FORMAT(pc_idx_fmt as i32) {
-                        DXGI_FORMAT_R16_UINT => Some(2u64),
-                        DXGI_FORMAT_R32_UINT => Some(4u64),
-                        _ => None,
-                    };
-                    let aligned_ic = index_count - (index_count % 3);
-                    if let Some(elem) = elem {
-                        let len = u64::from(aligned_ic).saturating_mul(elem);
-                        match crate::shadow::find(index_buffer, len) {
-                            Some(s) if s.left(index_buffer) >= len => {
-                                let gpu = s.gpu(index_buffer);
-                                if gpu % elem == 0 {
-                                    sub.kept_shadows.push(s);
-                                    (gpu, aligned_ic, DXGI_FORMAT(pc_idx_fmt as i32))
-                                } else {
-                                    (0, 0, DXGI_FORMAT_UNKNOWN)
-                                }
-                            }
-                            _ => (0, 0, DXGI_FORMAT_UNKNOWN),
-                        }
-                    } else {
-                        (0, 0, DXGI_FORMAT_UNKNOWN)
-                    }
-                } else {
-                    (0, 0, DXGI_FORMAT_UNKNOWN)
-                };
-                // If an indexed geometry failed to resolve its index buffer, deactivate it
-                // rather than feeding raw vertices with mismatched count/stride. For
-                // non-indexed triangles, DXR requires VertexCount to be a multiple of 3.
-                let (vb_gpu, vc, vb_stride) = if index_buffer != 0 && index_count > 0 && ib_gpu == 0 {
-                    (0, 0, 0)
-                } else if ib_gpu == 0 {
-                    let aligned_vc = vc - (vc % 3);
-                    if aligned_vc == 0 {
-                        (0, 0, 0)
-                    } else {
-                        (vb_gpu, aligned_vc, vb_stride)
-                    }
-                } else {
-                    (vb_gpu, vc, vb_stride)
-                };
-                let xf_gpu = if transform3x4 != 0 && vc > 0 {
-                    match crate::shadow::find(transform3x4, 48) {
-                        Some(s) if s.left(transform3x4) >= 48 => {
-                            let gpu = s.gpu(transform3x4);
-                            if gpu % 16 == 0 {
-                                sub.kept_shadows.push(s);
-                                gpu
-                            } else {
-                                0
-                            }
-                        }
-                        _ => 0,
-                    }
-                } else {
-                    0
-                };
-                let host_vtx_fmt = if vtx_fmt_ok {
-                    DXGI_FORMAT(pc_vtx_fmt as i32)
-                } else {
-                    DXGI_FORMAT_R32G32B32_FLOAT
-                };
-                host_geoms.push(D3D12_RAYTRACING_GEOMETRY_DESC {
-                    Type: D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES,
-                    Flags: dynamic_geom_flags(g.flags),
-                    Anonymous: D3D12_RAYTRACING_GEOMETRY_DESC_0 {
-                        Triangles: D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC {
-                            Transform3x4: xf_gpu,
-                            IndexFormat: idx_fmt,
-                            VertexFormat: host_vtx_fmt,
-                            IndexCount: ic,
-                            VertexCount: vc,
-                            IndexBuffer: ib_gpu,
-                            VertexBuffer: D3D12_GPU_VIRTUAL_ADDRESS_AND_STRIDE {
-                                StartAddress: vb_gpu,
-                                StrideInBytes: vb_stride,
-                            },
-                        },
-                    },
-                });
-            }
-            GeometryKind::Aabbs {
-                aabb_count,
-                aabbs_va,
-                aabbs_stride,
-            } => {
-                let (ab_gpu, cnt) = if aabbs_va != 0 && aabb_count > 0 && aabbs_stride % 8 == 0 {
-                    let stride = aabbs_stride.max(24);
-                    let len = aabb_count
-                        .saturating_sub(1)
-                        .saturating_mul(stride)
-                        .saturating_add(24);
-                    match crate::shadow::find(aabbs_va, len) {
-                        Some(s) if s.left(aabbs_va) >= len => {
-                            let gpu = s.gpu(aabbs_va);
-                            if gpu % 8 == 0 {
-                                sub.kept_shadows.push(s);
-                                (gpu, aabb_count)
-                            } else {
-                                (0, 0)
-                            }
-                        }
-                        _ => (0, 0),
-                    }
-                } else {
-                    (0, 0)
-                };
-                host_geoms.push(D3D12_RAYTRACING_GEOMETRY_DESC {
-                    Type: D3D12_RAYTRACING_GEOMETRY_TYPE_PROCEDURAL_PRIMITIVE_AABBS,
-                    Flags: dynamic_geom_flags(g.flags),
-                    Anonymous: D3D12_RAYTRACING_GEOMETRY_DESC_0 {
-                        AABBs: D3D12_RAYTRACING_GEOMETRY_AABBS_DESC {
-                            AABBCount: cnt,
-                            AABBs: D3D12_GPU_VIRTUAL_ADDRESS_AND_STRIDE {
-                                StartAddress: ab_gpu,
-                                StrideInBytes: if cnt > 0 { aabbs_stride } else { 0 },
-                            },
-                        },
-                    },
-                });
-            }
-        }
-    }
-
     const PERFORM_UPDATE: u32 = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE.0 as u32;
+    const ALLOW_COMPACTION: u32 =
+        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_COMPACTION.0 as u32;
 
-    let topo_hash = blas_topology_hash(&host_geoms);
-    let src_key = source_va & !0xFF;
+    let pairs: Vec<(u64, u64)> = blas_ops
+        .iter()
+        .map(|op| match *op {
+            DxrOp::BuildBlas {
+                dest_va, source_va, ..
+            } => (dest_va & !0xFF, source_va & !0xFF),
+            _ => (0, 0),
+        })
+        .collect();
+
+    let refit_on = refit_dynamic_blas();
+    let period = refit_period();
+    let n_pass = normals_gpu.and_then(|_| build_normals_pass(host));
+    let mut any_recorded = false;
+
+    struct ResolvedBlas<'a> {
+        key: u64,
+        source_va: u64,
+        raw_flags: u32,
+        postbuild: &'a [PostbuildSpec],
+        host_geoms: Vec<D3D12_RAYTRACING_GEOMETRY_DESC>,
+        geom_tris: Vec<u32>,
+        total_tris: u32,
+        topo_hash: u64,
+        geom_va_hash: u64,
+        any_gpu_written: bool,
+        any_transform: bool,
+    }
+
+    struct PlannedBlas {
+        key: u64,
+        host_geoms: Vec<D3D12_RAYTRACING_GEOMETRY_DESC>,
+        geom_tris: Vec<u32>,
+        flags: u32,
+        host_dst_va: u64,
+        host_src_va: u64,
+        scratch_need: u64,
+        dst_gen: u64,
+        dst_slice_size: u64,
+        is_refit: bool,
+        host_postbuild: Vec<D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC>,
+        ng_off: u32,
+        nd_off: u32,
+        normals_newly_allocated: bool,
+        need_normals_dispatch: bool,
+    }
+
     let to_refit_info = |e: &HostAs| -> Option<ExistingBlasRefitInfo> {
         (e.kind == AsKind::Blas).then_some(ExistingBlasRefitInfo {
             gpu_va: e.gpu_va,
@@ -4892,276 +6187,717 @@ unsafe fn record_build_blas(
             consecutive_refits: e.consecutive_refits,
         })
     };
-    let (existing_dst, existing_src) = {
-        let map = as_map().read().unwrap_or_else(|e| e.into_inner());
-        let dst = map.get(&key).and_then(to_refit_info);
-        let src = if src_key != 0 && src_key != key {
-            map.get(&src_key).and_then(to_refit_info)
-        } else {
-            None
-        };
-        (dst, src)
-    };
-    let decision = decide_blas_refit(
-        raw_flags,
-        key,
-        source_va,
-        topo_hash,
-        existing_dst,
-        existing_src,
-        refit_dynamic_blas(),
-        refit_period(),
-    );
-    let flags = decision.flags;
-    let host_src_va = decision.host_src_va;
 
-    let inputs = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
-        Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL,
-        Flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAGS(flags as i32),
-        NumDescs: host_geoms.len() as u32,
-        DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
-        Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
-            pGeometryDescs: host_geoms.as_ptr(),
-        },
-    };
-
-    let (host_dst_va, scratch_need) = if let Some((gpu_va, update_scratch)) = decision.in_place_update {
-        (gpu_va, update_scratch.max(AS_ALIGN))
-    } else {
-        let (result_bytes, scratch_bytes, update_scratch_bytes) =
-            if let Some(&cached) = state.prebuild_cache.get(&(flags, topo_hash)) {
-                cached
-            } else {
-                let mut pre = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO::default();
-                // SAFETY: valid device5 and geometry array alive through call.
-                unsafe { device5.GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &mut pre) };
-                let entry = (
-                    pre.ResultDataMaxSizeInBytes,
-                    pre.ScratchDataSizeInBytes,
-                    pre.UpdateScratchDataSizeInBytes,
-                );
-                if entry.0 > 0 {
-                    if state.prebuild_cache.len() >= MAX_PREBUILD_CACHE {
-                        state.prebuild_cache.clear();
-                    }
-                    state.prebuild_cache.insert((flags, topo_hash), entry);
-                }
-                entry
+    for range in plan_blas_sub_batches(&pairs) {
+        let slice = &blas_ops[range];
+        // Phase 1: Resolve shadow geometry buffers & fingerprints outside `AS_MAP` lock.
+        let mut resolved: Vec<ResolvedBlas<'_>> = Vec::with_capacity(slice.len());
+        for op in slice {
+            let DxrOp::BuildBlas {
+                dest_va,
+                source_va,
+                flags: raw_flags,
+                geometries,
+                postbuild,
+            } = op
+            else {
+                continue;
             };
-        if result_bytes == 0 {
-            STATS[STAT_SKIPPED].fetch_add(1, Ordering::Relaxed);
-            return false;
-        }
-        let Some(host_dst) = allocate_or_reuse_as(
-            host,
-            state,
-            key,
-            AsKind::Blas,
-            result_bytes,
-            flags,
-            0,
-            topo_hash,
-            update_scratch_bytes,
-            decision.next_consecutive_refits,
-        ) else {
-            STATS[STAT_SKIPPED].fetch_add(1, Ordering::Relaxed);
-            return false;
-        };
-        let scratch_need = if flags & PERFORM_UPDATE != 0 {
-            update_scratch_bytes.max(AS_ALIGN)
-        } else {
-            scratch_bytes.max(AS_ALIGN)
-        };
-        (host_dst.gpu_va, scratch_need)
-    };
-    let Some((scratch_buf, scratch_gpu, scratch_cap)) = sub.ensure_scratch(host, scratch_need) else {
-        STATS[STAT_SKIPPED].fetch_add(1, Ordering::Relaxed);
-        return false;
-    };
-    let scratch_id = scratch_buf.as_raw() as usize;
-    let (need_barrier, scratch_off) =
-        scratch_batch.alloc(scratch_id, scratch_cap, scratch_need, host_dst_va, host_src_va);
-
-    let host_postbuild = translate_postbuild(sub, postbuild);
-    let desc = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC {
-        DestAccelerationStructureData: host_dst_va,
-        Inputs: inputs,
-        SourceAccelerationStructureData: host_src_va,
-        ScratchAccelerationStructureData: scratch_gpu + scratch_off,
-    };
-    // SAFETY: open list4; dest, src, scratch, geometry buffers and postbuild buffers live.
-    unsafe {
-        if need_barrier {
-            emit_as_build_barrier(list, list7);
-        }
-        list4.BuildRaytracingAccelerationStructure(
-            &desc,
-            (!host_postbuild.is_empty()).then_some(host_postbuild.as_slice()),
-        );
-    }
-    if decision.in_place_update.is_some() {
-        let mut map = as_map().write().unwrap_or_else(|e| e.into_inner());
-        if let Some(entry) = map.get_mut(&key) {
-            entry.flags = flags;
-            entry.consecutive_refits = decision.next_consecutive_refits;
-        }
-    }
-    // Populate/refresh octahedral geometric normals in `dxr_normals` for this dynamic BLAS.
-    let mut normals_geom_off = 0u32;
-    if let (Some((n_buf, n_gpu)), Some(n_pass)) = (normals_gpu, build_normals_pass(host)) {
-        let need_geoms = host_geoms.len() as u32;
-        let mut geom_tris: Vec<u32> = Vec::with_capacity(host_geoms.len());
-        let mut total_tris = 0u32;
-        for g in &host_geoms {
-            let tc = if g.Type == D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES {
-                // SAFETY: `Type == TRIANGLES`.
-                let t = unsafe { g.Anonymous.Triangles };
-                if t.VertexBuffer.StartAddress == 0 || t.VertexCount == 0 {
-                    0
-                } else if t.IndexBuffer != 0 && t.IndexCount >= 3 {
-                    t.IndexCount / 3
-                } else {
-                    t.VertexCount / 3
-                }
-            } else {
-                0
-            };
-            geom_tris.push(tc);
-            total_tris = total_tris.saturating_add(tc);
-        }
-        let (ng_off, nd_off) = {
-            let mut map = as_map().write().unwrap_or_else(|e| e.into_inner());
-            if let Some(entry) = map.get_mut(&key) {
-                if entry.normals_geom_off != 0
-                    && entry.normals_geom_len == need_geoms
-                    && entry.normals_data_len == total_tris
-                {
-                    (entry.normals_geom_off, entry.normals_data_off)
-                } else {
-                    let rel_sub = state.sub_seq.saturating_add(2);
-                    let rel_ep = state.tlas_build_epoch.saturating_add(2);
-                    if entry.normals_geom_len > 0 {
-                        state
-                            .geom_pool
-                            .retire(entry.normals_geom_off, entry.normals_geom_len, rel_ep, rel_sub);
-                        entry.normals_geom_off = 0;
-                        entry.normals_geom_len = 0;
-                    }
-                    if entry.normals_data_len > 0 {
-                        state
-                            .data_pool
-                            .retire(entry.normals_data_off, entry.normals_data_len, rel_ep, rel_sub);
-                        entry.normals_data_off = 0;
-                        entry.normals_data_len = 0;
-                    }
-                    if need_geoms > 0
-                        && total_tris > 0
-                        && let (Some(go), Some(doff)) =
-                            (state.geom_pool.alloc(need_geoms), state.data_pool.alloc(total_tris))
-                    {
-                        entry.normals_geom_off = go;
-                        entry.normals_geom_len = need_geoms;
-                        entry.normals_data_off = doff;
-                        entry.normals_data_len = total_tris;
-                        (go, doff)
-                    } else {
-                        (0, 0)
-                    }
-                }
-            } else {
-                (0, 0)
+            let key = *dest_va & !0xFF;
+            if key == 0 || geometries.is_empty() {
+                STATS[STAT_SKIPPED].fetch_add(1, Ordering::Relaxed);
+                continue;
             }
+            let mut host_geoms = Vec::with_capacity(geometries.len());
+            let mut geom_tris = Vec::with_capacity(geometries.len());
+            let mut total_tris = 0u32;
+            let mut any_gpu_written = false;
+            let mut any_transform = false;
+            for g in geometries {
+                match g.kind {
+                    GeometryKind::Triangles {
+                        transform3x4,
+                        index_format,
+                        vertex_format,
+                        index_count,
+                        vertex_count,
+                        index_buffer,
+                        vertex_buffer_va,
+                        vertex_buffer_stride,
+                    } => {
+                        let pc_vtx_fmt = crate::resource::pc_format(vertex_format);
+                        let (vtx_align, vtx_min_bytes, vtx_fmt_ok) = match DXGI_FORMAT(pc_vtx_fmt as i32) {
+                            DXGI_FORMAT_R32G32B32_FLOAT => (4u64, 12u64, true),
+                            DXGI_FORMAT_R32G32_FLOAT => (4, 8, true),
+                            DXGI_FORMAT_R16G16B16A16_FLOAT | DXGI_FORMAT_R16G16B16A16_SNORM => (2, 8, true),
+                            DXGI_FORMAT_R16G16_FLOAT | DXGI_FORMAT_R16G16_SNORM => (2, 4, true),
+                            _ => (4, 12, false),
+                        };
+                        let (vb_gpu, vc, vb_stride) = if vtx_fmt_ok
+                            && vertex_buffer_va != 0
+                            && vertex_count > 0
+                            && vertex_buffer_stride % vtx_align == 0
+                        {
+                            let stride = vertex_buffer_stride.max(vtx_min_bytes);
+                            let len = u64::from(vertex_count)
+                                .saturating_sub(1)
+                                .saturating_mul(stride)
+                                .saturating_add(vtx_min_bytes);
+                            match crate::shadow::find(vertex_buffer_va, len) {
+                                Some(s) if s.left(vertex_buffer_va) >= len => {
+                                    let gpu = s.gpu(vertex_buffer_va);
+                                    if gpu % vtx_align == 0 {
+                                        if s.written() || s.gpu_only_skip() {
+                                            any_gpu_written = true;
+                                        }
+                                        sub.kept_shadows.push(s);
+                                        (gpu, vertex_count, vertex_buffer_stride)
+                                    } else {
+                                        (0, 0, 0)
+                                    }
+                                }
+                                _ => (0, 0, 0),
+                            }
+                        } else {
+                            (0, 0, 0)
+                        };
+                        let pc_idx_fmt = crate::resource::pc_format(index_format);
+                        let (ib_gpu, ic, idx_fmt) = if index_buffer != 0 && index_count >= 3 && vc > 0 {
+                            let elem = match DXGI_FORMAT(pc_idx_fmt as i32) {
+                                DXGI_FORMAT_R16_UINT => Some(2u64),
+                                DXGI_FORMAT_R32_UINT => Some(4u64),
+                                _ => None,
+                            };
+                            let aligned_ic = index_count - (index_count % 3);
+                            if let Some(elem) = elem {
+                                let len = u64::from(aligned_ic).saturating_mul(elem);
+                                match crate::shadow::find(index_buffer, len) {
+                                    Some(s) if s.left(index_buffer) >= len => {
+                                        let gpu = s.gpu(index_buffer);
+                                        if gpu % elem == 0 {
+                                            if s.written() || s.gpu_only_skip() {
+                                                any_gpu_written = true;
+                                            }
+                                            sub.kept_shadows.push(s);
+                                            (gpu, aligned_ic, DXGI_FORMAT(pc_idx_fmt as i32))
+                                        } else {
+                                            (0, 0, DXGI_FORMAT_UNKNOWN)
+                                        }
+                                    }
+                                    _ => (0, 0, DXGI_FORMAT_UNKNOWN),
+                                }
+                            } else {
+                                (0, 0, DXGI_FORMAT_UNKNOWN)
+                            }
+                        } else {
+                            (0, 0, DXGI_FORMAT_UNKNOWN)
+                        };
+                        let (vb_gpu, vc, vb_stride) = if index_buffer != 0 && index_count > 0 && ib_gpu == 0 {
+                            (0, 0, 0)
+                        } else if ib_gpu == 0 {
+                            let aligned_vc = vc - (vc % 3);
+                            if aligned_vc == 0 {
+                                (0, 0, 0)
+                            } else {
+                                (vb_gpu, aligned_vc, vb_stride)
+                            }
+                        } else {
+                            (vb_gpu, vc, vb_stride)
+                        };
+                        let xf_gpu = if transform3x4 != 0 && vc > 0 {
+                            match crate::shadow::find(transform3x4, 48) {
+                                Some(s) if s.left(transform3x4) >= 48 => {
+                                    let gpu = s.gpu(transform3x4);
+                                    if gpu % 16 == 0 {
+                                        any_transform = true;
+                                        sub.kept_shadows.push(s);
+                                        gpu
+                                    } else {
+                                        0
+                                    }
+                                }
+                                _ => 0,
+                            }
+                        } else {
+                            0
+                        };
+                        let host_vtx_fmt = if vtx_fmt_ok {
+                            DXGI_FORMAT(pc_vtx_fmt as i32)
+                        } else {
+                            DXGI_FORMAT_R32G32B32_FLOAT
+                        };
+                        let tc = if vb_gpu == 0 || vc == 0 {
+                            0
+                        } else if ib_gpu != 0 && ic >= 3 {
+                            ic / 3
+                        } else {
+                            vc / 3
+                        };
+                        geom_tris.push(tc);
+                        total_tris = total_tris.saturating_add(tc);
+                        host_geoms.push(D3D12_RAYTRACING_GEOMETRY_DESC {
+                            Type: D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES,
+                            Flags: dynamic_geom_flags(g.flags),
+                            Anonymous: D3D12_RAYTRACING_GEOMETRY_DESC_0 {
+                                Triangles: D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC {
+                                    Transform3x4: xf_gpu,
+                                    IndexFormat: idx_fmt,
+                                    VertexFormat: host_vtx_fmt,
+                                    IndexCount: ic,
+                                    VertexCount: vc,
+                                    IndexBuffer: ib_gpu,
+                                    VertexBuffer: D3D12_GPU_VIRTUAL_ADDRESS_AND_STRIDE {
+                                        StartAddress: vb_gpu,
+                                        StrideInBytes: vb_stride,
+                                    },
+                                },
+                            },
+                        });
+                    }
+                    GeometryKind::Aabbs {
+                        aabb_count,
+                        aabbs_va,
+                        aabbs_stride,
+                    } => {
+                        let (ab_gpu, cnt) = if aabbs_va != 0 && aabb_count > 0 && aabbs_stride % 8 == 0 {
+                            let stride = aabbs_stride.max(24);
+                            let len = aabb_count
+                                .saturating_sub(1)
+                                .saturating_mul(stride)
+                                .saturating_add(24);
+                            match crate::shadow::find(aabbs_va, len) {
+                                Some(s) if s.left(aabbs_va) >= len => {
+                                    let gpu = s.gpu(aabbs_va);
+                                    if gpu % 8 == 0 {
+                                        sub.kept_shadows.push(s);
+                                        (gpu, aabb_count)
+                                    } else {
+                                        (0, 0)
+                                    }
+                                }
+                                _ => (0, 0),
+                            }
+                        } else {
+                            (0, 0)
+                        };
+                        geom_tris.push(0);
+                        host_geoms.push(D3D12_RAYTRACING_GEOMETRY_DESC {
+                            Type: D3D12_RAYTRACING_GEOMETRY_TYPE_PROCEDURAL_PRIMITIVE_AABBS,
+                            Flags: dynamic_geom_flags(g.flags),
+                            Anonymous: D3D12_RAYTRACING_GEOMETRY_DESC_0 {
+                                AABBs: D3D12_RAYTRACING_GEOMETRY_AABBS_DESC {
+                                    AABBCount: cnt,
+                                    AABBs: D3D12_GPU_VIRTUAL_ADDRESS_AND_STRIDE {
+                                        StartAddress: ab_gpu,
+                                        StrideInBytes: if cnt > 0 { aabbs_stride } else { 0 },
+                                    },
+                                },
+                            },
+                        });
+                    }
+                }
+            }
+            let topo_hash = blas_topology_hash(&host_geoms);
+            let geom_va_hash = blas_geom_va_hash(&host_geoms);
+            resolved.push(ResolvedBlas {
+                key,
+                source_va: *source_va,
+                raw_flags: *raw_flags,
+                postbuild,
+                host_geoms,
+                geom_tris,
+                total_tris,
+                topo_hash,
+                geom_va_hash,
+                any_gpu_written,
+                any_transform,
+            });
+        }
+
+        if resolved.is_empty() {
+            continue;
+        }
+
+        // Phase 2: Acquire `AS_MAP` write lock ONCE for the entire sub-batch (instead of 3×/BLAS!).
+        let mut planned: Vec<PlannedBlas> = Vec::with_capacity(resolved.len());
+        let mut max_scratch = AS_ALIGN;
+        let mut sum_scratch = 0u64;
+        let mut any_normals_work = false;
+        let cur_epoch = state.tlas_build_epoch;
+        {
+            let mut map = as_map().write().unwrap_or_else(|e| e.into_inner());
+            for item in resolved {
+                let src_key = item.source_va & !0xFF;
+                let existing_dst = map.get(&item.key).and_then(to_refit_info);
+                let existing_src = if src_key != 0 && src_key != item.key {
+                    map.get(&src_key).and_then(to_refit_info)
+                } else {
+                    None
+                };
+                let decision = decide_blas_refit(
+                    item.raw_flags,
+                    item.key,
+                    item.source_va,
+                    item.topo_hash,
+                    existing_dst,
+                    existing_src,
+                    refit_on,
+                    period,
+                );
+                let flags = decision.flags;
+                let host_src_va = decision.host_src_va;
+
+                let (host_dst_va, scratch_need, dst_gen, dst_slice_size) =
+                    if let Some((gpu_va, update_scratch)) = decision.in_place_update {
+                        (gpu_va, update_scratch.max(AS_ALIGN), 0u64, 0u64)
+                    } else {
+                        let (result_bytes, scratch_bytes, update_scratch_bytes) =
+                            if let Some(&cached) = state.prebuild_cache.get(&(flags, item.topo_hash)) {
+                                cached
+                            } else {
+                                let inputs = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
+                                    Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL,
+                                    Flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAGS(flags as i32),
+                                    NumDescs: item.host_geoms.len() as u32,
+                                    DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
+                                    Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
+                                        pGeometryDescs: item.host_geoms.as_ptr(),
+                                    },
+                                };
+                                let mut pre = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO::default();
+                                // SAFETY: valid device5 and geometry array alive through call.
+                                unsafe { device5.GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &mut pre) };
+                                let entry = (
+                                    pre.ResultDataMaxSizeInBytes,
+                                    pre.ScratchDataSizeInBytes,
+                                    pre.UpdateScratchDataSizeInBytes,
+                                );
+                                if entry.0 > 0 {
+                                    if state.prebuild_cache.len() >= MAX_PREBUILD_CACHE {
+                                        state.prebuild_cache.clear();
+                                    }
+                                    state.prebuild_cache.insert((flags, item.topo_hash), entry);
+                                }
+                                entry
+                            };
+                        if result_bytes == 0 {
+                            STATS[STAT_SKIPPED].fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                        let generation = state.bump_gen();
+                        let allocated = if let Some(existing) = map.get_mut(&item.key)
+                            && existing.kind == AsKind::Blas
+                            && existing.slice.tier == SlabTier::TransientDynamicTlas
+                            && existing.slice.size >= result_bytes
+                        {
+                            existing.flags = flags;
+                            existing.num_instances = 0;
+                            existing.built = true;
+                            existing.generation = generation;
+                            existing.topo_hash = item.topo_hash;
+                            existing.update_scratch_bytes = update_scratch_bytes;
+                            existing.consecutive_refits = decision.next_consecutive_refits;
+                            existing.compacted_size = 0;
+                            existing.last_seen_tlas_epoch.store(cur_epoch, Ordering::Relaxed);
+                            Some((existing.gpu_va, generation, existing.slice.size))
+                        } else if let Some((buffer, slice, gpu_va)) =
+                            state.slabs.alloc(host, SlabTier::TransientDynamicTlas, result_bytes)
+                        {
+                            let slice_size = slice.size;
+                            let entry = HostAs {
+                                buffer,
+                                slice,
+                                gpu_va,
+                                mirror_tlas: None,
+                                kind: AsKind::Blas,
+                                flags,
+                                num_instances: 0,
+                                built: true,
+                                generation,
+                                topo_hash: item.topo_hash,
+                                update_scratch_bytes,
+                                consecutive_refits: decision.next_consecutive_refits,
+                                compacted_size: 0,
+                                last_seen_tlas_epoch: AtomicU64::new(cur_epoch),
+                                geom_va_hash: 0,
+                                normals_geom_off: 0,
+                                normals_geom_len: 0,
+                                normals_data_off: 0,
+                                normals_data_len: 0,
+                            };
+                            if let Some(old) = map.insert(item.key, entry) {
+                                state.retire_as(&old);
+                            }
+                            Some((gpu_va, generation, slice_size))
+                        } else {
+                            None
+                        };
+                        let Some((gpu_va, alloc_gen, slice_size)) = allocated else {
+                            STATS[STAT_SKIPPED].fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        };
+                        let scratch_need = if flags & PERFORM_UPDATE != 0 {
+                            update_scratch_bytes.max(AS_ALIGN)
+                        } else {
+                            scratch_bytes.max(AS_ALIGN)
+                        };
+                        (gpu_va, scratch_need, alloc_gen, slice_size)
+                    };
+
+                // Update in-place refit metadata and allocate/reuse `dxr_normals` under this same lock.
+                let need_geoms = item.host_geoms.len() as u32;
+                let (ng_off, nd_off, normals_newly_allocated, same_geom_va_hash) =
+                    if let Some(entry) = map.get_mut(&item.key) {
+                        if decision.in_place_update.is_some() {
+                            entry.flags = flags;
+                            entry.consecutive_refits = decision.next_consecutive_refits;
+                            entry.last_seen_tlas_epoch.store(cur_epoch, Ordering::Relaxed);
+                        }
+                        let prev_va_hash = entry.geom_va_hash;
+                        entry.geom_va_hash = item.geom_va_hash;
+                        let same_va = prev_va_hash != 0 && prev_va_hash == item.geom_va_hash;
+                        if n_pass.is_some() {
+                            if entry.normals_geom_off != 0
+                                && entry.normals_geom_len == need_geoms
+                                && entry.normals_data_len == item.total_tris
+                            {
+                                (entry.normals_geom_off, entry.normals_data_off, false, same_va)
+                            } else {
+                                let rel_sub = state.sub_seq.saturating_add(2);
+                                let rel_ep = state.tlas_build_epoch.saturating_add(2);
+                                let rel_dxr = retire_dxr_fence_target();
+                                if entry.normals_geom_len > 0 {
+                                    state.geom_pool.retire(
+                                        entry.normals_geom_off,
+                                        entry.normals_geom_len,
+                                        rel_ep,
+                                        rel_sub,
+                                        rel_dxr,
+                                    );
+                                    entry.normals_geom_off = 0;
+                                    entry.normals_geom_len = 0;
+                                }
+                                if entry.normals_data_len > 0 {
+                                    state.data_pool.retire(
+                                        entry.normals_data_off,
+                                        entry.normals_data_len,
+                                        rel_ep,
+                                        rel_sub,
+                                        rel_dxr,
+                                    );
+                                    entry.normals_data_off = 0;
+                                    entry.normals_data_len = 0;
+                                }
+                                if need_geoms > 0
+                                    && item.total_tris > 0
+                                    && let (Some(go), Some(doff)) = (
+                                        state.geom_pool.alloc(need_geoms),
+                                        state.data_pool.alloc(item.total_tris),
+                                    )
+                                {
+                                    entry.normals_geom_off = go;
+                                    entry.normals_geom_len = need_geoms;
+                                    entry.normals_data_off = doff;
+                                    entry.normals_data_len = item.total_tris;
+                                    (go, doff, true, false)
+                                } else {
+                                    (0, 0, false, same_va)
+                                }
+                            }
+                        } else {
+                            (0, 0, false, same_va)
+                        }
+                    } else {
+                        (0, 0, false, false)
+                    };
+
+                // Skip redundant `BUILD_NORMALS` only when refitting an unskinned, transform-free
+                // dynamic BLAS whose normals table and VB/IB VAs are completely unchanged.
+                let can_skip_normals = decision.is_refit
+                    && !normals_newly_allocated
+                    && !item.any_gpu_written
+                    && !item.any_transform
+                    && same_geom_va_hash;
+                let need_normals_dispatch = ng_off != 0 && nd_off != 0 && !can_skip_normals;
+                if need_normals_dispatch {
+                    any_normals_work = true;
+                }
+                state.insert_blas_hash(item.key, host_dst_va, ng_off);
+
+                let host_postbuild = translate_postbuild(sub, item.postbuild);
+                let aligned_scratch = scratch_need.max(AS_ALIGN).next_multiple_of(AS_ALIGN);
+                max_scratch = max_scratch.max(aligned_scratch);
+                sum_scratch = sum_scratch.saturating_add(aligned_scratch);
+                planned.push(PlannedBlas {
+                    key: item.key,
+                    host_geoms: item.host_geoms,
+                    geom_tris: item.geom_tris,
+                    flags,
+                    host_dst_va,
+                    host_src_va,
+                    scratch_need: aligned_scratch,
+                    dst_gen,
+                    dst_slice_size,
+                    is_refit: decision.is_refit,
+                    host_postbuild,
+                    ng_off,
+                    nd_off,
+                    normals_newly_allocated,
+                    need_normals_dispatch,
+                });
+            }
+        }
+
+        if planned.is_empty() {
+            continue;
+        }
+
+        let want_scratch = sum_scratch.min(MAX_POOLED_SCRATCH_BYTES).max(max_scratch);
+        let Some((scratch_buf, scratch_gpu, scratch_cap)) = sub.ensure_scratch(host, want_scratch) else {
+            STATS[STAT_SKIPPED].fetch_add(planned.len() as u64, Ordering::Relaxed);
+            continue;
         };
-        if ng_off != 0 && nd_off != 0 {
-            normals_geom_off = ng_off;
+        let scratch_id = scratch_buf.as_raw() as usize;
+
+        // Phase 3: Record ALL dynamic `BuildRaytracingAccelerationStructure` calls contiguously.
+        let mut refit_count = 0u64;
+        for item in &mut planned {
+            if (item.flags & ALLOW_COMPACTION) != 0
+                && (item.flags & PERFORM_UPDATE) == 0
+                && item.dst_gen != 0
+                && sub.compact_queries.len() < COMPACT_INFO_SLOTS
+                && let Some((uav_buf, uav_gpu, rb_buf)) = sub.ensure_compact_info(host)
+            {
+                if compact_uav_active.is_none() {
+                    // SAFETY: open list; transition compact UAV once per list (legacy fallback only).
+                    unsafe {
+                        emit_dxr_buffer_legacy_only(
+                            list,
+                            list7,
+                            &uav_buf,
+                            D3D12_RESOURCE_STATE_COMMON,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        );
+                    }
+                    *compact_uav_active = Some((uav_buf, rb_buf));
+                }
+                let slot = sub.compact_queries.len() as u32;
+                sub.compact_queries.push(CompactQueryRecord {
+                    guest_key: item.key,
+                    generation: item.dst_gen,
+                    uncompacted_size: item.dst_slice_size,
+                    slot,
+                    auto_compact: false,
+                });
+                item.host_postbuild.push(D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC {
+                    DestBuffer: uav_gpu + u64::from(slot) * 8,
+                    InfoType: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_COMPACTED_SIZE,
+                });
+            }
+
+            let (need_barrier, scratch_off) = scratch_batch.alloc(
+                scratch_id,
+                scratch_cap,
+                item.scratch_need,
+                item.host_dst_va,
+                item.host_src_va,
+            );
+            let inputs = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
+                Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL,
+                Flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAGS(item.flags as i32),
+                NumDescs: item.host_geoms.len() as u32,
+                DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
+                Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
+                    pGeometryDescs: item.host_geoms.as_ptr(),
+                },
+            };
+            let desc = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC {
+                DestAccelerationStructureData: item.host_dst_va,
+                Inputs: inputs,
+                SourceAccelerationStructureData: item.host_src_va,
+                ScratchAccelerationStructureData: scratch_gpu + scratch_off,
+            };
+            // SAFETY: open list4; dest, src, scratch, geometry buffers and postbuild buffers live.
+            unsafe {
+                if need_barrier {
+                    emit_as_build_barrier(list, list7, use_compute);
+                }
+                list4.BuildRaytracingAccelerationStructure(
+                    &desc,
+                    (!item.host_postbuild.is_empty()).then_some(item.host_postbuild.as_slice()),
+                );
+            }
+            if item.is_refit {
+                refit_count += 1;
+            }
+        }
+
+        // Phase 4: Emit 1 `BUILD_AS -> COMPUTE` barrier, then bind `BUILD_NORMALS_HLSL` ONCE
+        // for all dirty dynamic BLASes in this batch (`ARCH-14`).
+        if any_normals_work
+            && let (Some((n_buf, n_gpu)), Some(n_pass)) = (normals_gpu, n_pass)
+        {
             // SAFETY: open list; all shadow VB/IB/XF buffers are kept alive in `sub.kept_shadows`.
             unsafe {
+                emit_blas_to_compute_barrier(list, list7, use_compute);
                 if *normals_state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS {
-                    if *normals_state != D3D12_RESOURCE_STATE_COMMON {
-                        list.ResourceBarrier(&[transition(
+                    if *normals_state == D3D12_RESOURCE_STATE_COPY_DEST {
+                        emit_dxr_buffer_barrier(
+                            list,
+                            list7,
+                            n_buf,
+                            D3D12_BARRIER_SYNC_COPY,
+                            D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+                            D3D12_BARRIER_ACCESS_COPY_DEST,
+                            D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+                            *normals_state,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            use_compute,
+                        );
+                    } else if *normals_state != D3D12_RESOURCE_STATE_COMMON {
+                        emit_dxr_buffer_legacy_only(
+                            list,
+                            list7,
                             n_buf,
                             *normals_state,
                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                        )]);
+                        );
                     }
                     *normals_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
                 }
                 list.SetComputeRootSignature(&n_pass.root);
                 list.SetPipelineState(&n_pass.pso);
                 list.SetComputeRootUnorderedAccessView(4, *n_gpu);
-                let fallback_srv = host_geoms
-                    .iter()
-                    .find_map(|g| {
-                        (g.Type == D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES).then(|| {
-                            // SAFETY: `Type == TRIANGLES`.
-                            let va = g.Anonymous.Triangles.VertexBuffer.StartAddress & !3;
-                            (va != 0).then_some(va)
-                        })?
-                    })
-                    .unwrap_or(0);
-                let mut tri_cursor = 0u32;
-                for (g_idx, (g, &tc)) in host_geoms.iter().zip(&geom_tris).enumerate() {
-                    let geom_entry_word = ng_off + g_idx as u32;
-                    let prim_data_off = if tc > 0 { nd_off + tri_cursor } else { 0 };
-                    tri_cursor = tri_cursor.saturating_add(tc);
-                    if g.Type == D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES && tc > 0 {
-                        let t = g.Anonymous.Triangles;
-                        let vb_fmt = match t.VertexFormat {
-                            DXGI_FORMAT_R32G32B32_FLOAT => 0u32,
-                            DXGI_FORMAT_R32G32_FLOAT => 1,
-                            DXGI_FORMAT_R16G16B16A16_FLOAT => 2,
-                            DXGI_FORMAT_R16G16B16A16_SNORM => 3,
-                            DXGI_FORMAT_R16G16_FLOAT => 4,
-                            DXGI_FORMAT_R16G16_SNORM => 5,
-                            _ => 0,
-                        };
-                        let ib_mode = match t.IndexFormat {
-                            DXGI_FORMAT_R16_UINT if t.IndexBuffer != 0 => 1u32,
-                            DXGI_FORMAT_R32_UINT if t.IndexBuffer != 0 => 2,
-                            _ => 0,
-                        };
-                        let vb_base = t.VertexBuffer.StartAddress & !3;
-                        let vb_bias = (t.VertexBuffer.StartAddress & 3) as u32;
-                        let ib_base = if ib_mode != 0 { t.IndexBuffer & !3 } else { vb_base };
-                        let ib_bias = if ib_mode != 0 { (t.IndexBuffer & 3) as u32 } else { 0 };
-                        let xf_base = if t.Transform3x4 != 0 { t.Transform3x4 } else { vb_base };
-                        let has_xf = u32::from(t.Transform3x4 != 0);
-                        let constants = [
-                            tc,
-                            t.VertexBuffer.StrideInBytes as u32,
-                            vb_bias,
-                            vb_fmt,
-                            ib_mode,
-                            ib_bias,
-                            has_xf,
-                            geom_entry_word,
-                            prim_data_off,
-                            t.VertexCount,
-                        ];
-                        list.SetComputeRoot32BitConstants(0, 10, constants.as_ptr().cast(), 0);
-                        list.SetComputeRootShaderResourceView(1, vb_base);
-                        list.SetComputeRootShaderResourceView(2, ib_base);
-                        list.SetComputeRootShaderResourceView(3, xf_base);
-                        list.Dispatch(tc.div_ceil(64), 1, 1);
-                    } else if fallback_srv != 0 {
-                        // Still write 0 into Region 1 slot for empty/AABB geometry using a valid SRV VA.
-                        let constants = [0u32, 0, 0, 0, 0, 0, 0, geom_entry_word, 0, 0];
-                        list.SetComputeRoot32BitConstants(0, 10, constants.as_ptr().cast(), 0);
-                        list.SetComputeRootShaderResourceView(1, fallback_srv);
-                        list.SetComputeRootShaderResourceView(2, fallback_srv);
-                        list.SetComputeRootShaderResourceView(3, fallback_srv);
-                        list.Dispatch(1, 1, 1);
+
+                let mut last_vb = 0u64;
+                let mut last_ib = 0u64;
+                let mut last_xf = 0u64;
+                for item in &planned {
+                    if !item.need_normals_dispatch {
+                        continue;
+                    }
+                    let fallback_srv = item
+                        .host_geoms
+                        .iter()
+                        .find_map(|g| {
+                            (g.Type == D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES).then(|| {
+                                // SAFETY: `Type == TRIANGLES`.
+                                let va = g.Anonymous.Triangles.VertexBuffer.StartAddress & !3;
+                                (va != 0).then_some(va)
+                            })?
+                        })
+                        .unwrap_or(0);
+                    let mut tri_cursor = 0u32;
+                    for (g_idx, (g, &tc)) in item.host_geoms.iter().zip(&item.geom_tris).enumerate() {
+                        let geom_entry_word = item.ng_off + g_idx as u32;
+                        let prim_data_off = if tc > 0 { item.nd_off + tri_cursor } else { 0 };
+                        tri_cursor = tri_cursor.saturating_add(tc);
+                        if g.Type == D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES && tc > 0 {
+                            let t = g.Anonymous.Triangles;
+                            let vb_fmt = match t.VertexFormat {
+                                DXGI_FORMAT_R32G32B32_FLOAT => 0u32,
+                                DXGI_FORMAT_R32G32_FLOAT => 1,
+                                DXGI_FORMAT_R16G16B16A16_FLOAT => 2,
+                                DXGI_FORMAT_R16G16B16A16_SNORM => 3,
+                                DXGI_FORMAT_R16G16_FLOAT => 4,
+                                DXGI_FORMAT_R16G16_SNORM => 5,
+                                _ => 0,
+                            };
+                            let ib_mode = match t.IndexFormat {
+                                DXGI_FORMAT_R16_UINT if t.IndexBuffer != 0 => 1u32,
+                                DXGI_FORMAT_R32_UINT if t.IndexBuffer != 0 => 2,
+                                _ => 0,
+                            };
+                            let vb_base = t.VertexBuffer.StartAddress & !3;
+                            let vb_bias = (t.VertexBuffer.StartAddress & 3) as u32;
+                            let ib_base = if ib_mode != 0 { t.IndexBuffer & !3 } else { vb_base };
+                            let ib_bias = if ib_mode != 0 { (t.IndexBuffer & 3) as u32 } else { 0 };
+                            let xf_base = if t.Transform3x4 != 0 { t.Transform3x4 } else { vb_base };
+                            let has_xf = u32::from(t.Transform3x4 != 0);
+                            let constants = [
+                                tc,
+                                t.VertexBuffer.StrideInBytes as u32,
+                                vb_bias,
+                                vb_fmt,
+                                ib_mode,
+                                ib_bias,
+                                has_xf,
+                                geom_entry_word,
+                                prim_data_off,
+                                t.VertexCount,
+                            ];
+                            list.SetComputeRoot32BitConstants(0, 10, constants.as_ptr().cast(), 0);
+                            if vb_base != last_vb {
+                                list.SetComputeRootShaderResourceView(1, vb_base);
+                                last_vb = vb_base;
+                            }
+                            if ib_base != last_ib {
+                                list.SetComputeRootShaderResourceView(2, ib_base);
+                                last_ib = ib_base;
+                            }
+                            if xf_base != last_xf {
+                                list.SetComputeRootShaderResourceView(3, xf_base);
+                                last_xf = xf_base;
+                            }
+                            list.Dispatch(tc.div_ceil(64), 1, 1);
+                        } else if item.normals_newly_allocated && fallback_srv != 0 {
+                            // Write 0 into Region 1 slot once for newly allocated empty/AABB geometry.
+                            let constants = [0u32, 0, 0, 0, 0, 0, 0, geom_entry_word, 0, 0];
+                            list.SetComputeRoot32BitConstants(0, 10, constants.as_ptr().cast(), 0);
+                            if fallback_srv != last_vb {
+                                list.SetComputeRootShaderResourceView(1, fallback_srv);
+                                last_vb = fallback_srv;
+                            }
+                            if fallback_srv != last_ib {
+                                list.SetComputeRootShaderResourceView(2, fallback_srv);
+                                last_ib = fallback_srv;
+                            }
+                            if fallback_srv != last_xf {
+                                list.SetComputeRootShaderResourceView(3, fallback_srv);
+                                last_xf = fallback_srv;
+                            }
+                            list.Dispatch(1, 1, 1);
+                        }
                     }
                 }
             }
         }
+
+        STATS[STAT_DYNAMIC_BLAS].fetch_add(planned.len() as u64, Ordering::Relaxed);
+        if refit_count > 0 {
+            STATS[STAT_BLAS_REFITS].fetch_add(refit_count, Ordering::Relaxed);
+        }
+        any_recorded = true;
     }
-    state.insert_blas_hash(key, host_dst_va, normals_geom_off);
-    STATS[STAT_DYNAMIC_BLAS].fetch_add(1, Ordering::Relaxed);
-    if decision.is_refit {
-        STATS[STAT_BLAS_REFITS].fetch_add(1, Ordering::Relaxed);
+
+    any_recorded
+}
+
+/// FNV-1a fingerprint of resolved dynamic BLAS vertex/index/transform GPU VAs & strides
+/// so unskinned refits with unchanged buffers can safely skip redundant `BUILD_NORMALS`.
+fn blas_geom_va_hash(geoms: &[D3D12_RAYTRACING_GEOMETRY_DESC]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut mix = |v: u64| {
+        h ^= v;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    };
+    mix(geoms.len() as u64);
+    for g in geoms {
+        if g.Type == D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES {
+            // SAFETY: `Type == TRIANGLES`.
+            let t = unsafe { g.Anonymous.Triangles };
+            mix(t.VertexBuffer.StartAddress);
+            mix(t.VertexBuffer.StrideInBytes);
+            mix(t.IndexBuffer);
+            mix(t.Transform3x4);
+        } else {
+            // SAFETY: `Type == PROCEDURAL_PRIMITIVE_AABBS`.
+            let a = unsafe { g.Anonymous.AABBs };
+            mix(a.AABBs.StartAddress);
+            mix(a.AABBs.StrideInBytes);
+        }
     }
-    true
+    if h == 0 { 1 } else { h }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5174,6 +6910,7 @@ unsafe fn record_copy_as(
     dest_va: u64,
     source_va: u64,
     mode: u32,
+    use_compute: bool,
 ) -> bool {
     let dst_key = dest_va & !0xFF;
     let src_key = source_va & !0xFF;
@@ -5185,6 +6922,7 @@ unsafe fn record_copy_as(
     struct CopyAsSrcMeta {
         gpu_va: u64,
         slice_size: u64,
+        compacted_size: u64,
         kind: AsKind,
         flags: u32,
         num_instances: u32,
@@ -5193,12 +6931,16 @@ unsafe fn record_copy_as(
         update_scratch_bytes: u64,
         consecutive_refits: u32,
         normals_geom_off: u32,
+        normals_geom_len: u32,
+        normals_data_off: u32,
+        normals_data_len: u32,
     }
     let src = {
         let map = as_map().read().unwrap_or_else(|e| e.into_inner());
         map.get(&src_key).map(|e| CopyAsSrcMeta {
             gpu_va: e.gpu_va,
             slice_size: e.slice.size,
+            compacted_size: e.compacted_size,
             kind: e.kind,
             flags: e.flags,
             num_instances: e.num_instances,
@@ -5207,6 +6949,9 @@ unsafe fn record_copy_as(
             update_scratch_bytes: e.update_scratch_bytes,
             consecutive_refits: e.consecutive_refits,
             normals_geom_off: e.normals_geom_off,
+            normals_geom_len: e.normals_geom_len,
+            normals_data_off: e.normals_data_off,
+            normals_data_len: e.normals_data_len,
         })
     };
     let Some(src) = src else {
@@ -5242,11 +6987,32 @@ unsafe fn record_copy_as(
         STATS[STAT_COPIES].fetch_add(1, Ordering::Relaxed);
         return true;
     }
-    let (dst_flags, dst_topo_hash, dst_update_scratch, dst_refits) = if is_clone {
-        (src.flags, src.topo_hash, src.update_scratch_bytes, src.consecutive_refits)
+    let (dst_flags, dst_topo_hash, dst_update_scratch, dst_refits, dst_size, dst_tier) = if is_clone {
+        (
+            src.flags,
+            src.topo_hash,
+            src.update_scratch_bytes,
+            src.consecutive_refits,
+            src.slice_size,
+            SlabTier::TransientDynamicTlas,
+        )
     } else {
         // Compacted copies cannot be compacted again or refitted with PERFORM_UPDATE.
-        (src.flags & !(ALLOW_COMPACTION | ALLOW_UPDATE), 0, 0, 0)
+        // Size destination to the read-back `compacted_size` when known and place it in
+        // the `StaticCompacted` 32 MiB slab tier (`ARCH-10`).
+        let sz = if src.compacted_size > 0 && src.compacted_size < src.slice_size {
+            src.compacted_size.max(AS_ALIGN).next_multiple_of(AS_ALIGN)
+        } else {
+            src.slice_size
+        };
+        (
+            src.flags & !(ALLOW_COMPACTION | ALLOW_UPDATE),
+            0,
+            0,
+            0,
+            sz,
+            SlabTier::StaticCompacted,
+        )
     };
     let Some(dst) = (if dst_key == src_key {
         allocate_fresh_as(
@@ -5254,7 +7020,8 @@ unsafe fn record_copy_as(
             state,
             dst_key,
             src.kind,
-            src.slice_size,
+            dst_tier,
+            dst_size,
             dst_flags,
             src.num_instances,
             dst_topo_hash,
@@ -5267,7 +7034,8 @@ unsafe fn record_copy_as(
             state,
             dst_key,
             src.kind,
-            src.slice_size,
+            dst_tier,
+            dst_size,
             dst_flags,
             src.num_instances,
             dst_topo_hash,
@@ -5281,7 +7049,33 @@ unsafe fn record_copy_as(
     // SAFETY: open list4; both AS buffers are in RAYTRACING_ACCELERATION_STRUCTURE state.
     unsafe {
         list4.CopyRaytracingAccelerationStructure(dst.gpu_va, src.gpu_va, host_mode);
-        emit_as_copy_barrier(list, list7);
+        emit_as_copy_barrier(list, list7, use_compute);
+    }
+    if !is_clone {
+        // Transfer normals table ownership to the compacted destination and retire transient
+        // uncompacted `src_key` strictly behind `tlas_build_epoch + 2 && sub_seq + 2` (`ARCH-10`).
+        let mut map = as_map().write().unwrap_or_else(|e| e.into_inner());
+        if let Some(dst_entry) = map.get_mut(&dst_key)
+            && dst_entry.normals_geom_len == 0
+            && src.normals_geom_len > 0
+        {
+            dst_entry.normals_geom_off = src.normals_geom_off;
+            dst_entry.normals_geom_len = src.normals_geom_len;
+            dst_entry.normals_data_off = src.normals_data_off;
+            dst_entry.normals_data_len = src.normals_data_len;
+        }
+        if dst_key != src_key
+            && let Some(mut old_src) = map.remove(&src_key)
+        {
+            if old_src.normals_geom_off == src.normals_geom_off {
+                old_src.normals_geom_len = 0;
+                old_src.normals_data_len = 0;
+            }
+            if old_src.kind == AsKind::Blas {
+                state.remove_blas_hash(src_key);
+            }
+            state.retire_as(&old_src);
+        }
     }
     if src.kind == AsKind::Blas {
         state.insert_blas_hash(dst_key, dst.gpu_va, src.normals_geom_off);
@@ -5306,6 +7100,7 @@ unsafe fn record_extract_static_blas(
     extract_in_srv: &mut bool,
     staging_in_copy_src: &mut Option<ID3D12Resource>,
     compact_uav_active: &mut Option<(ID3D12Resource, ID3D12Resource)>,
+    use_compute: bool,
 ) -> bool {
     let key = dest_va & !0xFF;
     if key == 0 {
@@ -5331,7 +7126,7 @@ unsafe fn record_extract_static_blas(
     };
 
     let vert_bytes = max_nodes.saturating_mul(72); // 2 tris × 3 verts × 12B float3
-    let prev_buf_raw = sub.extract_verts.as_ref().map(|(b, _)| b.as_raw());
+    let prev_buf_raw = sub.extract_verts.as_ref().map(|(b, _)| b.buf.as_raw());
     let Some((vert_buf, vert_gpu)) = sub.ensure_extract_verts(host, vert_bytes) else {
         STATS[STAT_SKIPPED].fetch_add(1, Ordering::Relaxed);
         return false;
@@ -5345,14 +7140,17 @@ unsafe fn record_extract_static_blas(
     // within 1–2 frames, so skip `ALLOW_COMPACTION` and postbuild queries on it.
     let dump_bytes = 16u64 + max_nodes.saturating_mul(64);
     let dump_setup = if sub.readback_used.saturating_add(dump_bytes) <= sub.readback_cap
-        && let Some((rb_buf, _)) = sub.node_readback.as_ref().map(|(b, sz)| (b.clone(), *sz))
+        && let Some((rb_buf, _)) = sub.node_readback.as_ref().map(|(b, sz, _)| (b.clone(), *sz))
         && let Some((staging_buf, staging_gpu)) = sub.ensure_node_staging(host, dump_bytes)
     {
         Some((staging_buf, staging_gpu, rb_buf))
     } else {
         None
     };
-    let want_compact = compact_static_blas() && dump_setup.is_none();
+    let can_requeue_readback = dump_setup.is_none()
+        && dump_bytes <= MAX_READBACK_BYTES_PER_SUB
+        && state.pending_readback_requeue.len() < MAX_PENDING_READBACK_REQUEUE;
+    let want_compact = compact_static_blas() && dump_setup.is_none() && !can_requeue_readback;
 
     let geom = D3D12_RAYTRACING_GEOMETRY_DESC {
         Type: D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES,
@@ -5395,6 +7193,7 @@ unsafe fn record_extract_static_blas(
         state,
         key,
         AsKind::Blas,
+        SlabTier::TransientDynamicTlas,
         pre.ResultDataMaxSizeInBytes,
         build_flags.0 as u32,
         0,
@@ -5412,8 +7211,9 @@ unsafe fn record_extract_static_blas(
     };
     let scratch_id = scratch_buf.as_raw() as usize;
 
-    // Reserve a slice of this submission's readback buffer for async multi-geometry upgrade.
-    let dump_copy = dump_setup.map(|(staging_buf, staging_gpu, rb_buf)| {
+    // Reserve a slice of this submission's readback buffer for async multi-geometry upgrade,
+    // or re-queue into `pending_readback_requeue` if this burst exceeded `MAX_READBACK_BYTES_PER_SUB`.
+    let dump_copy = if let Some((staging_buf, staging_gpu, rb_buf)) = dump_setup {
         let rb_off = sub.readback_used;
         sub.readback_used = rb_off.saturating_add(dump_bytes).next_multiple_of(64);
         sub.readbacks.push(StaticReadbackRecord {
@@ -5422,40 +7222,76 @@ unsafe fn record_extract_static_blas(
             offset: rb_off,
             len: dump_bytes,
         });
-        (staging_buf, staging_gpu, rb_buf, rb_off, dump_bytes)
-    });
+        crate::memory::pin_extracted(key, size_bytes);
+        sub.extracted_bvh4s.push((key, size_bytes));
+        Some((staging_buf, staging_gpu, rb_buf, rb_off, dump_bytes))
+    } else {
+        if can_requeue_readback {
+            // Keep `memory.rs` pages pinned until the requeued readback finishes.
+            crate::memory::pin_extracted(key, size_bytes);
+            state
+                .pending_readback_requeue
+                .push_back((key, size_bytes, host_dst.generation));
+        } else {
+            // Un-dumpable oversized BVH4: release its `memory.rs` pages once this extract finishes.
+            crate::memory::pin_extracted(key, size_bytes);
+            sub.extracted_bvh4s.push((key, size_bytes));
+        }
+        None
+    };
 
     // SAFETY: open list4; view_heap, directory, vert_buf, staging/readback, AS slab, and scratch are live.
     unsafe {
         if *extract_in_srv {
-            list.ResourceBarrier(&[transition(
+            emit_dxr_buffer_barrier(
+                list,
+                list7,
                 &vert_buf,
+                D3D12_BARRIER_SYNC_BUILD_RAYTRACING_ACCELERATION_STRUCTURE,
+                D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+                D3D12_BARRIER_ACCESS_SHADER_RESOURCE,
+                D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            )]);
+                use_compute,
+            );
             *extract_in_srv = false;
         }
         if let Some((staging_buf, _, _, _, _)) = &dump_copy {
-            let from_state = if staging_in_copy_src
+            if staging_in_copy_src
                 .as_ref()
                 .is_some_and(|prev| prev.as_raw() == staging_buf.as_raw())
             {
-                D3D12_RESOURCE_STATE_COPY_SOURCE
+                emit_dxr_buffer_barrier(
+                    list,
+                    list7,
+                    staging_buf,
+                    D3D12_BARRIER_SYNC_COPY,
+                    D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+                    D3D12_BARRIER_ACCESS_COPY_SOURCE,
+                    D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    use_compute,
+                );
             } else {
                 if let Some(prev) = staging_in_copy_src.take() {
-                    list.ResourceBarrier(&[transition(
+                    emit_dxr_buffer_legacy_only(
+                        list,
+                        list7,
                         &prev,
                         D3D12_RESOURCE_STATE_COPY_SOURCE,
                         D3D12_RESOURCE_STATE_COMMON,
-                    )]);
+                    );
                 }
-                D3D12_RESOURCE_STATE_COMMON
-            };
-            list.ResourceBarrier(&[transition(
-                staging_buf,
-                from_state,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            )]);
+                emit_dxr_buffer_legacy_only(
+                    list,
+                    list7,
+                    staging_buf,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                );
+            }
         }
         list.SetDescriptorHeaps(&[Some(view_heap)]);
         list.SetComputeRootSignature(&pass.root);
@@ -5480,20 +7316,34 @@ unsafe fn record_extract_static_blas(
         list.Dispatch(groups, 1, 1);
 
         if let Some((staging_buf, _, rb_buf, rb_off, dump_len)) = dump_copy {
-            list.ResourceBarrier(&[transition(
+            emit_dxr_buffer_barrier(
+                list,
+                list7,
                 &staging_buf,
+                D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+                D3D12_BARRIER_SYNC_COPY,
+                D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+                D3D12_BARRIER_ACCESS_COPY_SOURCE,
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
-            )]);
+                use_compute,
+            );
             list.CopyBufferRegion(&rb_buf, rb_off, &staging_buf, 0, dump_len);
             *staging_in_copy_src = Some(staging_buf);
         }
 
-        list.ResourceBarrier(&[transition(
+        emit_dxr_buffer_barrier(
+            list,
+            list7,
             &vert_buf,
+            D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+            D3D12_BARRIER_SYNC_BUILD_RAYTRACING_ACCELERATION_STRUCTURE,
+            D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+            D3D12_BARRIER_ACCESS_SHADER_RESOURCE,
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-        )]);
+            use_compute,
+        );
         *extract_in_srv = true;
 
         let compact_postbuild = if want_compact
@@ -5501,11 +7351,13 @@ unsafe fn record_extract_static_blas(
             && let Some((uav_buf, uav_gpu, rb_buf)) = sub.ensure_compact_info(host)
         {
             if compact_uav_active.is_none() {
-                list.ResourceBarrier(&[transition(
+                emit_dxr_buffer_legacy_only(
+                    list,
+                    list7,
                     &uav_buf,
                     D3D12_RESOURCE_STATE_COMMON,
                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                )]);
+                );
                 *compact_uav_active = Some((uav_buf, rb_buf));
             }
             let slot = sub.compact_queries.len() as u32;
@@ -5514,6 +7366,7 @@ unsafe fn record_extract_static_blas(
                 generation: host_dst.generation,
                 uncompacted_size: host_dst.slice_size,
                 slot,
+                auto_compact: true,
             });
             Some([D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC {
                 DestBuffer: uav_gpu + u64::from(slot) * 8,
@@ -5526,7 +7379,7 @@ unsafe fn record_extract_static_blas(
         let (need_barrier, scratch_off) =
             scratch_batch.alloc(scratch_id, scratch_cap, scratch_need, host_dst.gpu_va, 0);
         if need_barrier {
-            emit_as_build_barrier(list, list7);
+            emit_as_build_barrier(list, list7, use_compute);
         }
         let desc = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC {
             DestAccelerationStructureData: host_dst.gpu_va,
@@ -5566,6 +7419,7 @@ unsafe fn record_build_tlas_batch(
     normals_gpu: Option<&(ID3D12Resource, u64)>,
     normals_state: &mut D3D12_RESOURCE_STATES,
     built_tlas: &mut bool,
+    use_compute: bool,
 ) -> bool {
     const ALLOW_UPDATE: u32 = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE.0 as u32;
     const PERFORM_UPDATE: u32 = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE.0 as u32;
@@ -5578,11 +7432,14 @@ unsafe fn record_build_tlas_batch(
         aligned_base: u64,
         src_offset: u32,
         inst_off: u64,
+        mirror_inst_off: u64,
+        mirror_rel_off: u32,
         num_instances: u32,
         tlas_inst_base: u32,
     }
     struct PreparedTlas {
         dest_gpu_va: u64,
+        mirror_dest_gpu_va: Option<u64>,
         flags: u32,
         effective_instances: u32,
         patch: Option<PatchSpec>,
@@ -5590,6 +7447,7 @@ unsafe fn record_build_tlas_batch(
         postbuild: Vec<D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC>,
     }
 
+    let want_mirror = mirror_tlas_enabled();
     let dest_keys: Vec<u64> = tlas_ops
         .iter()
         .map(|op| match *op {
@@ -5633,39 +7491,79 @@ unsafe fn record_build_tlas_batch(
                 continue;
             }
 
+            // Always rebuild TLAS from scratch with PREFER_FAST_TRACE: D3D12 forbids TLAS
+            // `PERFORM_UPDATE` whenever any instance transitions `AccelerationStructure` or
+            // `InstanceMask` between 0 and non-0, and a 3.5K-instance fast-trace TLAS build
+            // takes <0.1 ms while reducing overlapping AABB candidate callbacks in AnyHit loops.
             let mut effective_instances = *num_instances;
             let mut patch = None;
-            if effective_instances > 0 && *instance_descs_va != 0 {
+            let flags = (*raw_flags & !(ALLOW_UPDATE | PERFORM_UPDATE | PREFER_FAST_BUILD)) | PREFER_FAST_TRACE;
+            let (result_bytes, scratch_bytes) = if effective_instances > 0 && *instance_descs_va != 0 {
                 let inst_bytes = u64::from(effective_instances).saturating_mul(64);
                 let guest_shadow = crate::shadow::find(*instance_descs_va, inst_bytes);
                 if let (Some(guest_shadow), Some(_), Some(_)) = (guest_shadow, pass, stats_gpu)
                     && guest_shadow.left(*instance_descs_va) >= inst_bytes
                 {
-                    let inst_off = total_inst_bytes;
-                    total_inst_bytes =
-                        total_inst_bytes.saturating_add(inst_bytes.max(AS_ALIGN).next_multiple_of(AS_ALIGN));
-                    let guest_gpu = guest_shadow.gpu(*instance_descs_va);
-                    sub.kept_shadows.push(guest_shadow);
-                    patch = Some(PatchSpec {
-                        aligned_base: guest_gpu & !255,
-                        src_offset: (guest_gpu & 255) as u32,
-                        inst_off,
-                        num_instances: effective_instances,
-                        tlas_inst_base: if normals_gpu.is_some() { tlas_meta_base(key) } else { 0 },
-                    });
+                    let (rb, sb) = state.tlas_prebuild_info(device5, flags, effective_instances);
+                    if rb > 0 {
+                        let primary_aligned = inst_bytes.max(AS_ALIGN).next_multiple_of(AS_ALIGN);
+                        let inst_off = total_inst_bytes;
+                        let build_mirror = want_mirror && key != EMPTY_TLAS_KEY;
+                        let (mirror_inst_off, mirror_rel_off) = if build_mirror {
+                            let m_off = inst_off.saturating_add(primary_aligned);
+                            total_inst_bytes = m_off.saturating_add(primary_aligned);
+                            (m_off, primary_aligned as u32)
+                        } else {
+                            total_inst_bytes = inst_off.saturating_add(primary_aligned);
+                            (0, 0)
+                        };
+                        let guest_gpu = guest_shadow.gpu(*instance_descs_va);
+                        // Periodic TLAS-reachability liveness scan for deterministic `AS_MAP` GC (`ARCH-10`).
+                        let scan_epoch = state.tlas_build_epoch.saturating_add(1);
+                        if scan_epoch <= 16 || (scan_epoch & 7) < 2 {
+                            if guest_shadow.written() {
+                                state.last_unreadable_tlas_epoch = scan_epoch;
+                            } else if inst_bytes <= (4 << 20) {
+                                let len = inst_bytes as usize;
+                                state.inst_scan_buf.resize(len, 0);
+                                crate::host::copy_mapped(
+                                    state.inst_scan_buf.as_mut_ptr(),
+                                    *instance_descs_va as *const u8,
+                                    len,
+                                    false,
+                                );
+                                let map = as_map().read().unwrap_or_else(|e| e.into_inner());
+                                for chunk in state.inst_scan_buf.chunks_exact(64) {
+                                    let va = u64::from_le_bytes(chunk[56..64].try_into().unwrap());
+                                    if va != 0
+                                        && let Some(entry) = map.get(&(va & !0xFF))
+                                    {
+                                        entry.last_seen_tlas_epoch.store(scan_epoch, Ordering::Relaxed);
+                                    }
+                                }
+                                state.last_readable_tlas_scan_epoch = scan_epoch;
+                            }
+                        }
+                        sub.kept_shadows.push(guest_shadow);
+                        patch = Some(PatchSpec {
+                            aligned_base: guest_gpu & !255,
+                            src_offset: (guest_gpu & 255) as u32,
+                            inst_off,
+                            mirror_inst_off,
+                            mirror_rel_off,
+                            num_instances: effective_instances,
+                            tlas_inst_base: if normals_gpu.is_some() { tlas_meta_base(key) } else { 0 },
+                        });
+                    }
+                    (rb, sb)
                 } else {
                     effective_instances = 0;
+                    state.tlas_prebuild_info(device5, flags, 0)
                 }
             } else {
                 effective_instances = 0;
-            }
-
-            // Always rebuild TLAS from scratch with PREFER_FAST_TRACE: D3D12 forbids TLAS
-            // `PERFORM_UPDATE` whenever any instance transitions `AccelerationStructure` or
-            // `InstanceMask` between 0 and non-0, and a 3.5K-instance fast-trace TLAS build
-            // takes <0.1 ms while reducing overlapping AABB candidate callbacks in AnyHit loops.
-            let flags = (*raw_flags & !(ALLOW_UPDATE | PERFORM_UPDATE | PREFER_FAST_BUILD)) | PREFER_FAST_TRACE;
-            let (result_bytes, scratch_bytes) = state.tlas_prebuild_info(device5, flags, effective_instances);
+                state.tlas_prebuild_info(device5, flags, 0)
+            };
             if result_bytes == 0 {
                 STATS[STAT_SKIPPED].fetch_add(1, Ordering::Relaxed);
                 continue;
@@ -5676,6 +7574,7 @@ unsafe fn record_build_tlas_batch(
                 state,
                 key,
                 AsKind::Tlas,
+                SlabTier::TransientDynamicTlas,
                 result_bytes,
                 flags,
                 effective_instances,
@@ -5686,12 +7585,20 @@ unsafe fn record_build_tlas_batch(
                 STATS[STAT_SKIPPED].fetch_add(1, Ordering::Relaxed);
                 continue;
             };
+            let mirror_dest_gpu_va = host_dst.mirror_gpu_va;
+            if mirror_dest_gpu_va.is_none()
+                && let Some(p) = patch.as_mut()
+            {
+                p.mirror_rel_off = 0;
+            }
             let scratch_need = scratch_bytes.max(AS_ALIGN).next_multiple_of(AS_ALIGN);
+            let tlas_count = if mirror_dest_gpu_va.is_some() { 2u64 } else { 1u64 };
             max_scratch = max_scratch.max(scratch_need);
-            sum_scratch = sum_scratch.saturating_add(scratch_need);
+            sum_scratch = sum_scratch.saturating_add(scratch_need.saturating_mul(tlas_count));
             let host_postbuild = translate_postbuild(sub, postbuild);
             prepared.push(PreparedTlas {
                 dest_gpu_va: host_dst.gpu_va,
+                mirror_dest_gpu_va,
                 flags,
                 effective_instances,
                 patch,
@@ -5705,7 +7612,7 @@ unsafe fn record_build_tlas_batch(
         }
 
         let inst_alloc = if total_inst_bytes > 0 {
-            let prev_raw = sub.host_instances.as_ref().map(|(b, _)| b.as_raw());
+            let prev_raw = sub.host_instances.as_ref().map(|b| b.buf.as_raw());
             let Some((inst_buf, inst_gpu)) = sub.ensure_host_instances(host, total_inst_bytes) else {
                 STATS[STAT_SKIPPED].fetch_add(prepared.len() as u64, Ordering::Relaxed);
                 continue;
@@ -5729,11 +7636,18 @@ unsafe fn record_build_tlas_batch(
                 // SAFETY: `upload_ptr` maps `HASH_TABLE_BYTES` matching `state.blas_table`.
                 unsafe {
                     if *hash_in_srv {
-                        list.ResourceBarrier(&[transition(
+                        emit_dxr_buffer_barrier(
+                            list,
+                            list7,
                             &hash_gpu_buf,
+                            D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+                            D3D12_BARRIER_SYNC_COPY,
+                            D3D12_BARRIER_ACCESS_SHADER_RESOURCE,
+                            D3D12_BARRIER_ACCESS_COPY_DEST,
                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                             D3D12_RESOURCE_STATE_COPY_DEST,
-                        )]);
+                            use_compute,
+                        );
                     }
                     for (start_slot, end_slot) in ranges {
                         let byte_off = (start_slot * HASH_ENTRY_BYTES) as u64;
@@ -5745,11 +7659,18 @@ unsafe fn record_build_tlas_batch(
                         );
                         list.CopyBufferRegion(&hash_gpu_buf, byte_off, &upload_buf, byte_off, byte_len);
                     }
-                    list.ResourceBarrier(&[transition(
+                    emit_dxr_buffer_barrier(
+                        list,
+                        list7,
                         &hash_gpu_buf,
+                        D3D12_BARRIER_SYNC_COPY,
+                        D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+                        D3D12_BARRIER_ACCESS_COPY_DEST,
+                        D3D12_BARRIER_ACCESS_SHADER_RESOURCE,
                         D3D12_RESOURCE_STATE_COPY_DEST,
                         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                    )]);
+                        use_compute,
+                    );
                 }
                 *hash_in_srv = true;
             }
@@ -5775,21 +7696,43 @@ unsafe fn record_build_tlas_batch(
                 if let Some((n_buf, _)) = normals_gpu
                     && *normals_state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS
                 {
-                    if *normals_state != D3D12_RESOURCE_STATE_COMMON {
-                        list.ResourceBarrier(&[transition(
+                    if *normals_state == D3D12_RESOURCE_STATE_COPY_DEST {
+                        emit_dxr_buffer_barrier(
+                            list,
+                            list7,
+                            n_buf,
+                            D3D12_BARRIER_SYNC_COPY,
+                            D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+                            D3D12_BARRIER_ACCESS_COPY_DEST,
+                            D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+                            *normals_state,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            use_compute,
+                        );
+                    } else if *normals_state != D3D12_RESOURCE_STATE_COMMON {
+                        emit_dxr_buffer_legacy_only(
+                            list,
+                            list7,
                             n_buf,
                             *normals_state,
                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                        )]);
+                        );
                     }
                     *normals_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
                 }
                 if *host_inst_in_srv {
-                    list.ResourceBarrier(&[transition(
+                    emit_dxr_buffer_barrier(
+                        list,
+                        list7,
                         inst_buf,
+                        D3D12_BARRIER_SYNC_BUILD_RAYTRACING_ACCELERATION_STRUCTURE,
+                        D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+                        D3D12_BARRIER_ACCESS_SHADER_RESOURCE,
+                        D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
                         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                         D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                    )]);
+                        use_compute,
+                    );
                     *host_inst_in_srv = false;
                 }
                 list.SetComputeRootSignature(&pass.root);
@@ -5806,25 +7749,33 @@ unsafe fn record_build_tlas_batch(
                             cull_mask_cfg(),
                             PATCH_ENABLE_STATS,
                             p.tlas_inst_base,
+                            p.mirror_rel_off,
                         ];
-                        list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                        list.SetComputeRoot32BitConstants(0, 7, constants.as_ptr().cast(), 0);
                         list.SetComputeRootShaderResourceView(1, p.aligned_base);
                         list.SetComputeRootUnorderedAccessView(3, *inst_gpu + p.inst_off);
                         list.Dispatch(p.num_instances.div_ceil(64), 1, 1);
                     }
                 }
-                list.ResourceBarrier(&[transition(
+                emit_dxr_buffer_barrier(
+                    list,
+                    list7,
                     inst_buf,
+                    D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+                    D3D12_BARRIER_SYNC_BUILD_RAYTRACING_ACCELERATION_STRUCTURE,
+                    D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+                    D3D12_BARRIER_ACCESS_SHADER_RESOURCE,
                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                )]);
+                    use_compute,
+                );
             }
             *hash_in_srv = true;
             *host_inst_in_srv = true;
         }
 
-        // Build all TLASes in this sub-batch back-to-back with disjoint scratch slices,
-        // emitting a single trailing barrier once the batch finishes.
+        // Build all TLASes (and cull-enabled mirror TLASes) in this sub-batch back-to-back
+        // with disjoint scratch slices, emitting a single trailing barrier once done.
         let base_inst_gpu = inst_alloc.as_ref().map_or(0, |(_, g)| *g);
         // SAFETY: open list4; dest, scratch, host_instances, and postbuild buffers live.
         unsafe {
@@ -5832,7 +7783,7 @@ unsafe fn record_build_tlas_batch(
                 let (need_barrier, scratch_off) =
                     scratch_batch.alloc(scratch_id, scratch_cap, item.scratch_need, item.dest_gpu_va, 0);
                 if need_barrier {
-                    emit_as_build_barrier(list, list7);
+                    emit_as_build_barrier(list, list7, use_compute);
                 }
                 let host_inst_gpu = item.patch.as_ref().map_or(0, |p| base_inst_gpu + p.inst_off);
                 let inputs = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
@@ -5854,8 +7805,36 @@ unsafe fn record_build_tlas_batch(
                     &desc,
                     (!item.postbuild.is_empty()).then_some(item.postbuild.as_slice()),
                 );
+                if let Some(mirror_va) = item.mirror_dest_gpu_va {
+                    let (m_barrier, m_scratch_off) =
+                        scratch_batch.alloc(scratch_id, scratch_cap, item.scratch_need, mirror_va, 0);
+                    if m_barrier {
+                        emit_as_build_barrier(list, list7, use_compute);
+                    }
+                    let mirror_inst_gpu = item
+                        .patch
+                        .as_ref()
+                        .filter(|p| p.mirror_rel_off != 0)
+                        .map_or(0, |p| base_inst_gpu + p.mirror_inst_off);
+                    let m_inputs = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
+                        Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL,
+                        Flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAGS(item.flags as i32),
+                        NumDescs: item.effective_instances,
+                        DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
+                        Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
+                            InstanceDescs: mirror_inst_gpu,
+                        },
+                    };
+                    let m_desc = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC {
+                        DestAccelerationStructureData: mirror_va,
+                        Inputs: m_inputs,
+                        SourceAccelerationStructureData: 0,
+                        ScratchAccelerationStructureData: scratch_gpu + m_scratch_off,
+                    };
+                    list4.BuildRaytracingAccelerationStructure(&m_desc, None);
+                }
             }
-            scratch_batch.flush(list, list7);
+            scratch_batch.flush(list, list7, use_compute);
         }
 
         if !*built_tlas {
@@ -5907,6 +7886,7 @@ fn allocate_fresh_as(
     state: &mut DxrState,
     guest_key: u64,
     kind: AsKind,
+    tier: SlabTier,
     min_bytes: u64,
     flags: u32,
     num_instances: u32,
@@ -5915,14 +7895,30 @@ fn allocate_fresh_as(
     consecutive_refits: u32,
 ) -> Option<AllocatedAs> {
     let generation = state.bump_gen();
+    let cur_epoch = state.tlas_build_epoch;
     let alloc_bytes = if kind == AsKind::Tlas {
         min_bytes.max(DEFAULT_TLAS_RESERVE)
     } else {
         min_bytes
     };
-    let (buffer, slice, gpu_va) = state.slabs.alloc(host, alloc_bytes)?;
+    let (buffer, slice, gpu_va) = state.slabs.alloc(host, tier, alloc_bytes)?;
+    let mirror_tlas = if kind == AsKind::Tlas && mirror_tlas_enabled() && guest_key != EMPTY_TLAS_KEY {
+        let m_bytes = min_bytes.max(DEFAULT_MIRROR_TLAS_RESERVE);
+        state
+            .slabs
+            .alloc(host, SlabTier::TransientDynamicTlas, m_bytes)
+            .map(|(mbuf, mslice, mgpu)| MirrorTlas {
+                buffer: mbuf,
+                slice: mslice,
+                gpu_va: mgpu,
+            })
+    } else {
+        None
+    };
+    let mirror_gpu_va = mirror_tlas.as_ref().map(|m| m.gpu_va);
     let allocated = AllocatedAs {
         gpu_va,
+        mirror_gpu_va,
         generation,
         slice_size: slice.size,
     };
@@ -5930,6 +7926,7 @@ fn allocate_fresh_as(
         buffer,
         slice,
         gpu_va,
+        mirror_tlas,
         kind,
         flags,
         num_instances,
@@ -5938,6 +7935,9 @@ fn allocate_fresh_as(
         topo_hash,
         update_scratch_bytes,
         consecutive_refits,
+        compacted_size: 0,
+        last_seen_tlas_epoch: AtomicU64::new(cur_epoch),
+        geom_va_hash: 0,
         normals_geom_off: 0,
         normals_geom_len: 0,
         normals_data_off: 0,
@@ -5946,6 +7946,10 @@ fn allocate_fresh_as(
     let mut map = as_map().write().unwrap_or_else(|e| e.into_inner());
     if let Some(old) = map.insert(guest_key, entry) {
         state.retire_as(&old);
+    }
+    drop(map);
+    if kind == AsKind::Tlas {
+        crate::descriptor::host::bump_buffer_view_cache_epoch();
     }
     Some(allocated)
 }
@@ -5956,6 +7960,7 @@ fn allocate_or_reuse_as(
     state: &mut DxrState,
     guest_key: u64,
     kind: AsKind,
+    tier: SlabTier,
     min_bytes: u64,
     flags: u32,
     num_instances: u32,
@@ -5964,11 +7969,40 @@ fn allocate_or_reuse_as(
     consecutive_refits: u32,
 ) -> Option<AllocatedAs> {
     let generation = state.bump_gen();
+    let cur_epoch = state.tlas_build_epoch;
+    let want_mirror = kind == AsKind::Tlas && mirror_tlas_enabled() && guest_key != EMPTY_TLAS_KEY;
     let mut map = as_map().write().unwrap_or_else(|e| e.into_inner());
     if let Some(existing) = map.get_mut(&guest_key)
         && existing.kind == kind
+        && existing.slice.tier == tier
         && existing.slice.size >= min_bytes
     {
+        let mut mirror_replaced = false;
+        if want_mirror
+            && existing
+                .mirror_tlas
+                .as_ref()
+                .is_none_or(|m| m.slice.size < min_bytes)
+        {
+            let m_bytes = min_bytes.max(DEFAULT_MIRROR_TLAS_RESERVE);
+            if let Some((mbuf, mslice, mgpu)) =
+                state.slabs.alloc(host, SlabTier::TransientDynamicTlas, m_bytes)
+            {
+                if let Some(old_m) = existing.mirror_tlas.replace(MirrorTlas {
+                    buffer: mbuf,
+                    slice: mslice,
+                    gpu_va: mgpu,
+                }) {
+                    state.slabs.retire(
+                        old_m.slice,
+                        state.tlas_build_epoch.saturating_add(2),
+                        state.sub_seq.saturating_add(2),
+                        retire_dxr_fence_target(),
+                    );
+                }
+                mirror_replaced = true;
+            }
+        }
         existing.flags = flags;
         existing.num_instances = num_instances;
         existing.built = true;
@@ -5976,20 +8010,43 @@ fn allocate_or_reuse_as(
         existing.topo_hash = topo_hash;
         existing.update_scratch_bytes = update_scratch_bytes;
         existing.consecutive_refits = consecutive_refits;
-        return Some(AllocatedAs {
+        existing.compacted_size = 0;
+        existing.last_seen_tlas_epoch.store(cur_epoch, Ordering::Relaxed);
+        let res = AllocatedAs {
             gpu_va: existing.gpu_va,
+            mirror_gpu_va: existing.mirror_tlas.as_ref().map(|m| m.gpu_va),
             generation,
             slice_size: existing.slice.size,
-        });
+        };
+        drop(map);
+        if mirror_replaced {
+            crate::descriptor::host::bump_buffer_view_cache_epoch();
+        }
+        return Some(res);
     }
     let alloc_bytes = if kind == AsKind::Tlas {
         min_bytes.max(DEFAULT_TLAS_RESERVE)
     } else {
         min_bytes
     };
-    let (buffer, slice, gpu_va) = state.slabs.alloc(host, alloc_bytes)?;
+    let (buffer, slice, gpu_va) = state.slabs.alloc(host, tier, alloc_bytes)?;
+    let mirror_tlas = if want_mirror {
+        let m_bytes = min_bytes.max(DEFAULT_MIRROR_TLAS_RESERVE);
+        state
+            .slabs
+            .alloc(host, SlabTier::TransientDynamicTlas, m_bytes)
+            .map(|(mbuf, mslice, mgpu)| MirrorTlas {
+                buffer: mbuf,
+                slice: mslice,
+                gpu_va: mgpu,
+            })
+    } else {
+        None
+    };
+    let mirror_gpu_va = mirror_tlas.as_ref().map(|m| m.gpu_va);
     let allocated = AllocatedAs {
         gpu_va,
+        mirror_gpu_va,
         generation,
         slice_size: slice.size,
     };
@@ -5997,6 +8054,7 @@ fn allocate_or_reuse_as(
         buffer,
         slice,
         gpu_va,
+        mirror_tlas,
         kind,
         flags,
         num_instances,
@@ -6005,6 +8063,9 @@ fn allocate_or_reuse_as(
         topo_hash,
         update_scratch_bytes,
         consecutive_refits,
+        compacted_size: 0,
+        last_seen_tlas_epoch: AtomicU64::new(cur_epoch),
+        geom_va_hash: 0,
         normals_geom_off: 0,
         normals_geom_len: 0,
         normals_data_off: 0,
@@ -6012,6 +8073,10 @@ fn allocate_or_reuse_as(
     };
     if let Some(old) = map.insert(guest_key, entry) {
         state.retire_as(&old);
+    }
+    drop(map);
+    if kind == AsKind::Tlas {
+        crate::descriptor::host::bump_buffer_view_cache_epoch();
     }
     Some(allocated)
 }
@@ -6211,11 +8276,42 @@ fn decode_static_bvh4_nodes(guest_key: u64, generation: u64, data: &[u8]) -> Opt
         }
     }
 
+    // Pass 3 (offloaded to `victory-dxr-decode`, off `victory-submit`): precompute
+    // per-geometry relative offsets and packed octahedral geometric triangle normals (`ARCH-14`).
+    let mut geom_table = Vec::with_capacity(upgraded_geoms.len());
+    let mut normals_data = Vec::with_capacity(total_tris);
+    let mut tri_cursor = 0u32;
+    for g in &upgraded_geoms {
+        let g_tris = g.vert_count / 3;
+        geom_table.push(if g_tris > 0 { tri_cursor } else { u32::MAX });
+        let v_off = g.vert_offset as usize;
+        for t in 0..(g_tris as usize) {
+            let b = v_off + t * 3;
+            let packed = if b + 2 < vertices.len() {
+                let v0 = vertices[b];
+                let v1 = vertices[b + 1];
+                let v2 = vertices[b + 2];
+                let e1 = [v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]];
+                let e2 = [v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]];
+                let nx = e1[1] * e2[2] - e1[2] * e2[1];
+                let ny = e1[2] * e2[0] - e1[0] * e2[2];
+                let nz = e1[0] * e2[1] - e1[1] * e2[0];
+                victory_shader::emit::pack_oct_normal_u32(nx, ny, nz)
+            } else {
+                victory_shader::emit::DXR_NORMALS_FALLBACK
+            };
+            normals_data.push(packed);
+        }
+        tri_cursor = tri_cursor.saturating_add(g_tris);
+    }
+
     Some(PendingStaticUpgrade {
         guest_key,
         generation,
         geometries: upgraded_geoms,
         vertices,
+        geom_table,
+        normals_data,
     })
 }
 
@@ -6347,7 +8443,7 @@ mod tests {
 
     #[test]
     fn slab_allocator_deferred_retire_coalesce_and_best_fit_reuse() {
-        let mut alloc = SlabAllocator::<usize>::default();
+        let mut alloc = SlabAllocator::<usize>::new(SlabTier::TransientDynamicTlas);
         let make = |slab_size: u64, slab_idx: usize| -> Option<(usize, u64)> {
             let _ = slab_size;
             Some((slab_idx, (slab_idx as u64 + 1) << 32))
@@ -6358,38 +8454,47 @@ mod tests {
         let (_, b, _) = alloc.alloc_with(512, make).unwrap();
         let (_, c, _) = alloc.alloc_with(256, make).unwrap();
         let (_, d, _) = alloc.alloc_with(1024, make).unwrap();
-        assert_eq!(a, SlabSlice { slab_idx: 0, offset: 0, size: 256 });
-        assert_eq!(b, SlabSlice { slab_idx: 0, offset: 256, size: 512 });
-        assert_eq!(c, SlabSlice { slab_idx: 0, offset: 768, size: 256 });
-        assert_eq!(d, SlabSlice { slab_idx: 0, offset: 1024, size: 1024 });
+        assert_eq!(a, SlabSlice { tier: SlabTier::TransientDynamicTlas, slab_idx: 0, offset: 0, size: 256 });
+        assert_eq!(b, SlabSlice { tier: SlabTier::TransientDynamicTlas, slab_idx: 0, offset: 256, size: 512 });
+        assert_eq!(c, SlabSlice { tier: SlabTier::TransientDynamicTlas, slab_idx: 0, offset: 768, size: 256 });
+        assert_eq!(d, SlabSlice { tier: SlabTier::TransientDynamicTlas, slab_idx: 0, offset: 1024, size: 1024 });
         assert_eq!(va_a, 1u64 << 32);
 
-        // Defer-retire `b` (BLAS: requires tlas_epoch >= 3 && sub_seq >= 3) and `d` (non-TLAS: requires sub_seq >= 2).
-        alloc.retire(b, 3, 3);
-        alloc.retire(d, 0, 2);
+        // Defer-retire `b` (BLAS: requires tlas_epoch >= 3 && sub_seq >= 3 && dxr_fence >= 4)
+        // and `d` (non-TLAS: requires sub_seq >= 2 && dxr_fence >= 0).
+        alloc.retire(b, 3, 3, 4);
+        alloc.retire(d, 0, 2, 0);
 
-        // Neither is released at (tlas=1, sub=1).
-        assert_eq!(alloc.drain_retired(1, 1), 0);
-        assert_eq!(alloc.slabs[0].free, Vec::<(u64, u64)>::new());
-        assert_eq!(alloc.slabs[0].used, 2048);
+        // Neither is released at (tlas=1, sub=1, dxr=10).
+        assert_eq!(alloc.drain_retired(1, 1, 10), 0);
+        assert_eq!(alloc.slabs[0].as_ref().unwrap().free, Vec::<(u64, u64)>::new());
+        assert_eq!(alloc.slabs[0].as_ref().unwrap().used, 2048);
 
-        // At (tlas=1, sub=2), `d` (tail) is released without being blocked by `b` and folds back into `used`.
-        assert_eq!(alloc.drain_retired(1, 2), 1);
-        assert_eq!(alloc.slabs[0].used, 1024);
-        assert!(alloc.slabs[0].free.is_empty());
+        // At (tlas=1, sub=2, dxr=0), `d` (tail) is released without being blocked by `b` and folds back into `used`.
+        assert_eq!(alloc.drain_retired(1, 2, 0), 1);
+        assert_eq!(alloc.slabs[0].as_ref().unwrap().used, 1024);
+        assert!(alloc.slabs[0].as_ref().unwrap().free.is_empty());
 
-        // At (tlas=2, sub=3), `b` is still retained because tlas_epoch < 3.
-        assert_eq!(alloc.drain_retired(2, 3), 0);
-        // At (tlas=3, sub=3), `b` is freed into the free list.
-        assert_eq!(alloc.drain_retired(3, 3), 1);
-        assert_eq!(alloc.slabs[0].free, vec![(256, 512)]);
+        // At (tlas=2, sub=3, dxr=4), `b` is still retained because tlas_epoch < 3.
+        assert_eq!(alloc.drain_retired(2, 3, 4), 0);
+        // At (tlas=3, sub=3, dxr=3), `b` is still retained because dxr_fence < 4 (Spec-Trap #16).
+        assert_eq!(alloc.drain_retired(3, 3, 3), 0);
+        // At (tlas=3, sub=3, dxr=4), `b` is freed into the free list.
+        assert_eq!(alloc.drain_retired(3, 3, 4), 1);
+        assert_eq!(alloc.slabs[0].as_ref().unwrap().free, vec![(256, 512)]);
 
         // Free `a` (adjacent left) and `c` (adjacent right + touches tail): all three coalesce and reset `used` to 0!
         alloc.free(a);
-        assert_eq!(alloc.slabs[0].free, vec![(0, 768)]);
+        assert_eq!(alloc.slabs[0].as_ref().unwrap().free, vec![(0, 768)]);
         alloc.free(c);
-        assert_eq!(alloc.slabs[0].used, 0);
-        assert!(alloc.slabs[0].free.is_empty());
+        assert_eq!(alloc.slabs[0].as_ref().unwrap().used, 0);
+        assert!(alloc.slabs[0].as_ref().unwrap().free.is_empty());
+
+        // Reclaiming an empty 32 MiB slab releases it cleanly and reuses its slot index on next alloc.
+        let reclaimed = alloc.reclaim_empty_slabs();
+        assert_eq!(reclaimed, vec![(0usize, AS_SLAB_SIZE)]);
+        assert!(alloc.slabs[0].is_none());
+        assert_eq!(alloc.stats(), (0, 0));
 
         // Best-fit reuse: create two holes (512B and 256B), allocate 256B -> picks exact 256B hole.
         let (_, x0, _) = alloc.alloc_with(512, make).unwrap();
@@ -6398,12 +8503,12 @@ mod tests {
         let (_, _keep1, _) = alloc.alloc_with(256, make).unwrap();
         alloc.free(x0);
         alloc.free(x1);
-        assert_eq!(alloc.slabs[0].free, vec![(0, 512), (768, 256)]);
+        assert_eq!(alloc.slabs[0].as_ref().unwrap().free, vec![(0, 512), (768, 256)]);
 
         let (_, reused, va_reused) = alloc.alloc_with(256, make).unwrap();
         assert_eq!(reused, x1);
         assert_eq!(va_reused, (1u64 << 32) + 768);
-        assert_eq!(alloc.slabs[0].free, vec![(0, 512)]);
+        assert_eq!(alloc.slabs[0].as_ref().unwrap().free, vec![(0, 512)]);
 
         let (total, free) = alloc.stats();
         assert_eq!(total, AS_SLAB_SIZE);
@@ -6487,11 +8592,12 @@ mod tests {
         assert_eq!(compacted.offset, 256 * 1024);
         assert_eq!(compacted.size, 128 * 1024);
 
-        // Old uncompacted slice retired at tlas_epoch=5, sub_seq=10 -> releases at (7, 12).
-        alloc.retire(uncompacted, 7, 12);
-        assert_eq!(alloc.drain_retired(6, 12), 0);
-        assert_eq!(alloc.drain_retired(7, 11), 0);
-        assert_eq!(alloc.drain_retired(7, 12), 1);
+        // Old uncompacted slice retired at tlas_epoch=5, sub_seq=10, dxr_fence=8 -> releases at (7, 12, 10).
+        alloc.retire(uncompacted, 7, 12, 10);
+        assert_eq!(alloc.drain_retired(6, 12, 10), 0);
+        assert_eq!(alloc.drain_retired(7, 11, 10), 0);
+        assert_eq!(alloc.drain_retired(7, 12, 9), 0);
+        assert_eq!(alloc.drain_retired(7, 12, 10), 1);
 
         // Reclaimed 256 KiB hole is immediately reused by the next static BLAS allocation.
         let (_, reused, _) = alloc.alloc_with(256 * 1024, make).unwrap();
@@ -6521,17 +8627,22 @@ mod tests {
         assert_eq!((a, b, c), (100, 110, 120));
         assert_eq!(pool.alloc(1), None);
 
-        // Retire `a` and `b` at different epochs; draining coalesces them into one 20-word block.
-        pool.retire(a, 10, 5, 10);
-        pool.retire(b, 10, 5, 10);
-        pool.drain_retired(4, 10);
+        // Retire `a` and `b` at different epochs; draining coalesces them into one 20-word block
+        // only once tlas_epoch, sub_seq, AND dxr_fence all pass.
+        pool.retire(a, 10, 5, 10, 7);
+        pool.retire(b, 10, 5, 10, 7);
+        pool.drain_retired(4, 10, 7);
         assert_eq!(pool.alloc(10), None);
-        pool.drain_retired(5, 10);
+        pool.drain_retired(5, 10, 6);
+        assert_eq!(pool.alloc(10), None);
+        pool.drain_retired(5, 10, 7);
         assert_eq!(pool.alloc(20), Some(100));
 
         // Tail free rewinds bump pointer cleanly.
-        pool.retire(c, 10, 6, 11);
-        pool.drain_retired(6, 11);
+        pool.retire(c, 10, 6, 11, 8);
+        pool.drain_retired(6, 11, 7);
+        assert_eq!(pool.used, 130);
+        pool.drain_retired(6, 11, 8);
         assert_eq!(pool.used, 120);
 
         // `tlas_meta_base` is deterministic, non-zero for valid TLAS VAs, and 0 for null/empty.
@@ -6816,12 +8927,195 @@ mod tests {
         // Verify AllocatedAs is Copy and preserves fields cleanly.
         let alloc = AllocatedAs {
             gpu_va: 0xDEAD_BEEF_0000,
+            mirror_gpu_va: Some(0xBEEF_DEAD_0000),
             generation: 42,
             slice_size: 4096,
         };
         let copy = alloc;
         assert_eq!(alloc, copy);
-        assert_eq!((copy.gpu_va, copy.generation, copy.slice_size), (0xDEAD_BEEF_0000, 42, 4096));
+        assert_eq!(
+            (copy.gpu_va, copy.mirror_gpu_va, copy.generation, copy.slice_size),
+            (0xDEAD_BEEF_0000, Some(0xBEEF_DEAD_0000), 42, 4096)
+        );
+    }
+
+    #[test]
+    fn mirror_tlas_clears_cull_disable_and_preserves_front_ccw_and_other_flags() {
+        // r3.y layout: bits 0..23 = InstanceContributionToHitGroupIndex,
+        // bits 24..31 = Flags (bit 0 = TRIANGLE_CULL_DISABLE = 0x1,
+        // bit 1 = TRIANGLE_FRONT_COUNTERCLOCKWISE = 0x2, bit 2 = FORCE_OPAQUE = 0x4,
+        // bit 3 = FORCE_NON_OPAQUE = 0x8).
+        let contrib = 0x00AB_CDEFu32;
+        let all_flags = 0x0Fu32 << 24;
+        let cleared = clear_cull_disable_flag(all_flags | contrib);
+        // Bit 0 (TRIANGLE_CULL_DISABLE) cleared; bits 1..3 + 24-bit contribution preserved identically.
+        assert_eq!(cleared, (0x0Eu32 << 24) | contrib);
+        assert_eq!(cleared & 0x0100_0000, 0);
+        assert_eq!(cleared & 0x0200_0000, 0x0200_0000);
+        assert_eq!(cleared & 0x00FF_FFFF, contrib);
+
+        // Instance with only TRIANGLE_FRONT_COUNTERCLOCKWISE stays bit-identical.
+        let ccw_only = (0x02u32 << 24) | 0x123456;
+        assert_eq!(clear_cull_disable_flag(ccw_only), ccw_only);
+
+        // When mirror TLAS is enabled, default cull_mask_cfg is 0 (full 8-bit guest mask preserved),
+        // while explicit VICTORY_NATIVE_RT_CULL_MASK overrides still take effect.
+        assert_eq!(parse_cull_mask_cfg_for(None, true), 0);
+        assert_eq!(parse_cull_mask_cfg_for(Some(""), true), 0);
+        assert_eq!(parse_cull_mask_cfg_for(Some("tag:0x02"), true), CULL_MASK_TAG_MODE | 0x02);
+        assert_eq!(parse_cull_mask_cfg_for(None, false), DEFAULT_CULL_MASK_CFG);
+    }
+
+    #[test]
+    fn blas_table_shift_delete_preserves_64_probe_chains_and_wraparound() {
+        let mut table = vec![[0u32; 8]; HASH_CAPACITY];
+        let mut dirty = HashDirtyTracker::full();
+        let _ = dirty.take_ranges();
+
+        // Find 4 distinct guest VAs hashing to the exact same bucket near HASH_CAPACITY - 1
+        // so the probe chain wraps across index 65535 -> 0 -> 1 -> 2!
+        let target_bucket = HASH_MASK;
+        let mut colliding: Vec<u64> = Vec::new();
+        let mut next_bucket: Vec<u64> = Vec::new();
+        for k in 1u64..1_000_000 {
+            let va = k << 8;
+            let b = hash_key(k as u32, (k >> 32) as u32) & HASH_MASK;
+            if b == target_bucket && colliding.len() < 4 {
+                colliding.push(va);
+            } else if b == 0 && next_bucket.len() < 2 {
+                next_bucket.push(va);
+            }
+            if colliding.len() == 4 && next_bucket.len() == 2 {
+                break;
+            }
+        }
+        assert_eq!(colliding.len(), 4);
+        assert_eq!(next_bucket.len(), 2);
+
+        // Insert colliding[0] at 65535, colliding[1] at 0, next_bucket[0] at 1 (home=0),
+        // colliding[2] at 2 (home=65535), next_bucket[1] at 3 (home=0), colliding[3] at 4 (home=65535).
+        let items = [
+            (colliding[0], 0xA000u64, 10u32),
+            (colliding[1], 0xA100, 11),
+            (next_bucket[0], 0xB000, 20),
+            (colliding[2], 0xA200, 12),
+            (next_bucket[1], 0xB100, 21),
+            (colliding[3], 0xA300, 13),
+        ];
+        for &(va, host_va, goff) in &items {
+            insert_blas_hash_in(&mut table, &mut dirty, va, host_va, goff);
+        }
+        let _ = dirty.take_ranges();
+
+        // Delete head of the colliding chain (`colliding[0]` at slot 65535):
+        // `colliding[1]` must shift back to 65535, `next_bucket[0]` stays at/moves to home 0,
+        // and EVERY remaining key stays reachable within 64 probes!
+        assert!(shift_delete_blas_hash(&mut table, &mut dirty, colliding[0]));
+        assert!(dirty.is_dirty());
+        assert_eq!(lookup_blas_hash_in(&table, colliding[0]), None);
+        for &(va, host_va, goff) in &items[1..] {
+            assert_eq!(
+                lookup_blas_hash_in(&table, va),
+                Some((host_va, goff)),
+                "entry {va:#x} lost after shift-delete of head"
+            );
+        }
+
+        // Delete middle key (`next_bucket[0]`, home=0) and then `colliding[2]`:
+        assert!(shift_delete_blas_hash(&mut table, &mut dirty, next_bucket[0]));
+        assert_eq!(lookup_blas_hash_in(&table, next_bucket[0]), None);
+        assert!(shift_delete_blas_hash(&mut table, &mut dirty, colliding[2]));
+        assert_eq!(lookup_blas_hash_in(&table, colliding[2]), None);
+        // Deleting an already-deleted key returns false cleanly.
+        assert!(!shift_delete_blas_hash(&mut table, &mut dirty, colliding[2]));
+
+        for &(va, host_va, goff) in &[items[1], items[4], items[5]] {
+            assert_eq!(
+                lookup_blas_hash_in(&table, va),
+                Some((host_va, goff)),
+                "entry {va:#x} lost after mid-chain shift-delete"
+            );
+        }
+    }
+
+    #[test]
+    fn decide_blas_refit_preserves_allow_compaction_only_blases() {
+        let allow_upd = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE.0 as u32;
+        let allow_cmp = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_COMPACTION.0 as u32;
+        let fast_trace = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE.0 as u32;
+
+        // ALLOW_COMPACTION without ALLOW_UPDATE must NOT get ALLOW_UPDATE ORed in even when refit is ON.
+        let cmp_only = fast_trace | allow_cmp;
+        assert_eq!(prebuild_flags(1, cmp_only, true), cmp_only);
+        let d_cmp = decide_blas_refit(cmp_only, 0x1000, 0, 0xAAAA, None, None, true, 64);
+        assert_eq!(d_cmp.flags, cmp_only);
+        assert_eq!(d_cmp.flags & allow_upd, 0);
+        assert!(!d_cmp.is_refit);
+
+        // If the guest explicitly passes BOTH ALLOW_COMPACTION | ALLOW_UPDATE, keep ALLOW_UPDATE.
+        let both = fast_trace | allow_cmp | allow_upd;
+        assert_eq!(prebuild_flags(1, both, true), both);
+        let d_both = decide_blas_refit(both, 0x1000, 0, 0xAAAA, None, None, true, 64);
+        assert_eq!(d_both.flags, both);
+    }
+
+    #[test]
+    fn dxr_room_kept_dynamic_steady_and_streaming_reserves() {
+        // Disabled DXR reserves 0.
+        assert_eq!(dxr_room_kept_for(false, None, 0, 0, true), 0);
+
+        // Default steady = 128 MiB, streaming = 256 MiB when aux == 0.
+        assert_eq!(dxr_room_kept_for(true, None, 0, 0, false), 128 << 20);
+        assert_eq!(dxr_room_kept_for(true, None, 0, 0, true), 256 << 20);
+
+        // Accounts for DXR_AUX_VRAM_BYTES (e.g. 64 MiB normals + 2 MiB hash + 16 MiB scratch = 82 MiB),
+        // floored at 1 slab (32 MiB) so growth always has headroom.
+        assert_eq!(dxr_room_kept_for(true, None, 400 << 20, 82 << 20, false), 46 << 20);
+        assert_eq!(dxr_room_kept_for(true, None, 400 << 20, 82 << 20, true), 174 << 20);
+        assert_eq!(dxr_room_kept_for(true, None, 400 << 20, 200 << 20, false), AS_SLAB_SIZE);
+
+        // Explicit VICTORY_CARD_ROOM_FOR_DXR_MB override subtracts both slabs and aux bytes.
+        assert_eq!(
+            dxr_room_kept_for(true, Some(512), 300 << 20, 80 << 20, false),
+            132 << 20
+        );
+        assert_eq!(
+            dxr_room_kept_for(true, Some(256), 300 << 20, 80 << 20, true),
+            0
+        );
+    }
+
+    #[test]
+    fn blas_sub_batch_planner_and_decode_worker_prepacked_normals() {
+        assert_eq!(plan_blas_sub_batches(&[]), Vec::<std::ops::Range<usize>>::new());
+        // Disjoint dynamic BLASes collapse into a single batch (1 AS_MAP lock + 1 BUILD_NORMALS bind).
+        assert_eq!(
+            plan_blas_sub_batches(&[(0x1000, 0x1000), (0x2000, 0), (0x3000, 0x3000)]),
+            vec![0..3]
+        );
+        // Duplicate destination VA or cross-BLAS source dependency splits cleanly.
+        assert_eq!(
+            plan_blas_sub_batches(&[(0x1000, 0), (0x2000, 0x1000), (0x2000, 0x2000)]),
+            vec![0..1, 1..2, 2..3]
+        );
+
+        // Verify `decode_static_bvh4_nodes` precomputes octahedral normals & geom_table off-thread.
+        let v = [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0],
+        ];
+        // Non-opaque triangle in geom 0 prim 0: cross(v1-v0, v2-v0) = (0, 0, +1).
+        let n0 = make_node(v, 0, 0, 0, 0x09);
+        let upg = decode_static_bvh4_nodes(0x5000, 1, &pack_dump(1, 64, 1, &[n0]))
+            .expect("non-opaque static BLAS must decode");
+        assert_eq!(upg.geom_table, vec![0]);
+        assert_eq!(upg.normals_data.len(), 1);
+        assert_eq!(
+            upg.normals_data[0],
+            victory_shader::emit::pack_oct_normal_u32(0.0, 0.0, 1.0)
+        );
     }
 
     #[test]
@@ -6853,5 +9147,60 @@ mod tests {
         // Software BVH builder requested or running: never skip.
         assert!(!should_skip_builder_rt_off(true, false, true, false));
         assert!(!should_skip_builder_rt_off(true, false, false, true));
+    }
+
+    #[test]
+    fn compute_queue_sync_sanitization_strips_graphics_bits_and_narrows_prelude() {
+        let graphics_heavy = D3D12_BARRIER_SYNC_ALL_SHADING
+            | D3D12_BARRIER_SYNC_PIXEL_SHADING
+            | D3D12_BARRIER_SYNC_VERTEX_SHADING
+            | D3D12_BARRIER_SYNC_RENDER_TARGET
+            | D3D12_BARRIER_SYNC_DEPTH_STENCIL
+            | D3D12_BARRIER_SYNC_RAYTRACING
+            | D3D12_BARRIER_SYNC_BUILD_RAYTRACING_ACCELERATION_STRUCTURE
+            | D3D12_BARRIER_SYNC_COPY_RAYTRACING_ACCELERATION_STRUCTURE
+            | D3D12_BARRIER_SYNC_COPY;
+
+        // DirectQ preserves every bit verbatim.
+        assert_eq!(sanitize_sync_for_queue(graphics_heavy, false), graphics_heavy);
+
+        // ComputeQ strips ALL graphics-only bits and maps shading bits to COMPUTE_SHADING.
+        let sanitized = sanitize_sync_for_queue(graphics_heavy, true);
+        let expected_compute = D3D12_BARRIER_SYNC_COMPUTE_SHADING
+            | D3D12_BARRIER_SYNC_COPY
+            | D3D12_BARRIER_SYNC_BUILD_RAYTRACING_ACCELERATION_STRUCTURE
+            | D3D12_BARRIER_SYNC_COPY_RAYTRACING_ACCELERATION_STRUCTURE;
+        assert_eq!(sanitized, expected_compute);
+        let illegal_on_compute = (D3D12_BARRIER_SYNC_ALL_SHADING.0
+            | D3D12_BARRIER_SYNC_NON_PIXEL_SHADING.0
+            | D3D12_BARRIER_SYNC_PIXEL_SHADING.0
+            | D3D12_BARRIER_SYNC_VERTEX_SHADING.0
+            | D3D12_BARRIER_SYNC_RENDER_TARGET.0
+            | D3D12_BARRIER_SYNC_DEPTH_STENCIL.0
+            | D3D12_BARRIER_SYNC_DRAW.0
+            | D3D12_BARRIER_SYNC_INDEX_INPUT.0
+            | D3D12_BARRIER_SYNC_RESOLVE.0) as u32;
+        assert_eq!((sanitized.0 as u32) & illegal_on_compute, 0);
+
+        // Pure graphics sync bit never degenerates into SYNC_NONE on ComputeQ.
+        assert_eq!(
+            sanitize_sync_for_queue(D3D12_BARRIER_SYNC_RENDER_TARGET, true),
+            D3D12_BARRIER_SYNC_COMPUTE_SHADING
+        );
+        assert_eq!(
+            sanitize_sync_for_queue(D3D12_BARRIER_SYNC_NONE, true),
+            D3D12_BARRIER_SYNC_NONE
+        );
+
+        // ComputeQ skips prelude drain (skin_fence orders Direct -> Compute).
+        assert_eq!(prelude_barrier_for_ops(true, true, false, false, true), None);
+        // DirectQ fallback narrows prelude drain to COMPUTE_SHADING | COPY (no ALL_SHADING / COPY_AS sledgehammer).
+        let (sb, sa, _, _) = prelude_barrier_for_ops(true, true, false, false, false).unwrap();
+        assert_eq!(sb, D3D12_BARRIER_SYNC_COMPUTE_SHADING | D3D12_BARRIER_SYNC_COPY);
+        assert_eq!(
+            sa,
+            D3D12_BARRIER_SYNC_BUILD_RAYTRACING_ACCELERATION_STRUCTURE
+                | D3D12_BARRIER_SYNC_COMPUTE_SHADING
+        );
     }
 }

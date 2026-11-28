@@ -91,11 +91,17 @@ fn working() -> bool {
 
 /// The heap whose slots are marked: its slots, and the places in the title's
 /// code that last faulted on each of its 64 KiB blocks.
+///
+/// Both `slots` and `chunks` are backed by 8-byte-aligned `[AtomicU64]` arrays
+/// so `take()` consumes 8 slots / 8 chunks per `AtomicU64::swap(0, AcqRel)`
+/// while patched title assembly continues issuing unconditional 1-byte
+/// `mov byte [base + idx], 1` stores (TSO store-store ordered with `chunks[]`).
 struct Adopted {
     start: u64,
     count: usize,
-    slots: &'static [AtomicU8],
-    chunks: &'static [AtomicU8],
+    chunk_count: usize,
+    slots: &'static [AtomicU64],
+    chunks: &'static [AtomicU64],
     writers: &'static [AtomicUsize],
 }
 
@@ -114,38 +120,40 @@ fn adopt_now(start: u64, count: u32) -> bool {
         return false;
     }
     let count = count as usize;
-    let leak = |n: usize| -> &'static [AtomicU8] { Box::leak((0..n).map(|_| AtomicU8::new(0)).collect()) };
+    let slot_words = count.div_ceil(8);
+    let chunk_count = count.div_ceil(CHUNK);
+    let chunk_words = chunk_count.div_ceil(8);
+    let leak_u64 = |n: usize| -> &'static [AtomicU64] { Box::leak((0..n).map(|_| AtomicU64::new(0)).collect()) };
     // Keep leaked mark arrays monotonically non-shrinking across re-adoptions
     // so concurrent readers observing a larger `MARKS.len` never write OOB.
-    static LEAKED: std::sync::Mutex<Option<(&'static [AtomicU8], &'static [AtomicU8])>> = std::sync::Mutex::new(None);
+    static LEAKED: std::sync::Mutex<Option<(&'static [AtomicU64], &'static [AtomicU64])>> = std::sync::Mutex::new(None);
     let (slots, chunks) = {
         let mut kept = LEAKED.lock().unwrap_or_else(|e| e.into_inner());
-        let chunk_count = count.div_ceil(CHUNK);
         match *kept {
-            Some((s, c)) if s.len() >= count && c.len() >= chunk_count => {
-                for a in &s[..count] {
+            Some((s, c)) if s.len() >= slot_words && c.len() >= chunk_words => {
+                for a in &s[..slot_words] {
                     a.store(0, Relaxed);
                 }
-                for a in &c[..chunk_count] {
+                for a in &c[..chunk_words] {
                     a.store(0, Relaxed);
                 }
-                (&s[..count], &c[..chunk_count])
+                (&s[..slot_words], &c[..chunk_words])
             }
             _ => {
-                let s = leak(count);
-                let c = leak(chunk_count);
+                let s = leak_u64(slot_words);
+                let c = leak_u64(chunk_words);
                 *kept = Some((s, c));
                 (s, c)
             }
         }
     };
     let writers: &'static [AtomicUsize] = Box::leak((0..(count * 32).div_ceil(1 << 16)).map(|_| AtomicUsize::new(0)).collect());
-    MARKS.slots.store(slots.as_ptr().cast_mut(), Release);
-    MARKS.chunks.store(chunks.as_ptr().cast_mut(), Release);
+    MARKS.slots.store(slots.as_ptr().cast::<AtomicU8>().cast_mut(), Release);
+    MARKS.chunks.store(chunks.as_ptr().cast::<AtomicU8>().cast_mut(), Release);
     MARKS.start.store(start, Release);
     // Last: a store that sees a length sees the rest.
     MARKS.len.store(count as u64 * 32, Release);
-    *adopted = Some(Adopted { start, count, slots, chunks, writers });
+    *adopted = Some(Adopted { start, count, chunk_count, slots, chunks, writers });
     tracing::info!(
         start = format_args!("{start:#x}"),
         count,
@@ -183,17 +191,17 @@ pub(crate) fn mark(handle: u64) {
         return;
     }
     let slot = (at / 32) as usize;
-    // SAFETY: the maps are leaked, as long as the length says.
-    unsafe {
-        (*MARKS.slots.load(Relaxed).add(slot)).store(1, Release);
-        (*MARKS.chunks.load(Relaxed).add(slot / CHUNK)).store(1, Release);
-    }
+    mark_slot(slot);
     MARKED_BY_US.fetch_add(1, Relaxed);
 }
 
 /// Whether slot `index`'s mark is set (told, not yet taken).
 fn marked(a: &Adopted, index: u32) -> bool {
-    a.slots.get(index as usize).is_some_and(|s| s.load(Acquire) != 0)
+    let idx = index as usize;
+    idx < a.count
+        && a.slots
+            .get(idx >> 3)
+            .is_some_and(|w| (w.load(Acquire) >> ((idx & 7) * 8)) & 0xff != 0)
 }
 
 /// The marked slots of the heap at `start`, each mark cleared, as runs of
@@ -204,22 +212,43 @@ pub(crate) fn take(start: u64) -> Option<Vec<(u32, u32)>> {
     let a = adopted.as_ref().filter(|a| a.start == start)?;
     let mut runs: Vec<(u32, u32)> = Vec::new();
     let mut n = 0u64;
-    for (c, chunk) in a.chunks.iter().enumerate() {
-        if chunk.load(Relaxed) == 0 {
+    const WORDS_PER_CHUNK: usize = CHUNK / 8;
+    for (cw, chunk_word) in a.chunks.iter().enumerate() {
+        if chunk_word.load(Relaxed) == 0 {
             continue;
         }
-        // Cleared before its slots are read: a mark set meanwhile sets it again.
-        chunk.swap(0, AcqRel);
-        let first = c * CHUNK;
-        for (i, slot) in a.slots[first..(first + CHUNK).min(a.count)].iter().enumerate() {
-            if slot.load(Relaxed) == 0 || slot.swap(0, AcqRel) == 0 {
-                continue;
+        // Cleared before its slots are read: a mark set meanwhile sets its
+        // chunk byte unconditionally after its slot byte (x86-64 TSO).
+        let mut cmask = chunk_word.swap(0, AcqRel);
+        while cmask != 0 {
+            let lane = (cmask.trailing_zeros() / 8) as usize;
+            cmask &= !(0xffu64 << (lane * 8));
+            let c = cw * 8 + lane;
+            if c >= a.chunk_count {
+                break;
             }
-            let index = (first + i) as u32;
-            n += 1;
-            match runs.last_mut() {
-                Some((at, len)) if *at + *len == index => *len += 1,
-                _ => runs.push((index, 1)),
+            let first_word = c * WORDS_PER_CHUNK;
+            let end_word = (first_word + WORDS_PER_CHUNK).min(a.slots.len());
+            for (wi, slot_word) in a.slots[first_word..end_word].iter().enumerate() {
+                if slot_word.load(Relaxed) == 0 {
+                    continue;
+                }
+                let mut smask = slot_word.swap(0, AcqRel);
+                let base = (first_word + wi) * 8;
+                while smask != 0 {
+                    let b = (smask.trailing_zeros() / 8) as usize;
+                    smask &= !(0xffu64 << (b * 8));
+                    let slot_idx = base + b;
+                    if slot_idx >= a.count {
+                        break;
+                    }
+                    let index = slot_idx as u32;
+                    n += 1;
+                    match runs.last_mut() {
+                        Some((at, len)) if *at + *len == index => *len += 1,
+                        _ => runs.push((index, 1)),
+                    }
+                }
             }
         }
     }
@@ -314,6 +343,21 @@ pub(crate) fn to_check(frame: u64) -> Vec<usize> {
     out
 }
 
+/// Returns unvisited fallback pages back into the pending set when
+/// maintenance yields early to a waiting submission (`CPU-10`).
+pub(crate) fn put_back_pages(pages: &[usize]) {
+    if pages.is_empty() {
+        return;
+    }
+    let mut f = FALLBACK.lock().unwrap_or_else(|e| e.into_inner());
+    for &page in pages {
+        f.pages.insert(page);
+    }
+    if let Some(&first) = pages.first() {
+        f.next = first;
+    }
+}
+
 /// The fallback found slot `index` (at `handle`) with a new record: a view
 /// record that no mark told of is counted and said.
 pub(crate) fn missed(index: u32, handle: u64, view: bool, tabled: bool) {
@@ -368,18 +412,18 @@ static REAL: [AtomicUsize; 2] = [const { AtomicUsize::new(0) }; 2];
 /// Since the last line: the title's copies into the marked heap, records they marked.
 static COPIES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
-/// Whether `memcpy`/`memmove` imports are globally hooked to mark copied view
-/// records (`VICTORY_PORT_DESCRIPTORS_MEMCPY=1`, default OFF: the fallback
-/// page-check catches missed views without intercepting every process copy).
+/// Whether `memcpy`/`memmove` imports are hooked with a fast range filter
+/// (`dst.wrapping_sub(start) < len`) to mark copied view records
+/// (`VICTORY_PORT_DESCRIPTORS_MEMCPY=0` disables; default ON).
 fn hook_memcpy() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("VICTORY_PORT_DESCRIPTORS_MEMCPY").is_ok_and(|v| v.trim() == "1")
+        std::env::var_os("VICTORY_PORT_DESCRIPTORS_MEMCPY").is_none_or(|v| v != "0")
     })
 }
 
 /// What the title's import of `name` (bound to `address`) is bound to: with
-/// both `VICTORY_PORT_DESCRIPTORS=1` and `VICTORY_PORT_DESCRIPTORS_MEMCPY=1`,
+/// `VICTORY_PORT_DESCRIPTORS=1` (and unless `VICTORY_PORT_DESCRIPTORS_MEMCPY=0`),
 /// its `memcpy` and `memmove` mark the view records they copy into the heap.
 pub fn import(name: &str, address: usize) -> usize {
     let (which, ours) = match name {
@@ -417,34 +461,49 @@ unsafe fn copied(to: *mut u8, from: *const u8, n: usize, real: usize) -> *mut u8
     let len = MARKS.len.load(Acquire);
     if len != 0 && n >= 4 {
         let start = MARKS.start.load(Relaxed);
-        let (lo, hi) = ((to as u64).max(start), (to as u64 + n as u64).min(start + len));
-        if lo < hi {
-            COPIES[0].fetch_add(1, Relaxed);
-            // Each slot whose first word now lies in the copy and is a view's.
-            let mut slot = (lo - start).div_ceil(32);
-            let mut marked = 0;
-            while start + slot * 32 + 4 <= hi {
-                let at = start + slot * 32;
-                // SAFETY: just written by the copy, inside the heap.
-                if unsafe { (at as *const u32).read_unaligned() } == crate::descriptor::VIEW_TAG {
-                    mark_slot(slot as usize);
-                    marked += 1;
+        let dst = to as u64;
+        // Fast-path unsigned range check avoids overhead on non-heap copies.
+        if dst.wrapping_sub(start) < len
+            || (dst < start && dst.saturating_add(n as u64) > start)
+        {
+            let lo = dst.max(start);
+            let hi = dst.saturating_add(n as u64).min(start + len);
+            if lo < hi {
+                COPIES[0].fetch_add(1, Relaxed);
+                // Each slot whose first word now lies in the copy and is a view's.
+                let mut slot = (lo - start).div_ceil(32);
+                let mut marked = 0;
+                while start + slot * 32 + 4 <= hi {
+                    let at = start + slot * 32;
+                    // SAFETY: just written by the copy, inside the heap.
+                    if unsafe { (at as *const u32).read_unaligned() } == crate::descriptor::VIEW_TAG {
+                        mark_slot(slot as usize);
+                        marked += 1;
+                    }
+                    slot += 1;
                 }
-                slot += 1;
+                COPIES[1].fetch_add(marked, Relaxed);
             }
-            COPIES[1].fetch_add(marked, Relaxed);
         }
     }
     out
 }
 
-/// Marks slot `slot` of the marked heap (in it: checked by the caller).
+/// Marks slot `slot` of the marked heap (in it: checked by the caller) using
+/// `AtomicU64::fetch_or` on the 8-byte-aligned backing arrays so concurrent
+/// `AtomicU64::swap(0, AcqRel)` consumers in [`take`] never drop sibling bytes.
 #[inline]
 fn mark_slot(slot: usize) {
-    // SAFETY: the maps are leaked, as long as the length says.
+    let slot_word = slot >> 3;
+    let slot_bit = 1u64 << ((slot & 7) * 8);
+    let chunk = slot / CHUNK;
+    let chunk_word = chunk >> 3;
+    let chunk_bit = 1u64 << ((chunk & 7) * 8);
+    // SAFETY: the maps are leaked 8-byte-aligned `[AtomicU64]` arrays covering
+    // at least `MARKS.len / 32` slots and their chunks.
     unsafe {
-        (*MARKS.slots.load(Relaxed).add(slot)).store(1, Release);
-        (*MARKS.chunks.load(Relaxed).add(slot / CHUNK)).store(1, Release);
+        (*MARKS.slots.load(Relaxed).cast::<AtomicU64>().add(slot_word)).fetch_or(slot_bit, Release);
+        (*MARKS.chunks.load(Relaxed).cast::<AtomicU64>().add(chunk_word)).fetch_or(chunk_bit, Release);
     }
 }
 
@@ -533,31 +592,62 @@ mod tests {
         32
     }
 
-    /// Slots marked as the stores mark them, and by our calls, come out once
-    /// each, as runs; outside the heap nothing is marked.
+    /// Slots marked as the stores mark them (1-byte stores), and by our calls
+    /// (`AtomicU64::fetch_or`), come out once each via `AtomicU64::swap(0, AcqRel)`
+    /// across byte lanes, chunk boundaries, and non-8-multiple heap counts.
     #[test]
     fn marked_slots_are_taken_once_as_runs() {
+        // Serialize tests touching the global ADOPTED/MARKS state.
+        static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let start = 0x1000_0000u64;
-        assert!(adopt_now(start, 1000));
+        // Non-8-multiple count (1003) verifies tail clamping on the last AtomicU64 word.
+        assert!(adopt_now(start, 1003));
         assert!(adopted(start) && !adopted(start + 32));
-        let store = |slot: usize| {
-            let a = ADOPTED.read().unwrap();
-            let a = a.as_ref().unwrap();
-            a.slots[slot].store(1, Release);
-            a.chunks[slot / CHUNK].store(1, Release);
+        // Simulate patched assembly's unconditional 1-byte `mov byte [base+idx], 1` stores.
+        let asm_store = |slot: usize| {
+            // SAFETY: MARKS pointers point to 8-byte-aligned `[AtomicU64]` backing buffers.
+            unsafe {
+                (*MARKS.slots.load(Acquire).add(slot)).store(1, Release);
+                (*MARKS.chunks.load(Acquire).add(slot / CHUNK)).store(1, Release);
+            }
         };
-        store(5);
+        assert_eq!(MARKS.slots.load(Acquire) as usize % 8, 0, "slots must be 8-byte aligned");
+        assert_eq!(MARKS.chunks.load(Acquire) as usize % 8, 0, "chunks must be 8-byte aligned");
+        asm_store(5);
         mark(start + 6 * 32 + 7);
+        mark(start + 7 * 32);
+        asm_store(8); // crosses AtomicU64 word boundary (7 -> 8)
+        mark(start + 127 * 32);
+        asm_store(128); // crosses CHUNK=128 boundary (127 -> 128)
         mark(start + 300 * 32);
-        store(999);
+        asm_store(1002); // last valid slot in tail AtomicU64 word
         mark(start - 32);
-        mark(start + 1000 * 32);
-        assert_eq!(take(start).unwrap(), [(5, 2), (300, 1), (999, 1)]);
+        mark(start + 1003 * 32);
+        assert_eq!(
+            take(start).unwrap(),
+            [(5, 4), (127, 2), (300, 1), (1002, 1)]
+        );
         assert_eq!(take(start).unwrap(), []);
         assert!(take(start + 32).is_none());
         let_go(start);
         mark(start + 5 * 32);
         assert!(take(start).is_none());
         assert_eq!(MARKS.len.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn put_back_pages_preserves_unvisited_fallback_pages() {
+        let mut f = FALLBACK.lock().unwrap_or_else(|e| e.into_inner());
+        f.pages.clear();
+        f.looked = 0;
+        f.next = 0;
+        drop(f);
+        asked(&[(0x10_0000, 0x13_0000)]);
+        let pages = to_check(99);
+        assert_eq!(pages, [0x10_0000, 0x11_0000, 0x12_0000]);
+        put_back_pages(&pages[1..]);
+        let again = to_check(100);
+        assert_eq!(again, [0x11_0000, 0x12_0000]);
     }
 }

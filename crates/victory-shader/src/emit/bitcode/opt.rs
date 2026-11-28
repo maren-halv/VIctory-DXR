@@ -30,7 +30,7 @@
 //! Which passes run is `emit::shader_opt()` (`VICTORY_SHADER_OPT`), part of
 //! the translation and so of the shader cache's key.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::{
     Attr, Bin, Cast, Const, Func, MdDef, Module, Op, Term, Ty, TypeDef, V, for_each_operand, pred,
@@ -112,6 +112,8 @@ struct Tree {
     children: Vec<Vec<usize>>,
     /// Per block: the reached blocks that branch to it, once per edge.
     preds: Vec<Vec<usize>>,
+    /// Immediate dominator of each block (`usize::MAX` if unreachable).
+    idom: Vec<usize>,
 }
 
 /// The comparison that holds exactly when `p` does not (floats 0-15,
@@ -203,10 +205,16 @@ pub(super) enum Effect {
     /// Nothing, but the result depends on memory a store may change
     /// (buffer and texture reads).
     Reads,
+    /// `dx.op.rayQuery_State*`: reads the state of its `RayQuery` handle (`args[1]`).
+    /// Unchanged by memory stores; invalidated only by `RayQueryMut` on the same handle.
+    RayQueryRead,
+    /// `dx.op.rayQuery_*` mutators (`TraceRayInline`, `Proceed`, `Abort`, `Commit*`):
+    /// mutates `args[1]` (`rq`), always kept.
+    RayQueryMut,
     /// Nothing, but the result depends on which lanes run the instruction
     /// (wave and quad operations).
     Lanes,
-    /// Stores, atomics, barriers, outputs, discards: always kept.
+    /// Stores, atomics, barriers, outputs, discards, handle allocations: always kept.
     Writes,
 }
 
@@ -224,11 +232,13 @@ pub(super) fn effect(f: &Func) -> Effect {
         {
             Effect::Pure
         }
+        Some(Attr::ReadOnly) if name.starts_with("rayQuery_State") => Effect::RayQueryRead,
         Some(Attr::ReadOnly) if name.starts_with("wave") => Effect::Lanes,
         Some(Attr::ReadOnly) => Effect::Reads,
         // Declared with the attribute of calls that have effects, and have
         // none: they read the other lanes' values.
         _ if name.starts_with("wave") || name.starts_with("quad") => Effect::Lanes,
+        _ if name.starts_with("rayQuery_") => Effect::RayQueryMut,
         _ => Effect::Writes,
     }
 }
@@ -244,6 +254,9 @@ impl Module {
                 let mut changed = self.merge(passes);
                 if passes & FOLD != 0 {
                     changed |= self.prune();
+                }
+                if passes & LOADS != 0 {
+                    changed |= self.licm();
                 }
                 if !changed {
                     break;
@@ -355,6 +368,7 @@ impl Module {
             order,
             children,
             preds,
+            idom,
         }
     }
 
@@ -853,6 +867,31 @@ impl Module {
         }
     }
 
+    /// Whether `v` is a 24-bit unsigned `RayQuery` state scalar (`InstanceId`,
+    /// `GeometryIndex`, `InstanceContribution`, candidate or committed).
+    fn is_rq_u24(&self, v: V) -> bool {
+        let V::Inst(id) = v else { return false };
+        let Op::Call(f, args) = &self.insts[id as usize].op else {
+            return false;
+        };
+        self.funcs[*f as usize].name == "dx.op.rayQuery_StateScalar.i32"
+            && args
+                .first()
+                .and_then(|&op| self.int_k(op))
+                .is_some_and(|(w, op)| w == 32 && matches!(op, 202 | 203 | 208 | 209 | 214 | 215))
+    }
+
+    /// Whether `v` is bitwise NOT of `x` (`xor(x, all_ones)` for width `bits`).
+    fn is_bitnot_of(&self, v: V, x: V, bits: u32) -> bool {
+        let V::Inst(id) = v else { return false };
+        let Op::Bin(Bin::Xor, a, b) = self.insts[id as usize].op else {
+            return false;
+        };
+        let all = mask(bits);
+        (a == x && self.int_k(b) == Some((bits, all)))
+            || (b == x && self.int_k(a) == Some((bits, all)))
+    }
+
     /// The constant `x` of the integer type `ty`, kept sign-extended as
     /// [`Module::i32`] and [`Module::bool`] keep theirs.
     fn k(&mut self, ty: Ty, bits: u32, x: u64) -> V {
@@ -907,6 +946,65 @@ impl Module {
                     (Bin::Or, _, Some(m)) if m == all => Some(b),
                     (Bin::Or, Some(m), _) if m == all => Some(a),
                     (Bin::And | Bin::Or, _, _) if a == b => Some(a),
+                    (Bin::Sub | Bin::Xor, _, _) if a == b => Some(self.k(ty, bits, 0)),
+                    // `x & ~x = 0`, `x | ~x = -1`, `(x ^ k) ^ k = x`.
+                    (Bin::And, _, _)
+                        if self.is_bitnot_of(a, b, bits) || self.is_bitnot_of(b, a, bits) =>
+                    {
+                        Some(self.k(ty, bits, 0))
+                    }
+                    (Bin::Or, _, _)
+                        if self.is_bitnot_of(a, b, bits) || self.is_bitnot_of(b, a, bits) =>
+                    {
+                        Some(self.k(ty, bits, all))
+                    }
+                    (Bin::Xor, None, Some(k)) => {
+                        if let V::Inst(x) = a
+                            && let Op::Bin(Bin::Xor, x0, x1) = self.insts[x as usize].op
+                        {
+                            if self.int_k(x1) == Some((bits, k)) {
+                                return Some(x0);
+                            }
+                            if self.int_k(x0) == Some((bits, k)) {
+                                return Some(x1);
+                            }
+                        }
+                        None
+                    }
+                    (Bin::Xor, Some(k), None) => {
+                        if let V::Inst(x) = b
+                            && let Op::Bin(Bin::Xor, x0, x1) = self.insts[x as usize].op
+                        {
+                            if self.int_k(x1) == Some((bits, k)) {
+                                return Some(x0);
+                            }
+                            if self.int_k(x0) == Some((bits, k)) {
+                                return Some(x1);
+                            }
+                        }
+                        None
+                    }
+                    // 24-bit unsigned RayQuery scalars: `x & 0xFFFFFF -> x`, `(x << k) >>u k -> x`.
+                    (Bin::And, _, Some(m))
+                        if bits == 32 && (m & 0x00FF_FFFF) == 0x00FF_FFFF && self.is_rq_u24(a) =>
+                    {
+                        Some(a)
+                    }
+                    (Bin::And, Some(m), _)
+                        if bits == 32 && (m & 0x00FF_FFFF) == 0x00FF_FFFF && self.is_rq_u24(b) =>
+                    {
+                        Some(b)
+                    }
+                    (Bin::LShr, _, Some(k)) if bits == 32 && (1..=8).contains(&k) => {
+                        if let V::Inst(sh) = a
+                            && let Op::Bin(Bin::Shl, x, sh_k) = self.insts[sh as usize].op
+                            && self.int_k(sh_k) == Some((32, k))
+                            && self.is_rq_u24(x)
+                        {
+                            return Some(x);
+                        }
+                        None
+                    }
                     _ => None,
                 }
             }
@@ -990,11 +1088,53 @@ impl Module {
                 if t == f {
                     return Some(t);
                 }
-                if self.int_bits(ty) == Some(1)
-                    && self.int_k(t).is_some_and(|k| k.1 == 1)
-                    && self.int_k(f).is_some_and(|k| k.1 == 0)
-                {
-                    return Some(c);
+                if self.int_bits(ty) == Some(1) {
+                    let t_eff = if let Some((_, k)) = self.int_k(t) {
+                        Some(k != 0)
+                    } else if t == c {
+                        Some(true)
+                    } else if self.is_bitnot_of(t, c, 1) {
+                        Some(false)
+                    } else {
+                        None
+                    };
+                    let f_eff = if let Some((_, k)) = self.int_k(f) {
+                        Some(k != 0)
+                    } else if f == c {
+                        Some(false)
+                    } else if self.is_bitnot_of(f, c, 1) {
+                        Some(true)
+                    } else {
+                        None
+                    };
+                    match (t_eff, f_eff) {
+                        (Some(true), Some(true)) => return Some(self.bool(true)),
+                        (Some(false), Some(false)) => return Some(self.bool(false)),
+                        (Some(true), Some(false)) => return Some(c),
+                        (Some(false), Some(true)) => {
+                            if self.is_bitnot_of(t, c, 1) {
+                                return Some(t);
+                            }
+                            if self.is_bitnot_of(f, c, 1) {
+                                return Some(f);
+                            }
+                            if let V::Inst(ci) = c
+                                && let Op::Bin(Bin::Xor, x0, x1) = self.insts[ci as usize].op
+                            {
+                                if self.int_k(x1) == Some((1, 1)) {
+                                    return Some(x0);
+                                }
+                                if self.int_k(x0) == Some((1, 1)) {
+                                    return Some(x1);
+                                }
+                            }
+                            let yes = self.bool(true);
+                            self.insts[i as usize].op = Op::Bin(Bin::Xor, c, yes);
+                            *changed = true;
+                            return None;
+                        }
+                        _ => {}
+                    }
                 }
                 if inner {
                     self.insts[i as usize].op = Op::Select(c, t, f);
@@ -1209,6 +1349,36 @@ impl Module {
                 }
             }
         }
+        // Per-block `RayQueryMut` handles (`None` = unknown/wildcard) for cross-block
+        // dominated `RayQueryRead` CSE.
+        let has_rq = passes & LOADS != 0
+            && effects
+                .iter()
+                .any(|&e| matches!(e, Effect::RayQueryRead | Effect::RayQueryMut));
+        let mut block_rq_muts: Vec<Vec<Option<V>>> = if has_rq {
+            vec![Vec::new(); self.blocks.len()]
+        } else {
+            Vec::new()
+        };
+        if has_rq {
+            for &b in &tree.order {
+                for &i in &self.blocks[b].body {
+                    if self.class(&effects, i) == Effect::RayQueryMut {
+                        let rq = match &self.insts[i as usize].op {
+                            Op::Call(_, args) => args.get(1).map(|&v| resolve(&repl, v)),
+                            _ => None,
+                        };
+                        if !block_rq_muts[b].contains(&rq) {
+                            block_rq_muts[b].push(rq);
+                        }
+                    }
+                }
+            }
+        }
+        let mut rq_clean_cache: HashMap<(Option<V>, usize, usize), bool> = HashMap::new();
+        let mut rq_dom_known: HashMap<Key, (V, usize)> = HashMap::new();
+        let mut rq_local: HashMap<Key, (V, Option<V>)> = HashMap::new();
+        let mut rq_mut_in_cur: Vec<Option<V>> = Vec::new();
         // The values every path to the block being walked has computed
         // (those of the blocks above it in the tree, and its own so far).
         let mut known: HashMap<Key, V> = HashMap::new();
@@ -1218,15 +1388,25 @@ impl Module {
         let (yes, no) = (self.bool(true), self.bool(false));
         enum Step {
             Enter(usize),
-            Leave(Vec<Key>, Learned),
+            Leave(Vec<Key>, Vec<(Key, Option<(V, usize)>)>, Learned),
         }
         let mut steps = vec![Step::Enter(0)];
         while let Some(step) = steps.pop() {
             let b = match step {
                 Step::Enter(b) => b,
-                Step::Leave(keys, learned) => {
+                Step::Leave(keys, rq_undo, learned) => {
                     for k in keys {
                         known.remove(&k);
+                    }
+                    for (k, prev) in rq_undo.into_iter().rev() {
+                        match prev {
+                            Some(v) => {
+                                rq_dom_known.insert(k, v);
+                            }
+                            None => {
+                                rq_dom_known.remove(&k);
+                            }
+                        }
                     }
                     for v in learned.bits {
                         facts.bits.remove(&v);
@@ -1254,6 +1434,8 @@ impl Module {
                 None => v,
             };
             read.clear();
+            rq_local.clear();
+            rq_mut_in_cur.clear();
             // Two joins of the same values from the same blocks are one.
             if passes & REUSE != 0 && self.blocks[b].phis.len() > 1 {
                 let mut joins: HashMap<Vec<(usize, V)>, V> = HashMap::new();
@@ -1320,6 +1502,47 @@ impl Module {
                     known.insert(key.clone(), V::Inst(i));
                     added.push(key);
                 }
+                if passes & LOADS != 0
+                    && class == Effect::RayQueryRead
+                    && let Some(key) = self.key(i)
+                {
+                    let rq = match &self.insts[i as usize].op {
+                        Op::Call(_, args) => args.get(1).copied(),
+                        _ => None,
+                    };
+                    if let Some(&(first, _)) = rq_local.get(&key) {
+                        repl[i as usize] = Some(first);
+                        changed = true;
+                        continue;
+                    }
+                    let mut_in_cur = rq_mut_in_cur
+                        .iter()
+                        .any(|m| m.is_none() || rq.is_none() || *m == rq);
+                    if !mut_in_cur
+                        && let Some(&(first, def_blk)) = rq_dom_known.get(&key)
+                        && Self::rq_path_clean(
+                            rq,
+                            def_blk,
+                            b,
+                            &tree.preds,
+                            &block_rq_muts,
+                            &mut rq_clean_cache,
+                        )
+                    {
+                        repl[i as usize] = Some(first);
+                        changed = true;
+                        continue;
+                    }
+                    rq_local.insert(key, (V::Inst(i), rq));
+                }
+                if passes & LOADS != 0 && class == Effect::RayQueryMut {
+                    let rq = match &self.insts[i as usize].op {
+                        Op::Call(_, args) => args.get(1).copied(),
+                        _ => None,
+                    };
+                    rq_mut_in_cur.push(rq);
+                    rq_local.retain(|_, (_, r)| !(rq.is_none() || r.is_none() || *r == rq));
+                }
                 // Reads of memory, and wave operations (the same lanes run
                 // the whole block): the block's own earlier one.
                 if passes & LOADS != 0
@@ -1343,7 +1566,12 @@ impl Module {
                 let c = known_bit(&facts, resolve(&repl, c));
                 self.blocks[b].term = Some(Term::CondBr(c, t, f));
             }
-            steps.push(Step::Leave(added, learned));
+            let mut rq_undo = Vec::new();
+            for (k, (v, _)) in rq_local.drain() {
+                let prev = rq_dom_known.insert(k.clone(), (v, b));
+                rq_undo.push((k, prev));
+            }
+            steps.push(Step::Leave(added, rq_undo, learned));
             for &c in tree.children[b].iter().rev() {
                 steps.push(Step::Enter(c));
             }
@@ -1368,18 +1596,353 @@ impl Module {
         true
     }
 
-    /// [`FOLD`]: a branch on a constant goes one way. The side not taken
-    /// loses the branching block's values at its joins, and so do the joins
-    /// of blocks that nothing reaches any more. Returns whether a branch
-    /// changed.
+    /// Whether every CFG path from `def_blk` to the entry of `cur_blk` (including loop
+    /// back-edges through `cur_blk`) is free of `RayQueryMut` calls affecting `rq`.
+    fn rq_path_clean(
+        rq: Option<V>,
+        def_blk: usize,
+        cur_blk: usize,
+        preds: &[Vec<usize>],
+        block_rq_muts: &[Vec<Option<V>>],
+        cache: &mut HashMap<(Option<V>, usize, usize), bool>,
+    ) -> bool {
+        if def_blk == cur_blk {
+            return true;
+        }
+        if let Some(&ok) = cache.get(&(rq, def_blk, cur_blk)) {
+            return ok;
+        }
+        let mut visited = vec![false; preds.len()];
+        // Intentionally do NOT pre-mark `cur_blk` so cycles back into `cur_blk` check `cur_blk`.
+        let mut stack: Vec<usize> = preds[cur_blk].clone();
+        while let Some(x) = stack.pop() {
+            if x == def_blk || visited[x] {
+                continue;
+            }
+            visited[x] = true;
+            if block_rq_muts[x]
+                .iter()
+                .any(|m| m.is_none() || rq.is_none() || *m == rq)
+            {
+                cache.insert((rq, def_blk, cur_blk), false);
+                return false;
+            }
+            stack.extend_from_slice(&preds[x]);
+        }
+        cache.insert((rq, def_blk, cur_blk), true);
+        true
+    }
+
+    /// Whether `h` is an annotated read-only SRV buffer handle (`kind & 0x1000 == 0`
+    /// and `kind & 0xFF in 10..=12`), and whether it is one of the always-bound immutable
+    /// host stride root SRVs (`t255` `SLOT_STRIDES` or `t252` `SLOT_TABLE_STRIDES`).
+    fn srv_handle_kind(&self, h: V) -> (bool, bool) {
+        let V::Inst(a) = h else {
+            return (false, false);
+        };
+        let Op::Call(f, args) = &self.insts[a as usize].op else {
+            return (false, false);
+        };
+        if self.funcs[*f as usize].name != "dx.op.annotateHandle" || args.len() < 3 {
+            return (false, false);
+        }
+        let V::Const(props) = args[2] else {
+            return (false, false);
+        };
+        let Const::Aggregate(fields) = &self.consts[props as usize].1 else {
+            return (false, false);
+        };
+        let Some(&Const::Int(kind)) = fields.first().map(|&c| &self.consts[c as usize].1) else {
+            return (false, false);
+        };
+        let is_ro_buf = (kind & 0x1000) == 0 && matches!(kind & 0xFF, 10..=12);
+        if !is_ro_buf {
+            return (false, false);
+        }
+        let mut is_stride_srv = false;
+        if (kind & 0xFF) == 11
+            && let V::Inst(c) = args[1]
+            && let Op::Call(cf, cargs) = &self.insts[c as usize].op
+            && self.funcs[*cf as usize].name == "dx.op.createHandleFromBinding"
+            && cargs.len() >= 2
+            && let V::Const(bc) = cargs[1]
+            && let Const::Aggregate(bf) = &self.consts[bc as usize].1
+            && bf.len() >= 4
+        {
+            if let (
+                Const::Int(lo),
+                Const::Int(hi),
+                Const::Int(space),
+                Const::Int(class),
+            ) = (
+                &self.consts[bf[0] as usize].1,
+                &self.consts[bf[1] as usize].1,
+                &self.consts[bf[2] as usize].1,
+                &self.consts[bf[3] as usize].1,
+            ) {
+                is_stride_srv = *space == i64::from(super::super::shader::ROOT_CBV_SPACE)
+                    && *class == 0
+                    && *lo == *hi
+                    && (*lo == i64::from(super::super::shader::SLOT_STRIDES)
+                        || *lo == i64::from(super::super::shader::SLOT_TABLE_STRIDES));
+            }
+        }
+        (true, is_stride_srv)
+    }
+
+    fn dominates(idom: &[usize], a: usize, mut b: usize) -> bool {
+        while b != a {
+            let p = idom[b];
+            if p == b || p == usize::MAX {
+                return false;
+            }
+            b = p;
+        }
+        true
+    }
+
+    /// [`LOADS`] LICM: hoists loop-invariant immutable stride SRV loads (`t255`/`t252`)
+    /// from anywhere in a natural loop, and must-execute (`B == header`) read-only SRV
+    /// buffer loads in loops without memory writes, into the loop's dedicated preheader
+    /// along with their loop-invariant pure operands and `Extract`s.
+    fn licm(&mut self) -> bool {
+        if self.blocks.len() < 2 {
+            return false;
+        }
+        let effects = self.effects();
+        let tree = self.dominator_tree();
+        // Discover natural loops by back-edges `latch -> header` where `header dom latch`.
+        let mut back_edges: HashMap<usize, Vec<usize>> = HashMap::new();
+        for &b in &tree.order {
+            for &s in successors(self.blocks[b].term).iter() {
+                if Self::dominates(&tree.idom, s, b) {
+                    back_edges.entry(s).or_default().push(b);
+                }
+            }
+        }
+        if back_edges.is_empty() {
+            return false;
+        }
+        let mut loops: Vec<(usize, HashSet<usize>)> = Vec::with_capacity(back_edges.len());
+        for (h, latches) in back_edges {
+            let mut body: HashSet<usize> = HashSet::new();
+            body.insert(h);
+            let mut stack = latches;
+            while let Some(x) = stack.pop() {
+                if body.insert(x) {
+                    stack.extend_from_slice(&tree.preds[x]);
+                }
+            }
+            // Require reducible natural loop (`h` dominates every block in `body`).
+            if body.iter().all(|&b| Self::dominates(&tree.idom, h, b)) {
+                loops.push((h, body));
+            }
+        }
+        // Process innermost loops first so hoisted ops cascade outward.
+        loops.sort_by_key(|(_, body)| body.len());
+
+        let mut def_block = vec![usize::MAX; self.insts.len()];
+        for &b in &tree.order {
+            for &i in self.blocks[b].phis.iter().chain(&self.blocks[b].body) {
+                def_block[i as usize] = b;
+            }
+        }
+
+        let mut any_changed = false;
+        for (h, loop_blocks) in loops {
+            let outside_preds: Vec<usize> = tree.preds[h]
+                .iter()
+                .copied()
+                .filter(|p| !loop_blocks.contains(p))
+                .collect();
+            if outside_preds.len() != 1 {
+                continue;
+            }
+            let pre = outside_preds[0];
+            if !matches!(self.blocks[pre].term, Some(Term::Br(t)) if t == h) {
+                continue;
+            }
+
+            let mut loop_has_mem_writes = false;
+            for &b in &loop_blocks {
+                for &i in &self.blocks[b].body {
+                    let op = &self.insts[i as usize].op;
+                    if matches!(op, Op::Store(..) | Op::AtomicRmw(..) | Op::CmpXchg(..))
+                        || self.class(&effects, i) == Effect::Writes
+                    {
+                        loop_has_mem_writes = true;
+                        break;
+                    }
+                }
+                if loop_has_mem_writes {
+                    break;
+                }
+            }
+
+            // Determine whether an instruction `i` inside `loop_blocks` can be safely
+            // computed in `pre` as a loop-invariant dependency (no div/rem speculation).
+            let safe_pure_dep = |m: &Module, i: u32| -> bool {
+                match &m.insts[i as usize].op {
+                    Op::Bin(Bin::UDiv | Bin::URem, _, _) => false,
+                    Op::Phi(_) | Op::Alloca(..) => false,
+                    _ => m.class(&effects, i) == Effect::Pure,
+                }
+            };
+            // Recursive check (with memoization) for whether every loop-defined operand
+            // of `i` is a safe hoistable pure op.
+            let mut inv_cache: HashMap<u32, bool> = HashMap::new();
+            fn is_inv_dep(
+                m: &Module,
+                i: u32,
+                loop_blocks: &HashSet<usize>,
+                def_block: &[usize],
+                safe_pure: &impl Fn(&Module, u32) -> bool,
+                cache: &mut HashMap<u32, bool>,
+            ) -> bool {
+                let db = def_block[i as usize];
+                if db == usize::MAX || !loop_blocks.contains(&db) {
+                    return true;
+                }
+                if let Some(&ok) = cache.get(&i) {
+                    return ok;
+                }
+                if !safe_pure(m, i) {
+                    cache.insert(i, false);
+                    return false;
+                }
+                cache.insert(i, false); // cycle guard
+                let mut ok = true;
+                for_each_operand(&m.insts[i as usize].op, |v| {
+                    if ok && let V::Inst(u) = v {
+                        ok = is_inv_dep(m, u, loop_blocks, def_block, safe_pure, cache);
+                    }
+                });
+                cache.insert(i, ok);
+                ok
+            }
+
+            let mut hoist_list: Vec<u32> = Vec::new();
+            let mut hoist_set: HashSet<u32> = HashSet::new();
+            let mut hoisted_loads: HashSet<u32> = HashSet::new();
+
+            fn collect_deps(
+                m: &Module,
+                i: u32,
+                loop_blocks: &HashSet<usize>,
+                def_block: &[usize],
+                hoist_set: &mut HashSet<u32>,
+                hoist_list: &mut Vec<u32>,
+            ) {
+                for_each_operand(&m.insts[i as usize].op, |v| {
+                    if let V::Inst(u) = v {
+                        let db = def_block[u as usize];
+                        if db != usize::MAX && loop_blocks.contains(&db) && !hoist_set.contains(&u)
+                        {
+                            collect_deps(m, u, loop_blocks, def_block, hoist_set, hoist_list);
+                            if hoist_set.insert(u) {
+                                hoist_list.push(u);
+                            }
+                        }
+                    }
+                });
+            }
+
+            // Walk loop blocks in RPO order (`tree.order` filtered by `loop_blocks`).
+            let ordered_loop: Vec<usize> = tree
+                .order
+                .iter()
+                .copied()
+                .filter(|b| loop_blocks.contains(b))
+                .collect();
+            for &b in &ordered_loop {
+                for &i in &self.blocks[b].body {
+                    let Op::Call(f, args) = &self.insts[i as usize].op else {
+                        continue;
+                    };
+                    let name = self.funcs[*f as usize].name.as_str();
+                    if !(name.starts_with("dx.op.rawBufferLoad.")
+                        || name.starts_with("dx.op.bufferLoad."))
+                        || args.len() < 2
+                    {
+                        continue;
+                    }
+                    let (is_ro_srv, is_stride_srv) = self.srv_handle_kind(args[1]);
+                    let eligible = is_stride_srv || (is_ro_srv && !loop_has_mem_writes && b == h);
+                    if !eligible {
+                        continue;
+                    }
+                    let mut operands_inv = true;
+                    for_each_operand(&self.insts[i as usize].op, |v| {
+                        if operands_inv && let V::Inst(u) = v {
+                            operands_inv = is_inv_dep(
+                                self,
+                                u,
+                                &loop_blocks,
+                                &def_block,
+                                &safe_pure_dep,
+                                &mut inv_cache,
+                            );
+                        }
+                    });
+                    if !operands_inv {
+                        continue;
+                    }
+                    collect_deps(
+                        self,
+                        i,
+                        &loop_blocks,
+                        &def_block,
+                        &mut hoist_set,
+                        &mut hoist_list,
+                    );
+                    if hoist_set.insert(i) {
+                        hoist_list.push(i);
+                        hoisted_loads.insert(i);
+                    }
+                }
+            }
+
+            if hoist_list.is_empty() {
+                continue;
+            }
+            // Also hoist `Extract` of hoisted loads so only the extracted scalar crosses the loop.
+            for &b in &ordered_loop {
+                for &i in &self.blocks[b].body {
+                    if let Op::Extract(V::Inst(src), _) = self.insts[i as usize].op
+                        && hoisted_loads.contains(&src)
+                        && hoist_set.insert(i)
+                    {
+                        hoist_list.push(i);
+                    }
+                }
+            }
+            for &b in &ordered_loop {
+                self.blocks[b].body.retain(|i| !hoist_set.contains(i));
+            }
+            for &i in &hoist_list {
+                def_block[i as usize] = pre;
+                self.blocks[pre].body.push(i);
+            }
+            any_changed = true;
+        }
+        any_changed
+    }
+
+    /// [`FOLD`]: a branch on a constant goes one way, and trivial empty diamonds
+    /// collapse directly into their join block. The side not taken loses the
+    /// branching block's values at its joins, and so do the joins of blocks that
+    /// nothing reaches any more. Returns whether any branch changed.
     fn prune(&mut self) -> bool {
         let mut changed = false;
         for b in 0..self.blocks.len() {
             let Some(Term::CondBr(c, t, f)) = self.blocks[b].term else {
                 continue;
             };
-            // Both sides one block: two edges into it, left as they are.
             if t == f {
+                if self.blocks[t].phis.is_empty() {
+                    self.blocks[b].term = Some(Term::Br(t));
+                    changed = true;
+                }
                 continue;
             }
             let Some((_, k)) = self.int_k(c) else {
@@ -1392,6 +1955,108 @@ impl Module {
                 let p = self.blocks[not].phis[n];
                 if let Op::Phi(incoming) = &mut self.insts[p as usize].op {
                     incoming.retain(|&(_, from)| from != b);
+                }
+            }
+        }
+        // Collapse empty diamonds (`b -> {t, f} -> j` and asymmetric `b -> {empty -> j, j}`).
+        let reached_now = self.reached();
+        let mut preds = vec![Vec::new(); self.blocks.len()];
+        for (b, blk) in self.blocks.iter().enumerate() {
+            if !reached_now[b] {
+                continue;
+            }
+            for &s in successors(blk.term).iter() {
+                preds[s].push(b);
+            }
+        }
+        let mut touched = vec![false; self.blocks.len()];
+        for b in 0..self.blocks.len() {
+            if !reached_now[b] || touched[b] {
+                continue;
+            }
+            let Some(Term::CondBr(_, t, f)) = self.blocks[b].term else {
+                continue;
+            };
+            if t == f || touched[t] || touched[f] {
+                continue;
+            }
+            let is_empty_sole = |x: usize| -> Option<usize> {
+                if x == 0 || x == b || preds[x].as_slice() != [b] {
+                    return None;
+                }
+                let blk = &self.blocks[x];
+                if !blk.phis.is_empty() || !blk.body.is_empty() {
+                    return None;
+                }
+                match blk.term {
+                    Some(Term::Br(j)) if j != x => Some(j),
+                    _ => None,
+                }
+            };
+            // Case 1: Symmetric empty diamond `b -> {t, f}`, both empty `Br(j)`.
+            if let (Some(jt), Some(jf)) = (is_empty_sole(t), is_empty_sole(f))
+                && jt == jf
+                && !touched[jt]
+                && !preds[jt].contains(&b)
+            {
+                let j = jt;
+                let phis_match = self.blocks[j].phis.iter().all(|&p| {
+                    let Op::Phi(inc) = &self.insts[p as usize].op else {
+                        return false;
+                    };
+                    let vt = inc.iter().find(|&&(_, from)| from == t).map(|&(v, _)| v);
+                    let vf = inc.iter().find(|&&(_, from)| from == f).map(|&(v, _)| v);
+                    vt.is_some() && vt == vf
+                });
+                if phis_match {
+                    self.blocks[b].term = Some(Term::Br(j));
+                    for n in 0..self.blocks[j].phis.len() {
+                        let p = self.blocks[j].phis[n];
+                        if let Op::Phi(inc) = &mut self.insts[p as usize].op {
+                            let v = inc.iter().find(|&&(_, from)| from == t).unwrap().0;
+                            inc.retain(|&(_, from)| from != t && from != f);
+                            inc.push((v, b));
+                        }
+                    }
+                    touched[b] = true;
+                    touched[t] = true;
+                    touched[f] = true;
+                    touched[j] = true;
+                    changed = true;
+                    continue;
+                }
+            }
+            // Case 2: Asymmetric empty diamond `b -> {empty -> j, j}`.
+            let asym = if is_empty_sole(t) == Some(f) {
+                Some((t, f))
+            } else if is_empty_sole(f) == Some(t) {
+                Some((f, t))
+            } else {
+                None
+            };
+            if let Some((empty, j)) = asym
+                && !touched[j]
+            {
+                let phis_match = self.blocks[j].phis.iter().all(|&p| {
+                    let Op::Phi(inc) = &self.insts[p as usize].op else {
+                        return false;
+                    };
+                    let ve = inc.iter().find(|&&(_, from)| from == empty).map(|&(v, _)| v);
+                    let vb = inc.iter().find(|&&(_, from)| from == b).map(|&(v, _)| v);
+                    ve.is_some() && ve == vb
+                });
+                if phis_match {
+                    self.blocks[b].term = Some(Term::Br(j));
+                    for n in 0..self.blocks[j].phis.len() {
+                        let p = self.blocks[j].phis[n];
+                        if let Op::Phi(inc) = &mut self.insts[p as usize].op {
+                            inc.retain(|&(_, from)| from != empty);
+                        }
+                    }
+                    touched[b] = true;
+                    touched[empty] = true;
+                    touched[j] = true;
+                    changed = true;
                 }
             }
         }
@@ -1414,7 +2079,7 @@ impl Module {
     fn has_effect(&self, effects: &[Effect], i: u32) -> bool {
         match &self.insts[i as usize].op {
             Op::Store(..) | Op::AtomicRmw(..) | Op::CmpXchg(..) => true,
-            Op::Call(f, _) => effects[*f as usize] == Effect::Writes,
+            Op::Call(f, _) => matches!(effects[*f as usize], Effect::Writes | Effect::RayQueryMut),
             _ => false,
         }
     }
@@ -2885,5 +3550,252 @@ mod tests {
             .count();
         assert_eq!(helper_calls, 1, "isHelperLane must deduplicate across stores as Effect::Pure");
         m.write();
+    }
+
+    #[test]
+    fn rayquery_cross_block_cse_respects_mutations_and_ignores_memory_stores() {
+        let mut m = Module::default();
+        let void = m.void();
+        let i1 = m.int(1);
+        let i32t = m.int(32);
+        let alloc_ty = m.func_ty(i32t, vec![i32t, i32t]);
+        let proceed_ty = m.func_ty(i1, vec![i32t, i32t]);
+        let state_ty = m.func_ty(i32t, vec![i32t, i32t]);
+        let store_ty = m.func_ty(void, vec![i32t, i32t]);
+        let main_ty = m.func_ty(void, vec![]);
+        for ty in [alloc_ty, proceed_ty, state_ty, store_ty, main_ty] {
+            m.ptr(ty);
+        }
+        let alloc = m.function("dx.op.allocateRayQuery", alloc_ty, Some(Attr::NoUnwind), false);
+        let proceed = m.function(
+            "dx.op.rayQuery_Proceed.i1",
+            proceed_ty,
+            Some(Attr::NoUnwind),
+            false,
+        );
+        let state = m.function(
+            "dx.op.rayQuery_StateScalar.i32",
+            state_ty,
+            Some(Attr::ReadOnly),
+            false,
+        );
+        let store = m.function("dx.op.rawBufferStore.i32", store_ty, Some(Attr::NoUnwind), false);
+        m.function("main", main_ty, None, true);
+
+        let entry = m.new_block();
+        let b_clean = m.new_block();
+        let b_mut = m.new_block();
+        let b_join = m.new_block();
+        let b_loop = m.new_block();
+        let b_exit = m.new_block();
+
+        let (k178, k180, k209, k0, k1) = (m.i32(178), m.i32(180), m.i32(209), m.i32(0), m.i32(1));
+        let rq = m.call(entry, alloc, vec![k178, k0]);
+        let g_entry = m.call(entry, state, vec![k209, rq]);
+        // A memory store does NOT invalidate RayQuery state reads.
+        m.call(entry, store, vec![g_entry, k0]);
+        let g_after_store = m.call(entry, state, vec![k209, rq]);
+        let cond = m.cmp(entry, pred::NE, g_after_store, k0);
+        m.terminate(entry, Term::CondBr(cond, b_clean, b_mut));
+
+        // b_clean: dominated by entry with no RayQueryMut -> must reuse g_entry.
+        let g_clean = m.call(b_clean, state, vec![k209, rq]);
+        m.call(b_clean, store, vec![g_clean, k1]);
+        m.terminate(b_clean, Term::Br(b_join));
+
+        // b_mut: mutates rq -> join must NOT reuse g_entry.
+        let _p1 = m.call(b_mut, proceed, vec![k180, rq]);
+        m.terminate(b_mut, Term::Br(b_join));
+
+        let g_join = m.call(b_join, state, vec![k209, rq]);
+        m.call(b_join, store, vec![g_join, k1]);
+        m.terminate(b_join, Term::Br(b_loop));
+
+        // b_loop: reads state BEFORE proceed on back-edge -> must NOT reuse g_join.
+        let g_loop = m.call(b_loop, state, vec![k209, rq]);
+        m.call(b_loop, store, vec![g_loop, k0]);
+        let cont = m.call(b_loop, proceed, vec![k180, rq]);
+        m.terminate(b_loop, Term::CondBr(cont, b_loop, b_exit));
+        m.terminate(b_exit, Term::Ret);
+
+        m.optimise(MODULE);
+        assert_eq!(stores(&m, b_clean)[0][0], g_entry, "b_clean must reuse entry read across store");
+        assert_ne!(stores(&m, b_join)[0][0], g_entry, "b_join must not reuse across b_mut proceed");
+        assert_ne!(stores(&m, b_loop)[0][0], g_join, "loop header must not reuse across self-loop proceed");
+        let entry_states = m.blocks[entry]
+            .body
+            .iter()
+            .filter(|&&i| matches!(&m.insts[i as usize].op, Op::Call(f, _) if m.funcs[*f as usize].name == "dx.op.rayQuery_StateScalar.i32"))
+            .count();
+        assert_eq!(entry_states, 1, "store between two state reads must not prevent reuse");
+        m.write();
+    }
+
+    #[test]
+    fn rayquery_bitfields_bool_selects_and_empty_diamonds_fold() {
+        let mut m = Module::default();
+        let void = m.void();
+        let i32t = m.int(32);
+        let state_ty = m.func_ty(i32t, vec![i32t, i32t]);
+        let store_ty = m.func_ty(void, vec![i32t, i32t]);
+        let main_ty = m.func_ty(void, vec![]);
+        for ty in [state_ty, store_ty, main_ty] {
+            m.ptr(ty);
+        }
+        let state = m.function(
+            "dx.op.rayQuery_StateScalar.i32",
+            state_ty,
+            Some(Attr::ReadOnly),
+            false,
+        );
+        let store = m.function("dx.op.bufferStore.i32", store_ty, Some(Attr::NoUnwind), false);
+        m.function("main", main_ty, None, true);
+
+        let entry = m.new_block();
+        let d_left = m.new_block();
+        let d_right = m.new_block();
+        let d_join = m.new_block();
+
+        let (k0, k8, k209, k215, mask24) = (
+            m.i32(0),
+            m.i32(8),
+            m.i32(209), // COMMITTED_GEOMETRY_INDEX
+            m.i32(215), // COMMITTED_INSTANCE_CONTRIBUTION
+            m.i32(0x00FF_FFFF),
+        );
+        let (t1, f1) = (m.bool(true), m.bool(false));
+
+        let geom = m.call(entry, state, vec![k209, k0]);
+        let shl = m.bin(entry, Bin::Shl, geom, k8);
+        let lshr = m.bin(entry, Bin::LShr, shl, k8);
+        let contrib = m.call(entry, state, vec![k215, k0]);
+        let masked = m.bin(entry, Bin::And, contrib, mask24);
+
+        let c = m.cmp(entry, pred::NE, geom, k0);
+        let not_c = m.bin(entry, Bin::Xor, c, t1);
+        // select(c, !c, true) -> !c; select(c, false, !c) -> !c; select(c, !c, false) -> false
+        let s1 = m.select(entry, c, not_c, t1);
+        let s2 = m.select(entry, c, f1, not_c);
+        let s3 = m.select(entry, c, not_c, f1);
+        let z1 = m.cast(entry, Cast::ZExt, s1, i32t);
+        let z2 = m.cast(entry, Cast::ZExt, s2, i32t);
+        let z3 = m.cast(entry, Cast::ZExt, s3, i32t);
+
+        // Symmetric empty diamond whose join phi receives the same value on both arms.
+        m.terminate(entry, Term::CondBr(c, d_left, d_right));
+        m.terminate(d_left, Term::Br(d_join));
+        m.terminate(d_right, Term::Br(d_join));
+        let p = m.phi(d_join, i32t);
+        m.set_phi(p, vec![(lshr, d_left), (lshr, d_right)]);
+        m.call(d_join, store, vec![p, masked]);
+        let sum = m.bin(d_join, Bin::Add, z1, z2);
+        m.call(d_join, store, vec![sum, z3]);
+        m.terminate(d_join, Term::Ret);
+
+        m.optimise(MODULE);
+        assert!(
+            matches!(m.blocks[entry].term, Some(Term::Br(t)) if t == d_join),
+            "empty diamond must collapse"
+        );
+        let st = stores(&m, d_join);
+        assert_eq!(st[0][0], geom, "(GeometryIndex << 8) >> 8 must fold to GeometryIndex");
+        assert_eq!(st[0][1], contrib, "InstanceContribution & 0xFFFFFF must fold to InstanceContribution");
+        assert_eq!(st[1][1], k0, "select(c, !c, false) must fold to 0");
+        let V::Inst(sum_i) = st[1][0] else { panic!() };
+        assert!(
+            matches!(m.insts[sum_i as usize].op, Op::Bin(Bin::Add, a, b) if a == b),
+            "select(c, !c, true) and select(c, false, !c) must both fold to !c and CSE"
+        );
+        m.write();
+    }
+
+    #[test]
+    fn licm_hoists_stride_srv_and_readonly_header_loads_but_not_uav_or_written_loops() {
+        let mut s = crate::emit::shader::Shader::new(false);
+        let entry = s.entry;
+        let pre = s.m.new_block();
+        let hdr = s.m.new_block();
+        let inner = s.m.new_block();
+        let exit = s.m.new_block();
+        let i32t = s.t.i32;
+
+        let stride_h = s.root_srv_handle(crate::emit::shader::SLOT_STRIDES);
+        let ro_h = s.root_srv_handle(0);
+        let uav_h = s.root_uav_handle(0);
+        let idx = s.op(entry, "flattenedThreadIdInGroup.i32", Attr::ReadNone, i32t, 96, &[]);
+        s.m.terminate(entry, Term::Br(pre));
+        s.m.terminate(pre, Term::Br(hdr));
+
+        let cnt = s.m.phi(hdr, i32t);
+        let acc = s.m.phi(hdr, i32t);
+        let zero = s.m.i32(0);
+        let one = s.m.i32(1);
+        let four = s.m.i32(4);
+        let undef = s.m.undef(i32t);
+        let mask1 = s.m.i8(1);
+        let align4 = s.m.i32(4);
+        let c139 = s.m.i32(139);
+        let i8t = s.m.int(8);
+        let res_i32 = s
+            .m
+            .named_struct("dx.types.ResRet.i32", vec![i32t, i32t, i32t, i32t, i32t]);
+        let load_ty = s.m.func_ty(
+            res_i32,
+            vec![i32t, s.t.handle, i32t, i32t, i8t, i32t],
+        );
+        s.m.ptr(load_ty);
+        let raw_load = s.m.function("dx.op.rawBufferLoad.i32", load_ty, Some(Attr::ReadOnly), false);
+
+        // Must-execute read-only SRV load in header + UAV load in header (must NOT hoist!).
+        let c2 = s.m.i32(2);
+        let byte_off = s.m.bin(hdr, Bin::Shl, idx, c2);
+        let ro_ret = s.m.call(hdr, raw_load, vec![c139, ro_h, byte_off, undef, mask1, align4]);
+        let ro_val = s.m.extract(hdr, ro_ret, 0);
+        let uav_ret = s.m.call(hdr, raw_load, vec![c139, uav_h, byte_off, undef, mask1, align4]);
+        let uav_val = s.m.extract(hdr, uav_ret, 0);
+        let cond = s.m.cmp(hdr, pred::IULT, cnt, four);
+        s.m.terminate(hdr, Term::CondBr(cond, inner, exit));
+
+        // Conditional block inside loop reading t255 stride table -> MUST hoist to `pre`!
+        let st_off = s.m.bin(inner, Bin::Shl, idx, c2);
+        let st_ret = s.m.call(inner, raw_load, vec![c139, stride_h, st_off, undef, mask1, align4]);
+        let st_val = s.m.extract(inner, st_ret, 0);
+        let sum1 = s.m.bin(inner, Bin::Add, acc, ro_val);
+        let sum2 = s.m.bin(inner, Bin::Add, sum1, uav_val);
+        let sum3 = s.m.bin(inner, Bin::Add, sum2, st_val);
+        let next = s.m.bin(inner, Bin::Add, cnt, one);
+        s.m.terminate(inner, Term::Br(hdr));
+        s.m.set_phi(cnt, vec![(zero, pre), (next, inner)]);
+        s.m.set_phi(acc, vec![(zero, pre), (sum3, inner)]);
+
+        // Store final acc in exit so everything stays live.
+        let store_ty = s.m.func_ty(
+            s.t.void,
+            vec![i32t, s.t.handle, i32t, i32t, i32t, i32t, i32t, i32t, i8t, i32t],
+        );
+        s.m.ptr(store_ty);
+        let raw_store = s.m.function("dx.op.rawBufferStore.i32", store_ty, Some(Attr::NoUnwind), false);
+        let c140 = s.m.i32(140);
+        s.m.call(
+            exit,
+            raw_store,
+            vec![c140, uav_h, zero, undef, acc, undef, undef, undef, mask1, align4],
+        );
+        s.m.terminate(exit, Term::Ret);
+
+        s.m.optimise(MODULE);
+        let count_loads = |blk: usize| {
+            s.m.blocks[blk]
+                .body
+                .iter()
+                .filter(|&&i| {
+                    matches!(&s.m.insts[i as usize].op, Op::Call(f, _) if s.m.funcs[*f as usize].name == "dx.op.rawBufferLoad.i32")
+                })
+                .count()
+        };
+        assert_eq!(count_loads(pre), 2, "t255 stride load + header read-only SRV load must hoist to preheader");
+        assert_eq!(count_loads(hdr), 1, "UAV load must remain in header");
+        assert_eq!(count_loads(inner), 0, "t255 stride load must leave inner block");
+        s.m.write();
     }
 }

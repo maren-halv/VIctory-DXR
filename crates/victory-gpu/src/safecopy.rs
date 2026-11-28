@@ -45,22 +45,32 @@ std::arch::global_asm!(
     ".globl victory_safe_put_failed",
     // rcx destination, rdx what was there, r8 what is to be there, r9 blocks
     // of eight dwords: stores the dwords in which the two differ, and no
-    // other byte. eax: whether all could be stored.
+    // other byte. Uses caller shadow space [rsp + 8 .. rsp + 40) with scalar
+    // tzcnt/blsr stores for partial blocks (avoiding microcoded vpmaskmovd).
+    // eax: whether all could be stored.
     "victory_safe_put:",
     "test r9, r9",
     "jz 4f",
-    "vpcmpeqd ymm3, ymm3, ymm3",
     "2:",
     "vmovdqu ymm1, ymmword ptr [r8]",
     "vpcmpeqd ymm2, ymm1, ymmword ptr [rdx]",
     "vmovmskps eax, ymm2",
+    "xor eax, 255",
+    "jz 3f",
     "cmp eax, 255",
-    "je 3f",
-    "vpxor ymm2, ymm2, ymm3",
+    "je 5f",
+    "vmovdqu ymmword ptr [rsp + 8], ymm1",
+    "6:",
+    "tzcnt r10d, eax",
+    "mov r11d, dword ptr [rsp + 8 + r10 * 4]",
     "victory_safe_put_at:",
-    "vpmaskmovd ymmword ptr [rcx], ymm2, ymm1",
+    "mov dword ptr [rcx + r10 * 4], r11d",
+    "blsr eax, eax",
+    "jnz 6b",
+    "jmp 3f",
+    "5:",
+    "vmovdqu ymmword ptr [rcx], ymm1",
     "victory_safe_put_after:",
-    "nop",
     "3:",
     "add rcx, 32",
     "add rdx, 32",
@@ -80,19 +90,19 @@ std::arch::global_asm!(
     ".globl victory_safe_merge_after",
     ".globl victory_safe_merge_failed",
     // rcx title memory, rdx what the card holds, r8 what it held when last
-    // looked at, r9 blocks of 32 bytes, fifth where the two counts go. Where
-    // a byte of the second differs from the third, it goes into title memory
-    // (as whole dwords, and only dwords that then differ from what is there)
-    // and into the third; each block of title memory is read just before it
-    // is written. rax: the blocks left when a page of title memory could not
-    // be read or written (0: all done). The counts: blocks in which the
-    // second and third differed, dwords stored in title memory.
+    // looked at, r9 blocks of 32 bytes, fifth ([rsp + 40]) where the two
+    // counts go. Where a byte of the second differs from the third, it goes
+    // into title memory (as whole aligned dwords, and only dwords that then
+    // differ from what is there) and into the third; each block of title
+    // memory is read just before it is written. Partial blocks use a tight
+    // scalar tzcnt/blsr loop over the 8-bit dword mask via caller shadow space
+    // [rsp + 8 .. rsp + 40) so rsp/r9/r10/r11 stay exact across any SEH fault.
+    // rax: blocks left on fault (0: all done). Counts: changed blocks, dwords stored.
     "victory_safe_merge:",
     "xor r10d, r10d",
     "xor r11d, r11d",
     "test r9, r9",
     "jz 6f",
-    "vpcmpeqd ymm5, ymm5, ymm5",
     "2:",
     "vmovdqu ymm0, ymmword ptr [rdx]",
     "vpcmpeqb ymm1, ymm0, ymmword ptr [r8]",
@@ -108,15 +118,23 @@ std::arch::global_asm!(
     "jz 4f",
     "cmp eax, 255",
     "je 3f",
-    "vpxor ymm4, ymm4, ymm5",
-    "vpmaskmovd ymmword ptr [rcx], ymm4, ymm3",
-    "jmp 7f",
+    "vmovdqu ymmword ptr [rsp + 8], ymm3",
+    "vmovq xmm4, rdx",
+    "vmovq xmm5, r8",
+    "8:",
+    "tzcnt edx, eax",
+    "mov r8d, dword ptr [rsp + 8 + rdx * 4]",
+    "mov dword ptr [rcx + rdx * 4], r8d",
+    "inc r11",
+    "blsr eax, eax",
+    "jnz 8b",
+    "vmovq rdx, xmm4",
+    "vmovq r8, xmm5",
+    "jmp 4f",
     "3:",
     "vmovdqu ymmword ptr [rcx], ymm3",
     "victory_safe_merge_after:",
-    "7:",
-    "popcnt eax, eax",
-    "add r11, rax",
+    "add r11, 8",
     "4:",
     "inc r10",
     "vmovdqu ymmword ptr [r8], ymm0",
@@ -229,6 +247,17 @@ unsafe extern "system" {
     fn victory_safe_probe_failed();
 }
 
+/// Ensures any active Mode-1 GPU-only `PAGE_NOACCESS` tripwire overlapping
+/// `[addr, addr + len)` is disarmed and demoted before `safecopy` touches it,
+/// so tripwired pages are never misclassified as unmapped zeros (including by
+/// `host::read_sparse` fallback paths).
+#[inline]
+fn ensure_not_tripwired(addr: *const u8, len: usize) {
+    if len != 0 && crate::watch::tripwire_active() {
+        crate::watch::tripwire_touch(addr as usize, len, false);
+    }
+}
+
 /// The records of 32 bytes at `title` (`records` of them) that differ from
 /// those in `seen`: each is read once, goes over the one in `seen`, and gets
 /// its bit in `bits` (record n: bit n % 64 of word n / 64). False if a page
@@ -241,6 +270,7 @@ unsafe extern "system" {
 /// 0; `title` is as [`copy`]'s source. [`on`] must have been asked.
 pub(crate) unsafe fn changed(title: *const u8, seen: *mut u8, records: usize, bits: &mut [u64]) -> bool {
     assert!(bits.len() >= records.div_ceil(64));
+    ensure_not_tripwired(title, records.saturating_mul(32));
     // SAFETY: a fault reading title memory leaves through the failing exit
     // ([`failing_exit`]); the rest is the caller's.
     unsafe { victory_safe_changed(title, seen, records, bits.as_mut_ptr()) != 0 }
@@ -274,6 +304,7 @@ pub(crate) struct Merged {
 /// [`copy`]'s. The stretch lies in one page of 4 KiB of title memory. [`on`]
 /// must have been asked.
 pub(crate) unsafe fn merge(title: *mut u8, now: *const u8, held: *mut u8, len: usize, take: bool) -> Merged {
+    ensure_not_tripwired(title.cast_const(), len);
     let mut out = Merged { there: true, ..Merged::default() };
     let mut at = 0;
     while at < len {
@@ -384,6 +415,7 @@ pub(crate) unsafe fn differ(a: *const u8, b: *const u8, len: usize) -> bool {
 pub(crate) unsafe fn put_changed(dst: *mut u8, was: &[u8], now: &[u8]) -> bool {
     assert_eq!(was.len(), now.len());
     let n = now.len();
+    ensure_not_tripwired(dst.cast_const(), n);
     let head = dst.addr().wrapping_neg() & 3;
     let head = head.min(n);
     let blocks = (n - head) / 32;
@@ -433,6 +465,8 @@ pub(crate) fn on() -> bool {
 /// Of the two ranges, what is not title memory must be valid, and no Rust
 /// reference may cover the destination. [`on`] must have been asked.
 pub(crate) unsafe fn copy(dst: *mut u8, src: *const u8, len: usize) -> bool {
+    ensure_not_tripwired(src, len);
+    ensure_not_tripwired(dst.cast_const(), len);
     // SAFETY: a fault on either side leaves through the failing exit
     // ([`failing_exit`]); the rest is the caller's.
     unsafe { victory_safe_copy(dst, src, len) != 0 }
@@ -449,6 +483,7 @@ pub(crate) unsafe fn probe_readable(addr: *const u8, len: usize, stride: usize) 
     if len == 0 {
         return true;
     }
+    ensure_not_tripwired(addr, len);
     let stride = stride.max(1);
     // SAFETY: a fault reading `addr` leaves through the failing exit
     // ([`failing_exit`]); `stride >= 1` guarantees termination.
@@ -1039,6 +1074,122 @@ mod tests {
             // Unaligned start + tail: chunk 0 (p0..p1), chunk 6 (p6..p7), and tail chunk 7 (p7) are readable.
             assert_eq!(count_readable(pages.0.add(100), 7 * 4096 + 123, 4096), 3);
             assert_eq!(readable_bytes(pages.0.add(100), 7 * 4096 + 123, 4096), 2 * 4096 + 123);
+        }
+    }
+
+    #[test]
+    fn safecopy_recognizes_tripwire_pages_and_never_zeroes_them() {
+        assert!(on());
+        let src = Pages::new(4 * 4096);
+        let dst = Pages::new(4 * 4096);
+        src.fill();
+        let id = 0x5AFE_C091u64;
+        let arm_retry = |tid: u64| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !crate::watch::tripwire_arm(tid, src.0 as usize, src.1) {
+                assert!(std::time::Instant::now() < deadline, "tripwire_arm timed out");
+                std::thread::yield_now();
+            }
+        };
+        arm_retry(id);
+        assert!(crate::watch::tripwire_active());
+        // SAFETY: both allocations are live; safecopy must disarm the tripwire
+        // and read the true bytes rather than treating PAGE_NOACCESS as unmapped.
+        unsafe {
+            assert!(probe_readable(src.0, src.1, 4096));
+        }
+        // Re-arm and test `copy()` directly as well.
+        arm_retry(id + 1);
+        unsafe {
+            std::ptr::write_bytes(dst.0, 0, dst.1);
+            assert!(copy(dst.0, src.0, src.1));
+            let s = std::slice::from_raw_parts(src.0, src.1);
+            let d = std::slice::from_raw_parts(dst.0, dst.1);
+            assert_eq!(d, s);
+        }
+        crate::watch::tripwire_disarm_id(id);
+        crate::watch::tripwire_disarm_id(id + 1);
+    }
+
+    /// Exhaustive parity check over all 256 8-dword bitmasks for scalar
+    /// `tzcnt`/`blsr` `victory_safe_merge` & `victory_safe_put`, including
+    /// `title == now` no-op store skip on read-only pages.
+    #[test]
+    fn tzcnt_blsr_merge_and_put_cover_all_256_dword_masks_and_noop_skip() {
+        assert!(on());
+        let pages = Pages::new(4096);
+        let mut old = 0u32;
+        for mask in 0u16..=255 {
+            let mut title_init = [0x11u8; 32];
+            let mut held = [0x22u8; 32];
+            let mut now = held;
+            for d in 0..8usize {
+                title_init[d * 4..d * 4 + 4].copy_from_slice(&(0x1000u32 + d as u32).to_le_bytes());
+                if (mask >> d) & 1 != 0 {
+                    // Mutate only 1 byte inside the dword (always high-bit set so it never
+                    // equals `held` (0x22) or `title_init` (bytes <= 0x10)).
+                    let byte_off = d * 4 + (d % 4);
+                    now[byte_off] = 0x80 | ((d as u8).wrapping_mul(13).wrapping_add(mask as u8) & 0x7F);
+                }
+            }
+            // SAFETY: inside our committed 4 KiB page.
+            let done = unsafe {
+                std::ptr::copy_nonoverlapping(title_init.as_ptr(), pages.0, 32);
+                merge(pages.0, now.as_ptr(), held.as_mut_ptr(), 32, false)
+            };
+            assert!(done.there);
+            assert_eq!(done.new, u64::from(mask != 0), "mask {mask:#04x}");
+            assert_eq!(done.dwords, u64::from(mask.count_ones()), "mask {mask:#04x}");
+            assert_eq!(held, now);
+            // SAFETY: inside our committed page.
+            let got = unsafe { std::slice::from_raw_parts(pages.0, 32) };
+            for i in 0..32 {
+                let d = i / 4;
+                let expect = if (mask >> d) & 1 != 0 && i == d * 4 + (d % 4) {
+                    now[i]
+                } else {
+                    title_init[i]
+                };
+                assert_eq!(got[i], expect, "mask {mask:#04x} byte {i}");
+            }
+
+            // `put_changed` parity on the same 8-dword mask.
+            let was_put = [0x33u8; 32];
+            let mut now_put = was_put;
+            for d in 0..8usize {
+                if (mask >> d) & 1 != 0 {
+                    now_put[d * 4..d * 4 + 4].copy_from_slice(&(0x5000u32 + d as u32).to_le_bytes());
+                }
+            }
+            // SAFETY: inside our committed page.
+            unsafe {
+                std::ptr::write_bytes(pages.0, 0xCC, 32);
+                assert!(put_changed(pages.0, &was_put, &now_put));
+                let got_put = std::slice::from_raw_parts(pages.0, 32);
+                for d in 0..8usize {
+                    let expect = if (mask >> d) & 1 != 0 {
+                        &now_put[d * 4..d * 4 + 4]
+                    } else {
+                        &[0xCC; 4][..]
+                    };
+                    assert_eq!(&got_put[d * 4..d * 4 + 4], expect, "put mask {mask:#04x} dword {d}");
+                }
+            }
+        }
+
+        // `title == now` no-op skip invariant (V2): even when `now != held`, if
+        // title memory already holds `now`, `merge` must issue ZERO stores (so
+        // it succeeds without faulting on a `PAGE_READONLY` page!).
+        let mut held = [0x01u8; 32];
+        let now = [0x77u8; 32];
+        // SAFETY: our committed page, protected RO during merge and restored to RW.
+        unsafe {
+            std::ptr::copy_nonoverlapping(now.as_ptr(), pages.0, 32);
+            assert_ne!(VirtualProtect(pages.0.cast(), 4096, PAGE_READONLY, &mut old), 0);
+            let done = merge(pages.0, now.as_ptr(), held.as_mut_ptr(), 32, false);
+            assert_ne!(VirtualProtect(pages.0.cast(), 4096, PAGE_READWRITE, &mut old), 0);
+            assert_eq!(done, Merged { new: 1, dwords: 0, there: true });
+            assert_eq!(held, now);
         }
     }
 }

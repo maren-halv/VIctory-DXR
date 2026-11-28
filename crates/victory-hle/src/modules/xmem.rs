@@ -11,7 +11,9 @@ use std::alloc::{Layout, alloc, dealloc};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{
+    Arc, Condvar, LazyLock, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
+};
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_COMMITMENT_LIMIT, HANDLE, INVALID_HANDLE_VALUE,
@@ -21,8 +23,8 @@ use windows_sys::Win32::System::Memory::{
     MEM_EXTENDED_PARAMETER, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER,
     MEM_RESERVE, MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS,
     MapViewOfFile3, MemExtendedParameterAddressRequirements, PAGE_NOACCESS, PAGE_READWRITE,
-    SEC_COMMIT, SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree,
-    VirtualQueryEx,
+    ResetWriteWatch, SEC_COMMIT, SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2,
+    VirtualFree, VirtualProtect, VirtualQueryEx,
 };
 use windows_sys::Win32::System::ProcessStatus::{
     K32GetPerformanceInfo, K32GetProcessMemoryInfo, PERFORMANCE_INFORMATION,
@@ -116,9 +118,25 @@ struct PrivateRegionEntry {
     write_watched: bool,
 }
 
+/// Tracked committed private virtual bytes owned by the title.
+static TRACKED_VIRTUAL_BYTES: AtomicUsize = AtomicUsize::new(0);
+/// Tracked live 64 KiB physical pages allocated by the title.
+static TRACKED_PHYSICAL_PAGES: AtomicUsize = AtomicUsize::new(0);
+/// Tracked live non-32-bit `XMemAllocDefault` heap bytes.
+static TRACKED_HEAP_BYTES: AtomicUsize = AtomicUsize::new(0);
+
 /// Tracked non-placeholder `XMemVirtualAlloc` regions, keyed by range base.
 static PRIVATE_REGIONS: LazyLock<RwLock<BTreeMap<usize, PrivateRegionEntry>>> =
     LazyLock::new(Default::default);
+
+fn sync_tracked_virtual_bytes(regions: &BTreeMap<usize, PrivateRegionEntry>) {
+    let total: usize = regions
+        .values()
+        .filter(|e| e.committed)
+        .map(|e| e.len)
+        .sum();
+    TRACKED_VIRTUAL_BYTES.store(total, Ordering::Relaxed);
+}
 
 fn clear_private_overlaps(
     regions: &mut BTreeMap<usize, PrivateRegionEntry>,
@@ -273,6 +291,7 @@ fn private_region_alloc(requested_base: usize, at: usize, size: usize, kind: u32
             },
         );
     }
+    sync_tracked_virtual_bytes(&regions);
     bump_generation();
 }
 
@@ -309,6 +328,7 @@ fn private_region_free(address: usize, size: usize, kind: u32) {
             set_private_committed(&mut regions, start, end, false);
         }
     }
+    sync_tracked_virtual_bytes(&regions);
     bump_generation();
 }
 
@@ -388,6 +408,112 @@ fn address_range(flags: u64) -> (usize, usize) {
     (1 << 32, (1 << bits) - 1)
 }
 
+/// Maximum single allocation eligible for the `XMemVirtualAlloc` freelist.
+const RECYCLE_MAX_ALLOC: usize = 16 * MIB;
+/// Default total bytes retained in the `XMemVirtualAlloc` freelist (`VICTORY_XMEM_RECYCLE_MB`).
+const DEFAULT_RECYCLE_POOL_MB: usize = 64;
+/// Maximum cached blocks per `(alloc_size, align, lowest, highest)` class.
+const RECYCLE_BUCKET_CAP: usize = 8;
+
+fn recycle_max_bytes() -> usize {
+    static MAX: LazyLock<usize> = LazyLock::new(|| {
+        std::env::var("VICTORY_XMEM_RECYCLE_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(DEFAULT_RECYCLE_POOL_MB)
+            .saturating_mul(MIB)
+    });
+    *MAX
+}
+
+/// Rounds `size` up to a tight 64 KiB-aligned size class (`<= 25%` slack).
+fn recycle_class_size(size: usize) -> usize {
+    let min = size.next_multiple_of(PAGE);
+    if min <= 256 * 1024 {
+        min.next_power_of_two().max(PAGE)
+    } else {
+        let step = (min.next_power_of_two() >> 3).max(PAGE);
+        min.next_multiple_of(step)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct RecycleKey {
+    alloc_size: usize,
+    align: usize,
+    lowest: usize,
+    highest: usize,
+}
+
+#[derive(Default)]
+struct VirtualFreelist {
+    /// Live allocations eligible to return to `buckets` on `MEM_RELEASE`.
+    live: HashMap<usize, RecycleKey>,
+    /// Cached committed `MEM_WRITE_WATCH` blocks ready for zero-filled reuse.
+    buckets: HashMap<RecycleKey, Vec<usize>>,
+    pooled_bytes: usize,
+}
+
+static VIRTUAL_FREELIST: LazyLock<Mutex<VirtualFreelist>> = LazyLock::new(Default::default);
+
+fn take_recycled_virtual(key: RecycleKey) -> Option<usize> {
+    let mut fl = VIRTUAL_FREELIST.lock().unwrap_or_else(|e| e.into_inner());
+    let bucket = fl.buckets.get_mut(&key)?;
+    let at = bucket.pop()?;
+    if bucket.is_empty() {
+        fl.buckets.remove(&key);
+    }
+    fl.pooled_bytes = fl.pooled_bytes.saturating_sub(key.alloc_size);
+    fl.live.insert(at, key);
+    Some(at)
+}
+
+fn note_recyclable_virtual(at: usize, key: RecycleKey) {
+    let mut fl = VIRTUAL_FREELIST.lock().unwrap_or_else(|e| e.into_inner());
+    fl.live.insert(at, key);
+}
+
+fn untrack_recyclable_range(at: usize, size: usize) {
+    let mut fl = VIRTUAL_FREELIST.lock().unwrap_or_else(|e| e.into_inner());
+    if fl.live.is_empty() {
+        return;
+    }
+    if fl.live.remove(&at).is_some() {
+        return;
+    }
+    let end = at.saturating_add(size.max(1));
+    fl.live.retain(|&base, key| end <= base || at >= base.saturating_add(key.alloc_size));
+}
+
+/// Attempts to return a `MEM_RELEASE` allocation to the freelist. Returns `true`
+/// if retained (caller skips `VirtualFree`), `false` to release to the OS.
+fn try_recycle_virtual_release(at: usize) -> Option<usize> {
+    let max_bytes = recycle_max_bytes();
+    let key = {
+        let mut fl = VIRTUAL_FREELIST.lock().unwrap_or_else(|e| e.into_inner());
+        fl.live.remove(&at)?
+    };
+    if max_bytes == 0 || key.alloc_size > max_bytes {
+        return None;
+    }
+    // Restore PAGE_READWRITE before pooling; fails (e.g. error 87) if pinned.
+    let mut old = 0;
+    // SAFETY: live VirtualAlloc2 reservation owned by this process.
+    if unsafe { VirtualProtect(at as *const c_void, key.alloc_size, PAGE_READWRITE, &mut old) } == 0
+    {
+        return None;
+    }
+    let mut fl = VIRTUAL_FREELIST.lock().unwrap_or_else(|e| e.into_inner());
+    let bucket_len = fl.buckets.get(&key).map_or(0, Vec::len);
+    if bucket_len >= RECYCLE_BUCKET_CAP || fl.pooled_bytes.saturating_add(key.alloc_size) > max_bytes
+    {
+        return None;
+    }
+    fl.pooled_bytes += key.alloc_size;
+    fl.buckets.entry(key).or_default().push(at);
+    Some(key.alloc_size)
+}
+
 pub extern "system" fn XMemVirtualAlloc(
     base: *mut c_void,
     size: usize,
@@ -396,14 +522,15 @@ pub extern "system" fn XMemVirtualAlloc(
     protect: u32,
 ) -> *mut c_void {
     let (lowest, highest) = address_range(flags);
+    let align = if kind & (PAGES_2M | PAGES_64K_BIT) == PAGES_2M {
+        2 * MIB
+    } else {
+        0
+    };
     let mut requirements = MEM_ADDRESS_REQUIREMENTS {
         LowestStartingAddress: lowest as *mut c_void,
         HighestEndingAddress: highest as *mut c_void,
-        Alignment: if kind & (PAGES_2M | PAGES_64K_BIT) == PAGES_2M {
-            2 * MIB
-        } else {
-            0
-        },
+        Alignment: align,
     };
     let asked = protect;
     let mut protect = match protect & HOST_PROTECTION {
@@ -441,13 +568,46 @@ pub extern "system" fn XMemVirtualAlloc(
             kind |= MEM_WRITE_WATCH;
         }
     }
+    let recyclable = constrained
+        && !placeholder
+        && kind & MEM_RESERVE_PLACEHOLDER == 0
+        && kind & MEM_COMMIT != 0
+        && protect == PAGE_READWRITE
+        && size > 0
+        && size <= RECYCLE_MAX_ALLOC
+        && recycle_max_bytes() > 0;
+    let recycle_key = recyclable.then(|| RecycleKey {
+        alloc_size: recycle_class_size(size),
+        align,
+        lowest,
+        highest,
+    });
+    if let Some(key) = recycle_key
+        && let Some(at) = take_recycled_virtual(key)
+    {
+        // Zero-fill and reset write-watch so the reused block matches a fresh
+        // `VirtualAlloc2(MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH)` region.
+        // SAFETY: committed PAGE_READWRITE region of `key.alloc_size` bytes.
+        unsafe {
+            (at as *mut u8).write_bytes(0, key.alloc_size);
+            ResetWriteWatch(at as *const c_void, key.alloc_size);
+        }
+        private_region_alloc(0, at, size, kind);
+        victory_gpu::title_memory_allocated(at, size);
+        #[cfg(feature = "diagnostics")]
+        note_protection(asked, kind, flags, at, size);
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = asked;
+        return at as *mut c_void;
+    }
+    let alloc_size = recycle_key.map_or(size, |k| k.alloc_size);
     // SAFETY: the title's own arguments, cleaned of console bits; the
     // parameter points at `requirements`, which outlives the call.
     let at = unsafe {
         VirtualAlloc2(
             GetCurrentProcess(),
             base,
-            size,
+            alloc_size,
             kind,
             protect,
             if constrained {
@@ -461,7 +621,7 @@ pub extern "system" fn XMemVirtualAlloc(
     if at.is_null() {
         let error = std::io::Error::last_os_error();
         if kind & MEM_COMMIT != 0 {
-            commit_refused(size, "virtual memory", error);
+            commit_refused(alloc_size, "virtual memory", error);
         } else {
             tracing::warn!(
                 size,
@@ -482,6 +642,9 @@ pub extern "system" fn XMemVirtualAlloc(
         );
     }
     if !at.is_null() && !placeholder {
+        if let Some(key) = recycle_key {
+            note_recyclable_virtual(at as usize, key);
+        }
         if kind & MEM_RESERVE_PLACEHOLDER == 0 {
             private_region_alloc(base as usize, at as usize, size, kind);
         }
@@ -668,6 +831,7 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
         user.sub(HEADER)
             .cast::<[usize; 2]>()
             .write([layout.size(), layout.align()]);
+        TRACKED_HEAP_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
         user.cast()
     }
 }
@@ -681,12 +845,14 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
-            private_region_free(address as usize, 0, MEM_RELEASE);
-            VirtualFree(address, 0, MEM_RELEASE);
+            title_virtual_free(address, 0, MEM_RELEASE);
             return;
         }
         let user = address.cast::<u8>();
         let [size, align] = user.sub(HEADER).cast::<[usize; 2]>().read();
+        let _ = TRACKED_HEAP_BYTES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+            Some(cur.saturating_sub(size))
+        });
         dealloc(
             user.sub(align),
             Layout::from_size_align_unchecked(size, align),
@@ -706,14 +872,171 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 
 const PAGE: usize = 64 << 10;
 
+/// Sliding host-VA window chunk size (`16 MiB` = 256 × 64 KiB pages).
+const WINDOW_CHUNK_PAGES: usize = 256;
+/// Default total bytes of cached host-VA sliding windows (`VICTORY_SECTION_WINDOW_MB`).
+const DEFAULT_WINDOW_CACHE_MB: usize = 128;
+
+fn window_cache_max_bytes() -> usize {
+    static MAX: LazyLock<usize> = LazyLock::new(|| {
+        if std::env::var_os("VICTORY_SECTION_WINDOW").is_some_and(|v| v == "0") {
+            return 0;
+        }
+        std::env::var("VICTORY_SECTION_WINDOW_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(DEFAULT_WINDOW_CACHE_MB)
+            .saturating_mul(MIB)
+    });
+    *MAX
+}
+
+static NEXT_SECTION_ID: AtomicU64 = AtomicU64::new(1);
+
+/// A mapped sliding host-VA view of one `<= 16 MiB` chunk of a section.
+/// Unmaps only when both the LRU cache and every active [`WindowGuard`] drop it.
+struct MappedChunk {
+    base: usize,
+    len: usize,
+}
+
+impl Drop for MappedChunk {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Memory::UnmapViewOfFile;
+        if self.base != 0 {
+            // SAFETY: our own MapViewOfFile view; Arc guarantees no live
+            // WindowGuard or cache entry still points into it.
+            unsafe {
+                UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: self.base as *mut c_void,
+                })
+            };
+        }
+    }
+}
+
+/// Safe guard keeping a sliding section window chunk mapped while the caller
+/// reads or writes `[at, at + len)`.
+pub(crate) struct WindowGuard {
+    at: usize,
+    len: usize,
+    _chunk: Arc<MappedChunk>,
+}
+
+impl WindowGuard {
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        // SAFETY: committed bytes inside `_chunk`, kept mapped while `self` lives.
+        unsafe { std::slice::from_raw_parts_mut(self.at as *mut u8, self.len) }
+    }
+
+    #[cfg(test)]
+    fn addr(&self) -> usize {
+        self.at
+    }
+}
+
+struct WindowCacheEntry {
+    chunk: Arc<MappedChunk>,
+    last_used: u64,
+}
+
+#[derive(Default)]
+struct WindowCache {
+    entries: HashMap<(u64, usize), WindowCacheEntry>,
+    total_bytes: usize,
+    tick: u64,
+}
+
+static WINDOW_CACHE: LazyLock<Mutex<WindowCache>> = LazyLock::new(Default::default);
+
+fn window_cache_get(section_id: u64, chunk_idx: usize) -> Option<Arc<MappedChunk>> {
+    let mut cache = WINDOW_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    cache.tick = cache.tick.wrapping_add(1);
+    let tick = cache.tick;
+    let entry = cache.entries.get_mut(&(section_id, chunk_idx))?;
+    entry.last_used = tick;
+    Some(entry.chunk.clone())
+}
+
+fn window_cache_insert(
+    section_id: u64,
+    chunk_idx: usize,
+    chunk: Arc<MappedChunk>,
+    max_bytes: usize,
+) -> Arc<MappedChunk> {
+    let mut to_drop: Vec<Arc<MappedChunk>> = Vec::new();
+    let kept = {
+        let mut cache = WINDOW_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        cache.tick = cache.tick.wrapping_add(1);
+        let tick = cache.tick;
+        let key = (section_id, chunk_idx);
+        if let Some(existing) = cache.entries.get_mut(&key) {
+            existing.last_used = tick;
+            let winner = existing.chunk.clone();
+            to_drop.push(chunk);
+            winner
+        } else {
+            let chunk_len = chunk.len;
+            cache.total_bytes += chunk_len;
+            cache.entries.insert(
+                key,
+                WindowCacheEntry {
+                    chunk: chunk.clone(),
+                    last_used: tick,
+                },
+            );
+            while cache.total_bytes > max_bytes && cache.entries.len() > 1 {
+                let victim = cache
+                    .entries
+                    .iter()
+                    .filter(|&(&k, _)| k != key)
+                    .min_by_key(|(_, e)| e.last_used)
+                    .map(|(&k, _)| k);
+                let Some(victim_key) = victim else {
+                    break;
+                };
+                if let Some(removed) = cache.entries.remove(&victim_key) {
+                    cache.total_bytes = cache.total_bytes.saturating_sub(removed.chunk.len);
+                    to_drop.push(removed.chunk);
+                }
+            }
+            chunk
+        }
+    };
+    // Drop evicted / duplicate views outside `WINDOW_CACHE` lock so
+    // `UnmapViewOfFile` never blocks other workers.
+    drop(to_drop);
+    kept
+}
+
+fn window_cache_evict_section(section_id: u64) {
+    let mut to_drop: Vec<Arc<MappedChunk>> = Vec::new();
+    {
+        let mut cache = WINDOW_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        let keys: Vec<(u64, usize)> = cache
+            .entries
+            .keys()
+            .copied()
+            .filter(|&(sid, _)| sid == section_id)
+            .collect();
+        for key in keys {
+            if let Some(removed) = cache.entries.remove(&key) {
+                cache.total_bytes = cache.total_bytes.saturating_sub(removed.chunk.len);
+                to_drop.push(removed.chunk);
+            }
+        }
+    }
+    drop(to_drop);
+}
+
 struct Section {
+    id: u64,
     handle: HANDLE,
     pages: usize,
     /// Whether the section was created with `SEC_COMMIT` (all pages committed).
     sec_committed: bool,
-    /// A view of the whole section, kept ([`Section::window`]); 0 if the
-    /// host gave none.
-    window: std::sync::OnceLock<usize>,
+    /// Bytes reserved from [`COMMITTED_SECTION_BYTES`] for this section (released on drop).
+    budget_bytes: usize,
     /// A bit per page: committed, as far as [`Section::window`] asked (also
     /// marks pages touched for [`arrange`]).
     committed: Box<[std::sync::atomic::AtomicU64]>,
@@ -725,12 +1048,19 @@ struct Section {
 }
 
 impl Section {
-    fn new(handle: HANDLE, pages: usize, first_page: usize, sec_committed: bool) -> Section {
+    fn new(
+        handle: HANDLE,
+        pages: usize,
+        first_page: usize,
+        sec_committed: bool,
+        budget_bytes: usize,
+    ) -> Section {
         Section {
+            id: NEXT_SECTION_ID.fetch_add(1, Ordering::Relaxed),
             handle,
             pages,
             sec_committed,
-            window: std::sync::OnceLock::new(),
+            budget_bytes,
             committed: (0..pages.div_ceil(64))
                 .map(|_| std::sync::atomic::AtomicU64::new(0))
                 .collect(),
@@ -747,31 +1077,53 @@ impl Section {
         }
     }
 
-    /// Where bytes of `n` pages from page `index` on can be written,
-    /// whether or not the pages are mapped anywhere, committed.
+    /// Bounded, evictable `<= 16 MiB` sliding view covering `n` pages from
+    /// `index` on, committed and kept mapped by the returned [`WindowGuard`].
     ///
-    /// Every DirectStorage write mapped a view of its pages, committed it,
-    /// faulted each of its 4 KiB pages in and unmapped it again, all of it
-    /// under the process's one address-space lock, with 24 workers, the
-    /// title's own mapping calls (about 100,000 views of one page) and our
-    /// guards asking for the same lock. One view of the section, kept,
-    /// costs that once per page.
-    /// `VICTORY_SECTION_WINDOW=0`: a view for each write, as before.
-    fn window(&self, index: usize, n: usize) -> Option<usize> {
+    /// Returns `None` when disabled (`VICTORY_SECTION_WINDOW=0` or
+    /// `VICTORY_SECTION_WINDOW_MB=0`), when a run straddles a 16 MiB chunk
+    /// boundary, or on host failure — callers fall back to a one-shot [`View`].
+    fn window(&self, index: usize, n: usize) -> Option<WindowGuard> {
         use std::sync::atomic::Ordering;
         use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
-        static ON: LazyLock<bool> =
-            LazyLock::new(|| std::env::var_os("VICTORY_SECTION_WINDOW").is_none_or(|v| v != "0"));
-        if !*ON || index + n > self.pages {
+        let max_bytes = window_cache_max_bytes();
+        if max_bytes == 0 || n == 0 || index.checked_add(n).is_none_or(|end| end > self.pages) {
             return None;
         }
-        let base = *self.window.get_or_init(|| {
-            // SAFETY: the whole of a section we own.
-            unsafe { MapViewOfFile(self.handle, FILE_MAP_WRITE, 0, 0, self.pages * PAGE) }.Value as usize
-        });
-        if base == 0 {
+        let chunk_idx = index / WINDOW_CHUNK_PAGES;
+        let end_chunk_idx = (index + n - 1) / WINDOW_CHUNK_PAGES;
+        if chunk_idx != end_chunk_idx {
             return None;
         }
+        let chunk_start = chunk_idx * WINDOW_CHUNK_PAGES;
+        let chunk_pages = (self.pages - chunk_start).min(WINDOW_CHUNK_PAGES);
+        let chunk_bytes = chunk_pages * PAGE;
+        let chunk = match window_cache_get(self.id, chunk_idx) {
+            Some(chunk) => chunk,
+            None => {
+                let byte_offset = (chunk_start * PAGE) as u64;
+                // SAFETY: bounded chunk inside a section handle we own.
+                let base = unsafe {
+                    MapViewOfFile(
+                        self.handle,
+                        FILE_MAP_WRITE,
+                        (byte_offset >> 32) as u32,
+                        byte_offset as u32,
+                        chunk_bytes,
+                    )
+                }
+                .Value as usize;
+                if base == 0 {
+                    return None;
+                }
+                let mapped = Arc::new(MappedChunk {
+                    base,
+                    len: chunk_bytes,
+                });
+                window_cache_insert(self.id, chunk_idx, mapped, max_bytes)
+            }
+        };
+        let within_chunk = (index - chunk_start) * PAGE;
         if self.sec_committed {
             // Pages are already committed by the section; still mark them
             // touched so `arrange` never swaps written slices.
@@ -781,9 +1133,14 @@ impl Section {
                     self.committed[p / 64].fetch_or(bit, Ordering::AcqRel);
                 }
             }
-            return Some(base + index * PAGE);
+            return Some(WindowGuard {
+                at: chunk.base + within_chunk,
+                len: n * PAGE,
+                _chunk: chunk,
+            });
         }
-        let missing = |page: usize| self.committed[page / 64].load(Ordering::Acquire) >> (page % 64) & 1 == 0;
+        let missing =
+            |page: usize| self.committed[page / 64].load(Ordering::Acquire) >> (page % 64) & 1 == 0;
         let mut page = index;
         while page < index + n {
             if !missing(page) {
@@ -794,7 +1151,7 @@ impl Section {
             if run == 0 {
                 continue; // another worker committed it meanwhile
             }
-            if !commit(base + page * PAGE, run * PAGE) {
+            if !commit(chunk.base + (page - chunk_start) * PAGE, run * PAGE) {
                 return None;
             }
             for p in page..page + run {
@@ -802,7 +1159,11 @@ impl Section {
             }
             page += run;
         }
-        Some(base + index * PAGE)
+        Some(WindowGuard {
+            at: chunk.base + within_chunk,
+            len: n * PAGE,
+            _chunk: chunk,
+        })
     }
 }
 
@@ -851,16 +1212,9 @@ unsafe impl Sync for Section {}
 
 impl Drop for Section {
     fn drop(&mut self) {
-        use windows_sys::Win32::System::Memory::UnmapViewOfFile;
-        if let Some(&base) = self.window.get()
-            && base != 0
-        {
-            // SAFETY: our view; whoever writes through it holds the section.
-            unsafe {
-                UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
-                    Value: base as *mut c_void,
-                })
-            };
+        window_cache_evict_section(self.id);
+        if self.budget_bytes > 0 {
+            release_commit_section_bytes(self.budget_bytes);
         }
         bump_generation();
         victory_gpu::title_memory_section_gone(self.handle as usize);
@@ -1159,15 +1513,118 @@ fn commit_sections() -> bool {
     *ON
 }
 
-/// Largest section size (in bytes) eligible for `SEC_COMMIT` backing.
+/// Default total/per-allocation `SEC_COMMIT` section cap (`1024 MiB`): keeps
+/// the 185 MB 32-bit heap and 710 MB Pool A eligible for zero-pin `port 1`
+/// while preventing gigabyte streaming pools from pre-committing RAM.
+const DEFAULT_COMMIT_SECTION_MAX_MB: usize = 1024;
+/// `SEC_COMMIT` allocations up to this size remain a single section (preserving
+/// contiguous `arrange()` on the 185 MB 32-bit heap).
+const COMMIT_SUBSECTION_THRESHOLD: usize = 256 * MIB;
+/// Sub-section size for larger `SEC_COMMIT` pools (e.g. Pool A) so D3D12 only
+/// opens sub-sections that actually contain placed buffers.
+const COMMIT_SUBSECTION_BYTES: usize = 128 * MIB;
+/// Default chunk size for large `SEC_RESERVE` physical pools (`32 MiB`, clamped
+/// `16..=64 MiB` via `VICTORY_RESERVE_CHUNK_MB`) so freed slices reclaim commit
+/// as soon as their sub-section empties.
+const DEFAULT_RESERVE_CHUNK_MB: usize = 32;
+
+/// Live bytes backed by `SEC_COMMIT` physical sections (excluding sparse Wine).
+static COMMITTED_SECTION_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+fn try_reserve_commit_section_bytes(bytes: usize, limit: usize) -> bool {
+    let mut cur = COMMITTED_SECTION_BYTES.load(Ordering::Relaxed);
+    loop {
+        let Some(next) = cur.checked_add(bytes) else {
+            return false;
+        };
+        if next > limit {
+            return false;
+        }
+        match COMMITTED_SECTION_BYTES.compare_exchange_weak(
+            cur,
+            next,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return true,
+            Err(actual) => cur = actual,
+        }
+    }
+}
+
+fn release_commit_section_bytes(bytes: usize) {
+    let _ = COMMITTED_SECTION_BYTES.fetch_update(Ordering::AcqRel, Ordering::Relaxed, |cur| {
+        Some(cur.saturating_sub(bytes))
+    });
+}
+
+/// Largest section / total budget (in bytes) eligible for `SEC_COMMIT` backing
+/// (`VICTORY_INPLACE_SECTION_MAX_MB`, default `1024` MiB).
 fn commit_section_max_bytes() -> usize {
     static MAX: LazyLock<usize> = LazyLock::new(|| {
         std::env::var("VICTORY_INPLACE_SECTION_MAX_MB")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
-            .map_or(usize::MAX, |mb| mb.saturating_mul(MIB))
+            .unwrap_or(DEFAULT_COMMIT_SECTION_MAX_MB)
+            .saturating_mul(MIB)
     });
     *MAX
+}
+
+fn reserve_chunk_bytes() -> usize {
+    static CHUNK: LazyLock<usize> = LazyLock::new(|| {
+        std::env::var("VICTORY_RESERVE_CHUNK_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(DEFAULT_RESERVE_CHUNK_MB)
+            .clamp(16, 64)
+            .saturating_mul(MIB)
+    });
+    *CHUNK
+}
+
+/// Event-driven epoch bumped whenever physical pages are allocated or mapped,
+/// replacing `Sleep(1)` polling in DirectStorage page-list waits.
+static PAGE_EPOCH: AtomicU64 = AtomicU64::new(0);
+static PAGE_WAITERS: AtomicUsize = AtomicUsize::new(0);
+static PAGE_WAIT: LazyLock<(Mutex<u64>, Condvar)> = LazyLock::new(|| (Mutex::new(0), Condvar::new()));
+
+pub(crate) fn page_epoch() -> u64 {
+    PAGE_EPOCH.load(Ordering::Acquire)
+}
+
+fn notify_page_waiters() {
+    let next = PAGE_EPOCH.fetch_add(1, Ordering::AcqRel) + 1;
+    if PAGE_WAITERS.load(Ordering::Acquire) > 0 {
+        let mut guard = PAGE_WAIT.0.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = next;
+        drop(guard);
+        PAGE_WAIT.1.notify_all();
+    }
+}
+
+pub(crate) fn wait_page_epoch(seen: u64, timeout: std::time::Duration) -> u64 {
+    let cur = PAGE_EPOCH.load(Ordering::Acquire);
+    if cur != seen || timeout.is_zero() {
+        return cur;
+    }
+    struct WaiterGuard;
+    impl Drop for WaiterGuard {
+        fn drop(&mut self) {
+            PAGE_WAITERS.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+    PAGE_WAITERS.fetch_add(1, Ordering::AcqRel);
+    let _guard = WaiterGuard;
+    let lock = PAGE_WAIT.0.lock().unwrap_or_else(|e| e.into_inner());
+    if PAGE_EPOCH.load(Ordering::Acquire) != seen {
+        return PAGE_EPOCH.load(Ordering::Acquire);
+    }
+    let _ = PAGE_WAIT
+        .1
+        .wait_timeout_while(lock, timeout, |_| PAGE_EPOCH.load(Ordering::Acquire) == seen)
+        .unwrap_or_else(|e| e.into_inner());
+    PAGE_EPOCH.load(Ordering::Acquire)
 }
 
 /// Creates a pagefile-backed section of `size` bytes, optionally trying
@@ -1222,7 +1679,7 @@ fn create_section_handle(size: usize, try_commit: bool) -> Option<(HANDLE, bool)
 fn allocate_section(n: usize, try_commit: bool) -> Option<Arc<Section>> {
     let size = n.checked_mul(PAGE).filter(|&s| s > 0)?;
     let (handle, sec_committed) = create_section_handle(size, try_commit)?;
-    Some(Arc::new(Section::new(handle, n, 0, sec_committed)))
+    Some(Arc::new(Section::new(handle, n, 0, sec_committed, 0)))
 }
 
 /// `count` is in and out (pages wanted, pages given); all or nothing here.
@@ -1239,38 +1696,100 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
         return 0;
     };
-    // A pagefile-backed section of `size` bytes, its pages committed when
-    // first mapped or written (`commit`), unless `SEC_COMMIT` is enabled
-    // (always on Wine, where a committed section is sparse, or when
-    // `commit_sections()` permits up to `commit_section_max_bytes()`).
-    let try_commit = on_wine() || (commit_sections() && size <= commit_section_max_bytes());
-    let Some((handle, sec_committed)) = create_section_handle(size, try_commit) else {
-        let error = std::io::Error::last_os_error();
-        tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
-        // SAFETY: checked non-null.
-        unsafe { count.write(0) };
-        return 0;
+    let wine = on_wine();
+    let max_commit = commit_section_max_bytes();
+    let budget_reserved = !wine
+        && commit_sections()
+        && size <= max_commit
+        && try_reserve_commit_section_bytes(size, max_commit);
+    let want_commit = wine || budget_reserved;
+
+    let chunk_pages = if want_commit {
+        if wine || size <= COMMIT_SUBSECTION_THRESHOLD {
+            n
+        } else {
+            (COMMIT_SUBSECTION_BYTES / PAGE).max(1)
+        }
+    } else {
+        let reserve_chunk = (reserve_chunk_bytes() / PAGE).max(1);
+        if n <= reserve_chunk { n } else { reserve_chunk }
     };
+
+    // `(handle, chunk_pages, sec_committed, budget_bytes)` per created sub-section.
+    let mut created: Vec<(HANDLE, usize, bool, usize)> = Vec::with_capacity(n.div_ceil(chunk_pages));
+    let mut remaining_budget = if budget_reserved { size } else { 0 };
+    let mut offset_pages = 0usize;
+    while offset_pages < n {
+        let this_pages = (n - offset_pages).min(chunk_pages);
+        let this_bytes = this_pages * PAGE;
+        let Some((handle, sec_committed)) = create_section_handle(this_bytes, want_commit) else {
+            let error = std::io::Error::last_os_error();
+            tracing::warn!(n, offset_pages, %error, "XMemAllocatePhysicalPages failed");
+            for (h, _, _, b) in created {
+                if b > 0 {
+                    release_commit_section_bytes(b);
+                }
+                // SAFETY: handle created in this call and not published yet.
+                unsafe { CloseHandle(h) };
+            }
+            if remaining_budget > 0 {
+                release_commit_section_bytes(remaining_budget);
+            }
+            // SAFETY: checked non-null.
+            unsafe { count.write(0) };
+            return 0;
+        };
+        let section_budget = if budget_reserved {
+            remaining_budget = remaining_budget.saturating_sub(this_bytes);
+            if sec_committed {
+                this_bytes
+            } else {
+                release_commit_section_bytes(this_bytes);
+                0
+            }
+        } else {
+            0
+        };
+        created.push((handle, this_pages, sec_committed, section_budget));
+        offset_pages += this_pages;
+    }
+
+    let sub_sections = created.len();
+    let any_committed = created.iter().any(|c| c.2);
     tracing::debug!(
         n,
-        sec_committed,
+        sub_sections,
+        sec_committed = any_committed,
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
-    // For the GPU side's in-place census: only a committed section can be
+    // For the GPU side's in-place census: only committed sections can be
     // opened as a host heap.
-    victory_gpu::title_memory_section(handle as usize, size as u64, sec_committed);
+    for &(handle, this_pages, sec_committed, _) in &created {
+        victory_gpu::title_memory_section(handle as usize, (this_pages * PAGE) as u64, sec_committed);
+    }
     let mut table = page_table_mut();
     let first = table.next_page;
     table.next_page += n * FRAMES;
-    let section = Arc::new(Section::new(handle, n, first, sec_committed));
-    for index in 0..n {
-        let slice = Slice {
-            section: section.clone(),
-            index,
-        };
-        table.pages.insert(first + index * FRAMES, slice);
+    let mut page_offset = 0usize;
+    for (handle, this_pages, sec_committed, section_budget) in created {
+        let section = Arc::new(Section::new(
+            handle,
+            this_pages,
+            first + page_offset * FRAMES,
+            sec_committed,
+            section_budget,
+        ));
+        for index in 0..this_pages {
+            let slice = Slice {
+                section: section.clone(),
+                index,
+            };
+            table.pages.insert(first + (page_offset + index) * FRAMES, slice);
+        }
+        page_offset += this_pages;
     }
+    TRACKED_PHYSICAL_PAGES.fetch_add(n, Ordering::Relaxed);
     // Title memory is touched without our locks: a fault there may wait for
     // a mapping call, which takes them.
     drop(table);
@@ -1278,6 +1797,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         // SAFETY: the title passes room for `n` page numbers.
         unsafe { pages.add(index).write(first + index * FRAMES) };
     }
+    notify_page_waiters();
     1
 }
 
@@ -1294,7 +1814,8 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
     // SAFETY: the title passes `n` page numbers.
     let numbers = unsafe { std::slice::from_raw_parts(pages, n) }.to_vec();
     let mut table = page_table_mut();
-    // Dropped without the lock: the last page of a section unmaps its window.
+    // Dropped without the lock: the last page of a sub-section evicts its
+    // sliding windows and closes its handle immediately.
     let gone: Vec<Slice> = numbers
         .iter()
         .filter_map(|number| {
@@ -1303,7 +1824,13 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
             Some(slice)
         })
         .collect();
+    let freed = gone.len();
     drop(table);
+    if freed > 0 {
+        let _ = TRACKED_PHYSICAL_PAGES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+            Some(cur.saturating_sub(freed))
+        });
+    }
     drop(gone);
     1
 }
@@ -1427,10 +1954,8 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
     let (mut within, mut done) = (offset % PAGE, 0);
     for (slice, n) in &runs {
         let k = (n * PAGE - within).min(data.len() - done);
-        if let Some(at) = slice.section.window(slice.index, *n) {
-            // SAFETY: committed bytes of the section's view, which `runs`
-            // holds; the title's other uses of them race as on the console.
-            unsafe { std::ptr::copy_nonoverlapping(data[done..].as_ptr(), (at + within) as *mut u8, k) };
+        if let Some(mut guard) = slice.section.window(slice.index, *n) {
+            guard.bytes_mut()[within..within + k].copy_from_slice(&data[done..done + k]);
         } else {
             let Some(mut view) = View::map(slice, *n) else {
                 return false;
@@ -1452,8 +1977,9 @@ pub(crate) struct PageWindow {
 }
 
 enum Window {
-    /// In the section's own view, which the section holds.
-    Kept(usize, #[expect(dead_code, reason = "held for the view")] Arc<Section>),
+    /// Sliding window guard kept mapped until dropped; `Arc<Section>` drops
+    /// second so the section handle outlives the view.
+    Kept(WindowGuard, #[expect(dead_code, reason = "held for the section")] Arc<Section>),
     Own(View),
 }
 
@@ -1461,10 +1987,7 @@ impl PageWindow {
     pub(crate) fn bytes(&mut self) -> &mut [u8] {
         let (within, len) = (self.within, self.len);
         match &mut self.view {
-            // SAFETY: committed bytes of the section's view, ours alone as
-            // far as the runtime goes (other views alias them, as the
-            // console's do).
-            Window::Kept(at, _) => unsafe { std::slice::from_raw_parts_mut((*at + within) as *mut u8, len) },
+            Window::Kept(guard, _) => &mut guard.bytes_mut()[within..within + len],
             Window::Own(view) => &mut view.bytes()[within..within + len],
         }
     }
@@ -1481,7 +2004,7 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
         return None;
     };
     let view = match slice.section.window(slice.index, *n) {
-        Some(at) => Window::Kept(at, slice.section.clone()),
+        Some(guard) => Window::Kept(guard, slice.section.clone()),
         None => Window::Own(View::map(slice, *n)?),
     };
     Some(PageWindow {
@@ -1644,15 +2167,15 @@ fn lean() -> bool {
     *ON
 }
 
-/// The title's streaming thread runs below normal priority, as do sixteen
-/// workers of ours when pipelines are made; on the console nothing else
-/// wants its core. Called where that thread maps and submits: lifts a
-/// thread that is below normal to above it (`VICTORY_STREAM_PRIORITY=0`:
-/// left as the title set it).
+/// The title's streaming thread runs below normal priority, as do background
+/// workers when pipelines are made; on the console nothing else wants its
+/// core. Called where that thread maps and submits: lifts a thread that is
+/// below normal to normal priority (`VICTORY_STREAM_PRIORITY=0`: left as the
+/// title set it) without preempting title render threads.
 pub(crate) fn lift_thread() {
     use std::cell::Cell;
     use windows_sys::Win32::System::Threading::{
-        GetCurrentThread, GetThreadPriority, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
+        GetCurrentThread, GetThreadPriority, SetThreadPriority, THREAD_PRIORITY_NORMAL,
     };
     static ON: LazyLock<bool> =
         LazyLock::new(|| std::env::var_os("VICTORY_STREAM_PRIORITY").is_none_or(|v| v != "0"));
@@ -1670,7 +2193,7 @@ pub(crate) fn lift_thread() {
     unsafe {
         let thread = GetCurrentThread();
         if matches!(GetThreadPriority(thread), -2..0) {
-            SetThreadPriority(thread, THREAD_PRIORITY_ABOVE_NORMAL);
+            SetThreadPriority(thread, THREAD_PRIORITY_NORMAL);
         }
     }
 }
@@ -2043,6 +2566,9 @@ pub extern "system" fn XMemMapPhysicalPages(
         }
         i += run;
     }
+    drop(_changing);
+    drop(physical);
+    notify_page_waiters();
     address
 }
 
@@ -2057,14 +2583,16 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
         return 0;
     }
     lift_thread();
-    if side_by_side() > 1 && n > 1 {
+    if n > 1 {
         // Read before any lock is taken, as in `XMemMapPhysicalPages`.
         let wanted: Vec<(usize, usize)> = (0..n)
             // SAFETY: the title passes `n` addresses and, unless null, `n` pages.
             .map(|i| unsafe { (*addresses.add(i) as usize, if pages.is_null() { 0 } else { *pages.add(i) }) })
             .collect();
         if wanted.iter().all(|w| w.0 % PAGE == 0) {
-            return scatter(&wanted).into();
+            let ok = scatter(&wanted);
+            notify_page_waiters();
+            return ok.into();
         }
     }
     for i in 0..n {
@@ -2147,7 +2675,7 @@ fn can_coalesce(last: &Op, to: usize, slice: &Option<Slice>) -> bool {
 pub fn map_aliases(ranges: &[(u64, u64, u64)]) -> bool {
     let _costed = Costed::begin(None);
     lift_thread();
-    if side_by_side() <= 1 {
+    if ranges.len() <= 1 {
         return ranges.iter().all(|&(to, from, len)| map_alias(to, from, len));
     }
     // By the page: the address, and the one whose page it is to show.
@@ -2291,12 +2819,13 @@ fn side_by_side() -> usize {
 /// by side, each for a millisecond or two a page in the world's first seconds.
 const WIDE: usize = 16;
 
-/// `VICTORY_MAP_THREADS` as a number; `None`: by how much there is to map.
+/// `VICTORY_MAP_THREADS` as a number (default `1` to avoid multi-thread
+/// `AddressCreationLock` / VAD contention); `None` (`auto`): adaptive.
 fn asked_threads() -> Option<usize> {
     static ASKED: LazyLock<Option<usize>> = LazyLock::new(|| {
         match std::env::var("VICTORY_MAP_THREADS") {
             Ok(v) if v.trim() == "auto" => None,
-            v => Some(v.ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4).clamp(1, 32)),
+            v => Some(v.ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1).clamp(1, 32)),
         }
     });
     *ASKED
@@ -2583,8 +3112,9 @@ mod pool {
 
     /// Runs `ops`; each with whether the host did it.
     pub(super) fn all(ops: Vec<Op>) -> Vec<(Op, bool)> {
-        // Waking the others takes longer than a few quick calls.
-        if ops.len() < 3 {
+        // Run inline when single-threaded (`VICTORY_MAP_THREADS=1`) or too small
+        // to justify waking worker threads.
+        if ops.len() < 3 || side_by_side() <= 1 {
             return ops
                 .into_iter()
                 .map(|op| {
@@ -2894,11 +3424,9 @@ pub struct WorkingSet {
     pub kernel_pool_limit: u32,
 }
 
-/// The title's budget and our process's commit as what it uses. No tools
-/// memory: a retail console.
-// shortcut: all fields are filled whatever the flags ask for, and use is
-// not split by bandwidth class (GPU-optimal use reads 0); track
-// allocations per class if a title budgets from that field.
+/// The title's budget and tracked title memory usage (virtual allocations,
+/// physical pages, and default heap — excluding the host layer's VRAM/SHR/cache
+/// commit). No tools memory: a retail console.
 pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut WorkingSet) -> BOOL {
     if out.is_null() {
         return 0;
@@ -2909,21 +3437,23 @@ pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut Workin
     };
     // SAFETY: our own process and a sized structure.
     unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
+    let physical_pages = TRACKED_PHYSICAL_PAGES.load(Ordering::Relaxed);
+    let tracked_used = TRACKED_VIRTUAL_BYTES
+        .load(Ordering::Relaxed)
+        .saturating_add(physical_pages.saturating_mul(PAGE))
+        .saturating_add(TRACKED_HEAP_BYTES.load(Ordering::Relaxed));
     let (gpu_optimal, standard) = victory_gpu::console::current().title_memory();
     let stats = WorkingSet {
         title_limit: gpu_optimal + standard - TRANSFERRED.load(Ordering::Relaxed),
-        title_used: counters.PagefileUsage,
+        title_used: if tracked_used > 0 {
+            tracked_used
+        } else {
+            counters.PagefileUsage
+        },
+        physical_pages: physical_pages.min(u32::MAX as usize) as u32,
         gpu_optimal_limit: gpu_optimal,
         ..Default::default()
     };
-    // What the title is told, logged at the first asking and at every
-    // 1,024th: "used" is all the process has committed, the layer's own
-    // memory and the card's included (27 GB in run 60's gameplay against a
-    // limit of 13.5 GB). A title that budgets its streaming from these two
-    // figures believes it is far over its limit.
-    // shortcut: the figure is not yet the title's own memory alone (its
-    // heaps and the pages it mapped); count those if this line shows the
-    // title asking.
     static ASKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let asked = ASKED.fetch_add(1, Ordering::Relaxed);
     if asked.is_multiple_of(1024) {
@@ -2932,6 +3462,7 @@ pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut Workin
             which = _which,
             limit_mb = stats.title_limit >> 20,
             used_mb = stats.title_used >> 20,
+            process_mb = counters.PagefileUsage >> 20,
             "the title asks how much memory it uses"
         );
     }
@@ -2966,13 +3497,23 @@ pub extern "system" fn XMemTransferMemory(kind: u32, size: usize) -> BOOL {
 extern "system" fn title_virtual_free(address: *mut c_void, size: usize, kind: u32) -> BOOL {
     // Splitting and joining placeholders changes nothing they show.
     if kind & (MEM_PRESERVE_PLACEHOLDER | MEM_COALESCE_PLACEHOLDERS) == 0 {
+        let at = address as usize;
         if kind & MEM_RELEASE != 0 {
-            let at = address as usize;
             LOW_RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner()).retain(|r| r.0 != at);
             HIGH_RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner()).retain(|r| r.0 != at);
         }
-        private_region_free(address as usize, size, kind);
-        victory_gpu::title_memory_freed(address as usize, size);
+        private_region_free(at, size, kind);
+        victory_gpu::title_memory_freed(at, size);
+        if kind == MEM_RELEASE && size == 0 {
+            if let Some(recycled_len) = try_recycle_virtual_release(at) {
+                if recycled_len > size {
+                    victory_gpu::title_memory_freed(at, recycled_len);
+                }
+                return 1;
+            }
+        } else {
+            untrack_recyclable_range(at, size);
+        }
     }
     // SAFETY: the title's own arguments.
     unsafe { VirtualFree(address, size, kind) }
@@ -4000,7 +4541,8 @@ mod tests {
     fn committed_section_helper_creates_sec_commit_section() {
         let committed = allocate_section(2, true).expect("SEC_COMMIT section");
         assert!(committed.sec_committed);
-        let at = committed.window(0, 2).expect("window on committed section");
+        let guard = committed.window(0, 2).expect("window on committed section");
+        let at = guard.addr();
         // SAFETY: 2 committed 64 KiB pages mapped writable through `committed`'s window.
         unsafe {
             (at as *mut u64).write(0xdead_beef_cafe_babe);
@@ -4009,15 +4551,123 @@ mod tests {
             assert_eq!(((at + PAGE) as *const u64).read(), 0x1234_5678);
         }
         assert!(committed.commit_shown(0, at, 2 * PAGE));
+        drop(guard);
 
         let reserved = allocate_section(2, false).expect("SEC_RESERVE section");
         assert!(!reserved.sec_committed);
-        let rat = reserved.window(0, 2).expect("window on reserved section");
+        let rguard = reserved.window(0, 2).expect("window on reserved section");
+        let rat = rguard.addr();
         // SAFETY: `window` commits reserved pages before returning.
         unsafe {
             (rat as *mut u64).write(42);
             assert_eq!((rat as *const u64).read(), 42);
         }
+        drop(rguard);
+    }
+
+    #[test]
+    fn large_reserve_pool_chunks_into_independent_subsections_and_evicts_windows() {
+        // Allocate 40 MiB (640 pages > 32 MiB reserve chunk): must split into >= 2 sub-sections.
+        let n = 40 * MIB / PAGE;
+        let pages = allocate(n);
+        let (first_sec, last_sec) = {
+            let table = page_table();
+            (
+                table.pages[&pages[0]].section.clone(),
+                table.pages[&pages[n - 1]].section.clone(),
+            )
+        };
+        assert!(
+            !Arc::ptr_eq(&first_sec, &last_sec),
+            "40 MiB SEC_RESERVE pool must split into multiple sub-sections"
+        );
+        assert!(!first_sec.sec_committed && !last_sec.sec_committed);
+        let first_id = first_sec.id;
+
+        // Write through bounded sliding window across a chunk boundary (> 16 MiB) and verify.
+        let boundary = WINDOW_CHUNK_PAGES * PAGE - 16;
+        let payload = [0x3cu8; 64];
+        assert!(write_physical(&pages, boundary, &payload));
+        let mut w = page_window(&pages, 0, PAGE).expect("first page window");
+        w.bytes()[..8].copy_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes());
+
+        // Evicting the section from cache while `w` is live must NOT unmap `w`'s chunk.
+        window_cache_evict_section(first_id);
+        assert_eq!(w.bytes()[..8], 0x1122_3344_5566_7788u64.to_le_bytes());
+        drop(w);
+
+        // Freeing the first sub-section's pages drops it cleanly while the tail stays alive.
+        let first_pages = first_sec.pages;
+        drop(first_sec);
+        assert_eq!(XMemFreePhysicalPages(first_pages, pages[..first_pages].as_ptr()), 1);
+        assert!(page_table().pages.get(&pages[0]).is_none());
+        assert!(page_table().pages.get(&pages[n - 1]).is_some());
+        drop(last_sec);
+        assert_eq!(
+            XMemFreePhysicalPages(n - first_pages, pages[first_pages..].as_ptr()),
+            1
+        );
+    }
+
+    #[test]
+    fn virtual_alloc_freelist_recycles_with_zero_fill_and_write_watch() {
+        let p1 = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            128 * 1024,
+            MEM_RESERVE | MEM_COMMIT,
+            GRAPHICS,
+            PAGE_READWRITE,
+        );
+        assert!(!p1.is_null());
+        // SAFETY: 128 KiB committed RW block.
+        unsafe {
+            p1.cast::<u8>().write_bytes(0xEE, 128 * 1024);
+        }
+        assert_ne!(title_virtual_free(p1, 0, MEM_RELEASE), 0);
+        assert!(query_private_region(p1 as usize, 128 * 1024).is_none());
+
+        let p2 = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            128 * 1024,
+            MEM_RESERVE | MEM_COMMIT,
+            GRAPHICS,
+            PAGE_READWRITE,
+        );
+        assert_eq!(p2, p1, "matching size class should recycle block from freelist");
+        // SAFETY: reused committed RW block must be zero-filled.
+        let bytes = unsafe { std::slice::from_raw_parts(p2.cast::<u8>(), 128 * 1024) };
+        assert!(bytes.iter().all(|&b| b == 0), "recycled block must be zeroed");
+
+        // Must preserve MEM_WRITE_WATCH and start clean (0 dirty pages after ResetWriteWatch).
+        let (mut found, mut count, mut gran) = ([0usize; 4], 4, 0);
+        // SAFETY: valid write-watched allocation.
+        let rc = unsafe {
+            windows_sys::Win32::System::Memory::GetWriteWatch(
+                0,
+                p2,
+                128 * 1024,
+                found.as_mut_ptr().cast(),
+                &mut count,
+                &mut gran,
+            )
+        };
+        assert_eq!(rc, 0);
+        assert_eq!(count, 0, "ResetWriteWatch clears zero-fill dirty bits");
+        assert_ne!(title_virtual_free(p2, 0, MEM_RELEASE), 0);
+    }
+
+    #[test]
+    fn working_set_stats_track_title_allocations_and_free() {
+        let mut before = WorkingSet::default();
+        assert_eq!(XMemGetWorkingSetStatistics(0x2000_0001, &mut before), 1);
+
+        let pages = allocate(8);
+        let mut with_pages = WorkingSet::default();
+        assert_eq!(XMemGetWorkingSetStatistics(0x2000_0001, &mut with_pages), 1);
+        assert!(with_pages.physical_pages >= 8);
+        assert!(with_pages.title_used >= 8 * PAGE);
+
+        assert_eq!(XMemFreePhysicalPages(8, pages.as_ptr()), 1);
     }
 
     #[test]

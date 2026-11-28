@@ -246,7 +246,7 @@ static IDLE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 /// Maximum upload scratch bytes idle host lists may keep between them when
 /// scratch chunks are not pooled (`VICTORY_SCRATCH_POOL=0`).
 #[cfg(windows)]
-const IDLE_BYTES_MOST: u64 = 128 << 20;
+const IDLE_BYTES_MOST: u64 = 32 << 20;
 
 /// Number of idle `HostList`s currently pooled for reuse.
 #[cfg(windows)]
@@ -270,7 +270,9 @@ pub(crate) fn trim_idle() {
         IDLE_COUNT.store(idle.0.len() as u64, std::sync::atomic::Ordering::Relaxed);
         excess
     };
-    drop(dropped);
+    if !dropped.is_empty() {
+        crate::host::retire_com_async(dropped);
+    }
 }
 
 /// Whether host lists that have run are used again (on by default;
@@ -294,13 +296,13 @@ pub(crate) fn fresh_list() -> Option<crate::host::HostList> {
         }
         taken
     };
-    if let Some(Idle(list, _)) = take_idle() {
+    if let Some(Idle(mut list, _)) = take_idle() {
+        list.open_for_recording_mut();
         return Some(list);
     }
-    // Reclaim any landed flights past `land_lag` before allocating a new
-    // command allocator, since `Host::send_late` no longer calls `land()` inline.
     crate::host::reclaim_landed();
-    if let Some(Idle(list, _)) = take_idle() {
+    if let Some(Idle(mut list, _)) = take_idle() {
+        list.open_for_recording_mut();
         return Some(list);
     }
     crate::host::host().and_then(|h| h.new_list().ok())
@@ -347,7 +349,7 @@ impl RecyclePool {
                                 s.queue.pop_front().unwrap()
                             };
                             let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                item.0.reset_mut();
+                                item.0.clear_for_idle_mut();
                                 item.1 = item.0.scratch_kept_mut();
                             }))
                             .is_ok();
@@ -386,7 +388,7 @@ impl RecyclePool {
                 break;
             };
             let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                item.0.reset_mut();
+                item.0.clear_for_idle_mut();
                 item.1 = item.0.scratch_kept_mut();
             }))
             .is_ok();
@@ -408,12 +410,14 @@ impl RecyclePool {
 #[cfg(windows)]
 fn recycle_collected(mut to_reset: Vec<Idle>, cap: usize) {
     if !to_reset.is_empty() {
-        const PARALLEL_MIN: usize = 8;
+        // `clear_for_idle_mut` detaches allocator leases and clears CPU state
+        // without calling D3D12 `Reset`, so small batches stay inline.
+        const PARALLEL_MIN: usize = 32;
         let reset = if to_reset.len() >= PARALLEL_MIN {
             RecyclePool::get().reset_all(to_reset)
         } else {
             for Idle(host, bytes) in &mut to_reset {
-                host.reset_mut();
+                host.clear_for_idle_mut();
                 *bytes = host.scratch_kept_mut();
             }
             to_reset
@@ -431,7 +435,9 @@ fn recycle_collected(mut to_reset: Vec<Idle>, cap: usize) {
             }
             IDLE_COUNT.store(idle.0.len() as u64, std::sync::atomic::Ordering::Relaxed);
         }
-        drop(excess);
+        if !excess.is_empty() {
+            crate::host::retire_com_async(excess);
+        }
     }
     if IDLE_COUNT.load(std::sync::atomic::Ordering::Relaxed) > cap as u64 {
         trim_idle();
@@ -766,6 +772,32 @@ fn new_list(
         return object::hand_out(LIST, list, iid, &LIST_IIDS, out);
     }
     object::hand_out(LIST, boxed(kind, pipeline, false), iid, &LIST_IIDS, out)
+}
+
+/// A backing list for `thin::back_list` with no open host list until `reset`.
+#[cfg(windows)]
+fn boxed_closed(kind: u32) -> Box<List> {
+    Box::new(List {
+        object: if crate::device::newer() {
+            Object::new(&NEWER_LIST_FUNCTIONS)
+        } else {
+            Object::new(&LIST_FUNCTIONS)
+        },
+        kind,
+        put: [0; 5],
+        reserved: [0; 64],
+        graphics_root_headers: [0; 128],
+        compute_root_headers: [0; 128],
+        pipeline_shadow: [0; 8],
+        newer: [0; 256],
+        uploads: Default::default(),
+        host: None,
+        state: std::sync::Mutex::new(crate::draw::State::default()),
+        earlier: Vec::new(),
+        gate: Vec::new(),
+        thin: Default::default(),
+        is_thin: false,
+    })
 }
 
 /// A list; with `thin` one whose calls are written down (it has no host list).
@@ -1441,26 +1473,26 @@ extern "system" fn copy_texture_region(
             let Some(data) = buffer_range(src.resource, src.footprint.offset, bytes) else {
                 return;
             };
-            let buffer = match list.place_source(data as usize, bytes as usize) {
+            let (buffer, upload_offset) = match list.place_source(data as usize, bytes as usize) {
                 // What shaders wrote to it, at this place of the list.
-                Some(buffer) => buffer,
+                Some(buffer) => (buffer, 0u64),
                 None => {
-                    let Some((buffer, staging)) = list.upload(host, bytes) else {
+                    let Some((buffer, offset, staging)) = list.upload_at(host, bytes) else {
                         return;
                     };
                     // The list owns this mapped D3D12 upload buffer. Wine can
                     // report its address as MEM_FREE, so use the host-upload
                     // path.
                     list.defer_fill_buffer(&buffer, staging, data, bytes as usize);
-                    buffer
+                    (buffer, offset)
                 }
             };
             from.resource = buffer.as_raw().cast_const().cast();
-            from.footprint.offset = 0;
+            from.footprint.offset = upload_offset;
             #[cfg(feature = "diagnostics")]
             {
                 // SAFETY: a live buffer.
-                read = Some((unsafe { buffer.GetGPUVirtualAddress() }, bytes));
+                read = Some((unsafe { buffer.GetGPUVirtualAddress() } + upload_offset, bytes));
             }
             _upload = buffer;
         } else {
@@ -2063,7 +2095,13 @@ pub(crate) struct TextureBarrierDesc {
 #[cfg(windows)]
 const _: () = {
     use windows::Win32::Graphics::Direct3D12::{
-        D3D12_BARRIER_GROUP, D3D12_BUFFER_BARRIER, D3D12_GLOBAL_BARRIER, D3D12_TEXTURE_BARRIER,
+        D3D12_BARRIER_ACCESS_RAYTRACING_ACCELERATION_STRUCTURE_READ,
+        D3D12_BARRIER_ACCESS_RAYTRACING_ACCELERATION_STRUCTURE_WRITE, D3D12_BARRIER_GROUP,
+        D3D12_BARRIER_SYNC_BUILD_RAYTRACING_ACCELERATION_STRUCTURE,
+        D3D12_BARRIER_SYNC_COPY_RAYTRACING_ACCELERATION_STRUCTURE,
+        D3D12_BARRIER_SYNC_EMIT_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO,
+        D3D12_BARRIER_SYNC_RAYTRACING, D3D12_BARRIER_SYNC_SPLIT, D3D12_BUFFER_BARRIER,
+        D3D12_GLOBAL_BARRIER, D3D12_TEXTURE_BARRIER,
     };
     assert!(size_of::<BarrierGroup>() == 16);
     assert!(size_of::<BarrierGroup>() == size_of::<D3D12_BARRIER_GROUP>());
@@ -2073,6 +2111,26 @@ const _: () = {
     assert!(size_of::<BufferBarrierDesc>() == size_of::<D3D12_BUFFER_BARRIER>());
     assert!(size_of::<TextureBarrierDesc>() == 64);
     assert!(size_of::<TextureBarrierDesc>() == size_of::<D3D12_TEXTURE_BARRIER>());
+    assert!(SYNC_RAYTRACING == D3D12_BARRIER_SYNC_RAYTRACING.0 as u32);
+    assert!(
+        SYNC_EMIT_RAYTRACING_POSTBUILD
+            == D3D12_BARRIER_SYNC_EMIT_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO.0 as u32
+    );
+    assert!(
+        SYNC_BUILD_RAYTRACING_AS
+            == D3D12_BARRIER_SYNC_BUILD_RAYTRACING_ACCELERATION_STRUCTURE.0 as u32
+    );
+    assert!(
+        SYNC_COPY_RAYTRACING_AS
+            == D3D12_BARRIER_SYNC_COPY_RAYTRACING_ACCELERATION_STRUCTURE.0 as u32
+    );
+    assert!(SYNC_SPLIT == D3D12_BARRIER_SYNC_SPLIT.0 as u32);
+    assert!(
+        ACCESS_RTAS_READ == D3D12_BARRIER_ACCESS_RAYTRACING_ACCELERATION_STRUCTURE_READ.0 as u32
+    );
+    assert!(
+        ACCESS_RTAS_WRITE == D3D12_BARRIER_ACCESS_RAYTRACING_ACCELERATION_STRUCTURE_WRITE.0 as u32
+    );
 };
 
 /// Element size in bytes for a known `BarrierGroup::kind`, or `None` if unknown.
@@ -2095,15 +2153,20 @@ const SYNC_PIXEL_SHADING: u32 = 0x10;
 const SYNC_DEPTH_STENCIL: u32 = 0x20;
 const SYNC_RENDER_TARGET: u32 = 0x40;
 const SYNC_COMPUTE_SHADING: u32 = 0x80;
+const SYNC_RAYTRACING: u32 = 0x100;
 const SYNC_COPY: u32 = 0x200;
 const SYNC_RESOLVE: u32 = 0x400;
 const SYNC_EXECUTE_INDIRECT: u32 = 0x800; // aliased with PREDICATION
 const SYNC_ALL_SHADING: u32 = 0x1000;
 const SYNC_NON_PIXEL_SHADING: u32 = 0x2000;
+const SYNC_EMIT_RAYTRACING_POSTBUILD: u32 = 0x4000;
 const SYNC_CLEAR_UAV: u32 = 0x8000;
+const SYNC_BUILD_RAYTRACING_AS: u32 = 0x80_0000;
+const SYNC_COPY_RAYTRACING_AS: u32 = 0x100_0000;
+const SYNC_SPLIT: u32 = 0x8000_0000;
 
-/// Sync bits recognized and legal on a PC Direct queue (unrecognized bits,
-/// split barriers, video/RTAS bits, or Xbox-private bits force fallback).
+/// Sync bits recognized and legal on a PC Direct queue (unrecognized, video,
+/// or Xbox-private bits force fallback).
 const KNOWN_DIRECT_SYNC: u32 = SYNC_ALL
     | SYNC_DRAW
     | SYNC_INDEX_INPUT
@@ -2112,12 +2175,17 @@ const KNOWN_DIRECT_SYNC: u32 = SYNC_ALL
     | SYNC_DEPTH_STENCIL
     | SYNC_RENDER_TARGET
     | SYNC_COMPUTE_SHADING
+    | SYNC_RAYTRACING
     | SYNC_COPY
     | SYNC_RESOLVE
     | SYNC_EXECUTE_INDIRECT
     | SYNC_ALL_SHADING
     | SYNC_NON_PIXEL_SHADING
-    | SYNC_CLEAR_UAV;
+    | SYNC_EMIT_RAYTRACING_POSTBUILD
+    | SYNC_CLEAR_UAV
+    | SYNC_BUILD_RAYTRACING_AS
+    | SYNC_COPY_RAYTRACING_AS
+    | SYNC_SPLIT;
 
 // D3D12_BARRIER_ACCESS bit values.
 const ACCESS_COMMON: u32 = 0x0;
@@ -2135,6 +2203,8 @@ const ACCESS_COPY_DEST: u32 = 0x400;
 const ACCESS_COPY_SOURCE: u32 = 0x800;
 const ACCESS_RESOLVE_DEST: u32 = 0x1000;
 const ACCESS_RESOLVE_SOURCE: u32 = 0x2000;
+const ACCESS_RTAS_READ: u32 = 0x4000;
+const ACCESS_RTAS_WRITE: u32 = 0x8000;
 const ACCESS_SHADING_RATE_SOURCE: u32 = 0x1_0000;
 const ACCESS_NO_ACCESS: u32 = 0x8000_0000;
 
@@ -2146,7 +2216,9 @@ const KNOWN_BUFFER_ACCESS: u32 = ACCESS_VERTEX_BUFFER
     | ACCESS_STREAM_OUTPUT
     | ACCESS_INDIRECT_ARGUMENT
     | ACCESS_COPY_DEST
-    | ACCESS_COPY_SOURCE;
+    | ACCESS_COPY_SOURCE
+    | ACCESS_RTAS_READ
+    | ACCESS_RTAS_WRITE;
 
 const KNOWN_DIRECT_ACCESS: u32 = KNOWN_BUFFER_ACCESS
     | ACCESS_RENDER_TARGET
@@ -2156,19 +2228,6 @@ const KNOWN_DIRECT_ACCESS: u32 = KNOWN_BUFFER_ACCESS
     | ACCESS_RESOLVE_SOURCE
     | ACCESS_SHADING_RATE_SOURCE
     | ACCESS_NO_ACCESS;
-
-/// Global sync bits that touch graphics fixed-function, copy, or full-pipe.
-const GLOBAL_CONSERVATIVE_SYNC: u32 =
-    SYNC_ALL | SYNC_RENDER_TARGET | SYNC_DEPTH_STENCIL | SYNC_RESOLVE | SYNC_COPY;
-
-/// Global access bits that touch graphics fixed-function or copy.
-const GLOBAL_CONSERVATIVE_ACCESS: u32 = ACCESS_RENDER_TARGET
-    | ACCESS_DEPTH_STENCIL_WRITE
-    | ACCESS_DEPTH_STENCIL_READ
-    | ACCESS_RESOLVE_DEST
-    | ACCESS_RESOLVE_SOURCE
-    | ACCESS_COPY_DEST
-    | ACCESS_COPY_SOURCE;
 
 /// Conservative global fallback matching legacy `UAV(NULL)` shader ordering.
 const CONSERVATIVE_GLOBAL: GlobalBarrierDesc = GlobalBarrierDesc {
@@ -2191,6 +2250,9 @@ fn sync_access_compatible(sync: u32, access: u32) -> bool {
     if sync == SYNC_NONE {
         return access == ACCESS_NO_ACCESS;
     }
+    if (sync & SYNC_SPLIT) != 0 {
+        return sync == SYNC_SPLIT && access == ACCESS_NO_ACCESS;
+    }
     if (sync & !KNOWN_DIRECT_SYNC) != 0 {
         return false;
     }
@@ -2206,6 +2268,7 @@ fn sync_access_compatible(sync: u32, access: u32) -> bool {
     const SHADING: u32 = SYNC_VERTEX_SHADING
         | SYNC_PIXEL_SHADING
         | SYNC_COMPUTE_SHADING
+        | SYNC_RAYTRACING
         | SYNC_DRAW
         | SYNC_ALL_SHADING
         | SYNC_NON_PIXEL_SHADING;
@@ -2222,7 +2285,14 @@ fn sync_access_compatible(sync: u32, access: u32) -> bool {
     if (access & ACCESS_RENDER_TARGET) != 0 && (sync & (SYNC_RENDER_TARGET | SYNC_DRAW)) == 0 {
         return false;
     }
-    if (access & ACCESS_UNORDERED_ACCESS) != 0 && (sync & (SHADING | SYNC_CLEAR_UAV)) == 0 {
+    if (access & ACCESS_UNORDERED_ACCESS) != 0
+        && (sync
+            & (SHADING
+                | SYNC_CLEAR_UAV
+                | SYNC_BUILD_RAYTRACING_AS
+                | SYNC_EMIT_RAYTRACING_POSTBUILD))
+            == 0
+    {
         return false;
     }
     if (access & (ACCESS_DEPTH_STENCIL_WRITE | ACCESS_DEPTH_STENCIL_READ)) != 0
@@ -2230,7 +2300,9 @@ fn sync_access_compatible(sync: u32, access: u32) -> bool {
     {
         return false;
     }
-    if (access & ACCESS_SHADER_RESOURCE) != 0 && (sync & SHADING) == 0 {
+    if (access & ACCESS_SHADER_RESOURCE) != 0
+        && (sync & (SHADING | SYNC_BUILD_RAYTRACING_AS)) == 0
+    {
         return false;
     }
     if (access & ACCESS_STREAM_OUTPUT) != 0 && (sync & VERTEX) == 0 {
@@ -2243,6 +2315,21 @@ fn sync_access_compatible(sync: u32, access: u32) -> bool {
         return false;
     }
     if (access & (ACCESS_RESOLVE_DEST | ACCESS_RESOLVE_SOURCE)) != 0 && (sync & SYNC_RESOLVE) == 0 {
+        return false;
+    }
+    if (access & ACCESS_RTAS_READ) != 0
+        && (sync
+            & (SHADING
+                | SYNC_BUILD_RAYTRACING_AS
+                | SYNC_COPY_RAYTRACING_AS
+                | SYNC_EMIT_RAYTRACING_POSTBUILD))
+            == 0
+    {
+        return false;
+    }
+    if (access & ACCESS_RTAS_WRITE) != 0
+        && (sync & (SYNC_BUILD_RAYTRACING_AS | SYNC_COPY_RAYTRACING_AS)) == 0
+    {
         return false;
     }
     if (access & ACCESS_SHADING_RATE_SOURCE) != 0
@@ -2281,25 +2368,18 @@ fn decode_global_barrier(b: GlobalBarrierDesc) -> DecodedBarrier {
     if b.sync_before == SYNC_NONE || b.sync_after == SYNC_NONE {
         return DecodedBarrier::Skip;
     }
-    if !sync_access_compatible(b.sync_before, b.access_before)
+    // D3D12 Enhanced Barriers forbid `SYNC_SPLIT` on global barriers.
+    if ((b.sync_before | b.sync_after) & SYNC_SPLIT) != 0
+        || !sync_access_compatible(b.sync_before, b.access_before)
         || !sync_access_compatible(b.sync_after, b.access_after)
     {
-        return DecodedBarrier::Fallback(CONSERVATIVE_GLOBAL);
-    }
-    let touches_copy = ((b.sync_before | b.sync_after) & SYNC_COPY) != 0
-        || (b.access_before != ACCESS_NO_ACCESS && (b.access_before & ACCESS_COPY_DEST) != 0)
-        || (b.access_after != ACCESS_NO_ACCESS
-            && (b.access_after & (ACCESS_COPY_DEST | ACCESS_COPY_SOURCE)) != 0);
-    if touches_copy {
-        return DecodedBarrier::Fallback(CONSERVATIVE_GLOBAL_COPY);
-    }
-    let touches_conservative = ((b.sync_before | b.sync_after) & GLOBAL_CONSERVATIVE_SYNC) != 0
-        || (b.access_before != ACCESS_NO_ACCESS
-            && (b.access_before & GLOBAL_CONSERVATIVE_ACCESS) != 0)
-        || (b.access_after != ACCESS_NO_ACCESS
-            && (b.access_after & GLOBAL_CONSERVATIVE_ACCESS) != 0);
-    if touches_conservative {
-        return DecodedBarrier::Fallback(CONSERVATIVE_GLOBAL);
+        let touches_copy = ((b.sync_before | b.sync_after) & SYNC_COPY) != 0
+            || (b.access_before != ACCESS_NO_ACCESS && (b.access_before & ACCESS_COPY_DEST) != 0);
+        return DecodedBarrier::Fallback(if touches_copy {
+            CONSERVATIVE_GLOBAL_COPY
+        } else {
+            CONSERVATIVE_GLOBAL
+        });
     }
     DecodedBarrier::Exact(widen_for_indirect_clamp(b))
 }
@@ -2307,6 +2387,10 @@ fn decode_global_barrier(b: GlobalBarrierDesc) -> DecodedBarrier {
 fn decode_buffer_barrier(b: &BufferBarrierDesc) -> DecodedBarrier {
     if b.sync_before == SYNC_NONE || b.sync_after == SYNC_NONE {
         return DecodedBarrier::Skip;
+    }
+    // D3D12 Enhanced Barriers forbid `SYNC_SPLIT` on buffer barriers.
+    if ((b.sync_before | b.sync_after) & SYNC_SPLIT) != 0 {
+        return DecodedBarrier::Fallback(CONSERVATIVE_GLOBAL);
     }
     let access_before_ok =
         b.access_before == ACCESS_NO_ACCESS || (b.access_before & !KNOWN_BUFFER_ACCESS) == 0;
@@ -2439,7 +2523,7 @@ fn decode_sync_shape(flags: u32, control: u32) -> SyncPlan {
                 access_before: ACCESS_UNORDERED_ACCESS,
                 access_after: ACCESS_UNORDERED_ACCESS | ACCESS_SHADER_RESOURCE | ACCESS_VERTEX_BUFFER,
             },
-            covers_all_uavs: false,
+            covers_all_uavs: true,
             coalesce_if_uav_clean: true,
         },
         (GCR_GL1_GLV_GLK, CTRL_GCR_PFP) => SyncPlan::Barrier {
@@ -3222,10 +3306,154 @@ extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
     let _ = (this, count, groups);
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ResolvedTexUav<T> {
+    Uav(T),
+    Skip,
+    Fallback,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ParsedBarrierPlan<B, T> {
+    buf_barriers: Vec<(B, GlobalBarrierDesc)>,
+    global_barriers: Vec<GlobalBarrierDesc>,
+    tex_uavs: Vec<T>,
+    fallback: Option<(GlobalBarrierDesc, bool)>,
+}
+
+/// Pure planner for console `BarrierGroup` arrays. Preserves every narrow sibling
+/// buffer/global/texture barrier even when one item in a mixed batch requires a
+/// conservative fallback, instead of discarding siblings.
+fn plan_parsed_barrier_groups<B, T: PartialEq>(
+    groups: &[BarrierGroup],
+    mut resolve_buf: impl FnMut(&BufferBarrierDesc) -> Option<B>,
+    mut resolve_tex: impl FnMut(&TextureBarrierDesc) -> ResolvedTexUav<T>,
+) -> ParsedBarrierPlan<B, T> {
+    let mut plan = ParsedBarrierPlan {
+        buf_barriers: Vec::new(),
+        global_barriers: Vec::new(),
+        tex_uavs: Vec::new(),
+        fallback: None,
+    };
+
+    let mut set_fallback = |desc: GlobalBarrierDesc, copy: bool| {
+        let now = match plan.fallback {
+            Some((_, true)) => (CONSERVATIVE_GLOBAL_COPY, true),
+            _ if copy => (CONSERVATIVE_GLOBAL_COPY, true),
+            Some((prev, false)) => (prev, false),
+            None => (desc, false),
+        };
+        plan.fallback = Some(now);
+    };
+
+    for g in groups {
+        if g.count == 0 {
+            continue;
+        }
+        if g.barriers.is_null() {
+            set_fallback(CONSERVATIVE_GLOBAL, false);
+            continue;
+        }
+        match g.kind {
+            BARRIER_GROUP_GLOBAL => {
+                // SAFETY: caller guarantees `g.count` valid `GlobalBarrierDesc` entries.
+                let items = unsafe {
+                    std::slice::from_raw_parts(
+                        g.barriers.cast::<GlobalBarrierDesc>(),
+                        g.count as usize,
+                    )
+                };
+                for &b in items {
+                    match decode_global_barrier(b) {
+                        DecodedBarrier::Skip => {}
+                        DecodedBarrier::Exact(desc) => plan.global_barriers.push(desc),
+                        DecodedBarrier::Fallback(desc) => {
+                            set_fallback(desc, (desc.sync_before & SYNC_COPY) != 0);
+                        }
+                    }
+                }
+            }
+            BARRIER_GROUP_BUFFER => {
+                // SAFETY: caller guarantees `g.count` valid `BufferBarrierDesc` entries.
+                let items = unsafe {
+                    std::slice::from_raw_parts(
+                        g.barriers.cast::<BufferBarrierDesc>(),
+                        g.count as usize,
+                    )
+                };
+                for b in items {
+                    let desc = match decode_buffer_barrier(b) {
+                        DecodedBarrier::Skip => continue,
+                        DecodedBarrier::Exact(d) => d,
+                        DecodedBarrier::Fallback(d) => {
+                            set_fallback(d, false);
+                            continue;
+                        }
+                    };
+                    if let Some(handle) = resolve_buf(b) {
+                        plan.buf_barriers.push((handle, desc));
+                    } else {
+                        // Aliased or unmapped buffer: preserve exact narrowed sync/access
+                        // as a global barrier when valid, else record conservative fallback.
+                        match decode_global_barrier(desc) {
+                            DecodedBarrier::Skip => {}
+                            DecodedBarrier::Exact(gdesc) => plan.global_barriers.push(gdesc),
+                            DecodedBarrier::Fallback(gdesc) => {
+                                set_fallback(gdesc, (gdesc.sync_before & SYNC_COPY) != 0);
+                            }
+                        }
+                    }
+                }
+            }
+            BARRIER_GROUP_TEXTURE => {
+                // SAFETY: caller guarantees `g.count` valid `TextureBarrierDesc` entries.
+                let items = unsafe {
+                    std::slice::from_raw_parts(
+                        g.barriers.cast::<TextureBarrierDesc>(),
+                        g.count as usize,
+                    )
+                };
+                for b in items {
+                    match decode_texture_barrier(b) {
+                        TextureBarrierPlan::Skip => {}
+                        TextureBarrierPlan::CopyToCopy => {
+                            plan.global_barriers.push(GlobalBarrierDesc {
+                                sync_before: SYNC_COPY,
+                                sync_after: SYNC_COPY,
+                                access_before: ACCESS_COPY_DEST,
+                                access_after: ACCESS_COPY_DEST,
+                            });
+                        }
+                        TextureBarrierPlan::ScopedUav => match resolve_tex(b) {
+                            ResolvedTexUav::Uav(handle) => {
+                                if !plan.tex_uavs.contains(&handle) {
+                                    plan.tex_uavs.push(handle);
+                                }
+                            }
+                            ResolvedTexUav::Skip => {}
+                            ResolvedTexUav::Fallback => {
+                                set_fallback(CONSERVATIVE_GLOBAL, false);
+                            }
+                        },
+                        TextureBarrierPlan::Fallback => {
+                            set_fallback(CONSERVATIVE_GLOBAL, false);
+                        }
+                    }
+                }
+            }
+            _ => {
+                set_fallback(CONSERVATIVE_GLOBAL, false);
+            }
+        }
+    }
+
+    plan
+}
+
 /// Parses console `BarrierGroup` descriptors and emits the narrowest safe
 /// Enhanced Barrier set on `list7` (plus resource-scoped legacy texture UAV
-/// barriers where required). Falls back conservatively on any unrecognized bit,
-/// null pointer, or unresolvable texture/buffer descriptor.
+/// barriers where required). An undecoded item in a mixed batch appends a
+/// conservative global barrier without discarding narrow sibling barriers.
 #[cfg(windows)]
 fn emit_parsed_barrier_groups(
     list: &crate::host::HostList,
@@ -3259,182 +3487,97 @@ fn emit_parsed_barrier_groups(
     }
 
     // SAFETY: caller passes `count` valid `BarrierGroup` entries.
-    let groups = unsafe { std::slice::from_raw_parts(groups_ptr.cast::<BarrierGroup>(), count as usize) };
+    let groups =
+        unsafe { std::slice::from_raw_parts(groups_ptr.cast::<BarrierGroup>(), count as usize) };
 
-    let mut buf_barriers: Vec<D3D12_BUFFER_BARRIER> = Vec::new();
-    let mut global_barriers: Vec<D3D12_GLOBAL_BARRIER> = Vec::new();
-    let mut tex_uav_ptrs: Vec<*mut std::ffi::c_void> = Vec::new();
-    let mut fallback: Option<(GlobalBarrierDesc, bool)> = None;
-
-    let mut set_fallback = |desc: GlobalBarrierDesc, copy: bool| -> bool {
-        let now = match fallback {
-            Some((_, true)) => (CONSERVATIVE_GLOBAL_COPY, true),
-            _ if copy => (CONSERVATIVE_GLOBAL_COPY, true),
-            Some((prev, false)) => (prev, false),
-            None => (desc, false),
-        };
-        fallback = Some(now);
-        now.1
-    };
-
-    'groups: for g in groups {
-        if g.count == 0 {
-            continue;
-        }
-        if g.barriers.is_null() {
-            set_fallback(CONSERVATIVE_GLOBAL, false);
-            break;
-        }
-        match g.kind {
-            BARRIER_GROUP_GLOBAL => {
-                // SAFETY: `g.count` valid `GlobalBarrierDesc` entries.
-                let items = unsafe {
-                    std::slice::from_raw_parts(g.barriers.cast::<GlobalBarrierDesc>(), g.count as usize)
-                };
-                for &b in items {
-                    match decode_global_barrier(b) {
-                        DecodedBarrier::Skip => {}
-                        DecodedBarrier::Exact(desc) => {
-                            global_barriers.push(D3D12_GLOBAL_BARRIER {
-                                SyncBefore: D3D12_BARRIER_SYNC(desc.sync_before as i32),
-                                SyncAfter: D3D12_BARRIER_SYNC(desc.sync_after as i32),
-                                AccessBefore: D3D12_BARRIER_ACCESS(desc.access_before as i32),
-                                AccessAfter: D3D12_BARRIER_ACCESS(desc.access_after as i32),
-                            });
-                        }
-                        DecodedBarrier::Fallback(desc) => {
-                            if set_fallback(desc, (desc.sync_before & SYNC_COPY) != 0) {
-                                break 'groups;
-                            }
-                        }
-                    }
-                }
+    let plan = plan_parsed_barrier_groups(
+        groups,
+        |b| {
+            if b.resource.is_null() {
+                return None;
             }
-            BARRIER_GROUP_BUFFER => {
-                // SAFETY: `g.count` valid `BufferBarrierDesc` entries.
-                let items = unsafe {
-                    std::slice::from_raw_parts(g.barriers.cast::<BufferBarrierDesc>(), g.count as usize)
-                };
-                for b in items {
-                    let desc = match decode_buffer_barrier(b) {
-                        DecodedBarrier::Skip => continue,
-                        DecodedBarrier::Exact(d) => d,
-                        DecodedBarrier::Fallback(d) => {
-                            set_fallback(d, false);
-                            continue;
-                        }
-                    };
-                    let resolved = if b.resource.is_null() {
-                        None
+            crate::resource::buffer_bytes(b.resource).and_then(|(ptr, buf_len)| {
+                let (addr, len) = if b.offset == 0 && (b.size == u64::MAX || b.size >= buf_len) {
+                    (ptr as u64, buf_len)
+                } else {
+                    let avail = buf_len.saturating_sub(b.offset);
+                    let span = if b.size == u64::MAX { avail } else { b.size.min(avail) };
+                    if span > 0 {
+                        ((ptr as u64).wrapping_add(b.offset), span)
                     } else {
-                        crate::resource::buffer_bytes(b.resource).and_then(|(ptr, buf_len)| {
-                            let (addr, len) = if b.offset == 0 && (b.size == u64::MAX || b.size >= buf_len) {
-                                (ptr as u64, buf_len)
-                            } else {
-                                let avail = buf_len.saturating_sub(b.offset);
-                                let span = if b.size == u64::MAX { avail } else { b.size.min(avail) };
-                                if span > 0 {
-                                    ((ptr as u64).wrapping_add(b.offset), span)
-                                } else {
-                                    (ptr as u64, buf_len)
-                                }
-                            };
-                            crate::shadow::scoped_barrier_shadow(addr, len)
-                        })
-                    };
-                    if let Some(shadow) = resolved {
-                        buf_barriers.push(D3D12_BUFFER_BARRIER {
-                            SyncBefore: D3D12_BARRIER_SYNC(desc.sync_before as i32),
-                            SyncAfter: D3D12_BARRIER_SYNC(desc.sync_after as i32),
-                            AccessBefore: D3D12_BARRIER_ACCESS(desc.access_before as i32),
-                            AccessAfter: D3D12_BARRIER_ACCESS(desc.access_after as i32),
-                            // SAFETY: borrowed COM pointer; `keep_shadow` keeps it alive.
-                            pResource: unsafe { std::mem::transmute_copy(&shadow.buffer) },
-                            Offset: 0,
-                            Size: u64::MAX,
-                        });
-                        list.keep_shadow(shadow);
-                    } else {
-                        // Aliased or unmapped buffer: preserve exact narrowed sync/access
-                        // as a global barrier when purely shader-scoped, else conservative.
-                        match decode_global_barrier(desc) {
-                            DecodedBarrier::Skip => {}
-                            DecodedBarrier::Exact(gdesc) => {
-                                global_barriers.push(D3D12_GLOBAL_BARRIER {
-                                    SyncBefore: D3D12_BARRIER_SYNC(gdesc.sync_before as i32),
-                                    SyncAfter: D3D12_BARRIER_SYNC(gdesc.sync_after as i32),
-                                    AccessBefore: D3D12_BARRIER_ACCESS(gdesc.access_before as i32),
-                                    AccessAfter: D3D12_BARRIER_ACCESS(gdesc.access_after as i32),
-                                });
-                            }
-                            DecodedBarrier::Fallback(gdesc) => {
-                                set_fallback(gdesc, (gdesc.sync_before & SYNC_COPY) != 0);
-                            }
-                        }
+                        (ptr as u64, buf_len)
                     }
-                }
-            }
-            BARRIER_GROUP_TEXTURE => {
-                // SAFETY: `g.count` valid `TextureBarrierDesc` entries.
-                let items = unsafe {
-                    std::slice::from_raw_parts(g.barriers.cast::<TextureBarrierDesc>(), g.count as usize)
                 };
-                for b in items {
-                    match decode_texture_barrier(b) {
-                        TextureBarrierPlan::Skip => {}
-                        TextureBarrierPlan::CopyToCopy => {
-                            global_barriers.push(D3D12_GLOBAL_BARRIER {
-                                SyncBefore: D3D12_BARRIER_SYNC(SYNC_COPY as i32),
-                                SyncAfter: D3D12_BARRIER_SYNC(SYNC_COPY as i32),
-                                AccessBefore: D3D12_BARRIER_ACCESS(ACCESS_COPY_DEST as i32),
-                                AccessAfter: D3D12_BARRIER_ACCESS(ACCESS_COPY_DEST as i32),
-                            });
-                        }
-                        TextureBarrierPlan::ScopedUav => {
-                            if b.resource.is_null() {
-                                set_fallback(CONSERVATIVE_GLOBAL, false);
-                                continue;
-                            }
-                            if let Some(twin) = crate::resource::twin_resource(b.resource) {
-                                list.keep(twin);
-                                let raw = twin.as_raw();
-                                if !tex_uav_ptrs.contains(&raw) {
-                                    tex_uav_ptrs.push(raw);
-                                }
-                            } else if let Some(copy) = crate::resource::host_copy(b.resource) {
-                                if (copy.flags() & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 as u32)
-                                    != 0
-                                {
-                                    list.keep(&copy.texture);
-                                    let raw = copy.texture.as_raw();
-                                    if !tex_uav_ptrs.contains(&raw) {
-                                        tex_uav_ptrs.push(raw);
-                                    }
-                                } else if (b.access_before & ACCESS_UNORDERED_ACCESS) != 0 {
-                                    // Requested UAV access on a resource without host UAV flag: fallback.
-                                    set_fallback(CONSERVATIVE_GLOBAL, false);
-                                }
-                            } else {
-                                // Unrecognized resource pointer: fallback conservatively.
-                                set_fallback(CONSERVATIVE_GLOBAL, false);
-                            }
-                        }
-                        TextureBarrierPlan::Fallback => {
-                            set_fallback(CONSERVATIVE_GLOBAL, false);
-                        }
-                    }
+                crate::shadow::scoped_barrier_shadow(addr, len)
+            })
+        },
+        |b| {
+            if b.resource.is_null() {
+                return ResolvedTexUav::Fallback;
+            }
+            if let Some(twin) = crate::resource::twin_resource(b.resource) {
+                list.keep(twin);
+                ResolvedTexUav::Uav(twin.as_raw())
+            } else if let Some(copy) = crate::resource::host_copy(b.resource) {
+                if (copy.flags() & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 as u32) != 0 {
+                    list.keep(&copy.texture);
+                    ResolvedTexUav::Uav(copy.texture.as_raw())
+                } else if (b.access_before & ACCESS_UNORDERED_ACCESS) != 0 {
+                    ResolvedTexUav::Fallback
+                } else {
+                    ResolvedTexUav::Skip
                 }
+            } else {
+                ResolvedTexUav::Fallback
             }
-            _ => {
-                set_fallback(CONSERVATIVE_GLOBAL, false);
-                break;
-            }
-        }
-    }
+        },
+    );
 
-    if let Some((desc, covers_copy)) = fallback {
+    if let Some((desc, covers_copy)) = plan.fallback
+        && plan.buf_barriers.is_empty()
+        && plan.global_barriers.is_empty()
+        && plan.tex_uavs.is_empty()
+    {
         emit_fallback(desc, covers_copy);
         return;
+    }
+
+    let mut buf_barriers: Vec<D3D12_BUFFER_BARRIER> = Vec::with_capacity(plan.buf_barriers.len());
+    for (shadow, desc) in plan.buf_barriers {
+        buf_barriers.push(D3D12_BUFFER_BARRIER {
+            SyncBefore: D3D12_BARRIER_SYNC(desc.sync_before as i32),
+            SyncAfter: D3D12_BARRIER_SYNC(desc.sync_after as i32),
+            AccessBefore: D3D12_BARRIER_ACCESS(desc.access_before as i32),
+            AccessAfter: D3D12_BARRIER_ACCESS(desc.access_after as i32),
+            // SAFETY: borrowed COM pointer; `keep_shadow` keeps it alive.
+            pResource: unsafe { std::mem::transmute_copy(&shadow.buffer) },
+            Offset: 0,
+            Size: u64::MAX,
+        });
+        list.keep_shadow(shadow);
+    }
+
+    let mut global_barriers: Vec<D3D12_GLOBAL_BARRIER> =
+        Vec::with_capacity(plan.global_barriers.len() + usize::from(plan.fallback.is_some()));
+    for desc in plan.global_barriers {
+        global_barriers.push(D3D12_GLOBAL_BARRIER {
+            SyncBefore: D3D12_BARRIER_SYNC(desc.sync_before as i32),
+            SyncAfter: D3D12_BARRIER_SYNC(desc.sync_after as i32),
+            AccessBefore: D3D12_BARRIER_ACCESS(desc.access_before as i32),
+            AccessAfter: D3D12_BARRIER_ACCESS(desc.access_after as i32),
+        });
+    }
+    let mut mark_clean = false;
+    if let Some((desc, covers_copy)) = plan.fallback
+        && (covers_copy || !crate::host::coalesce_uav_barriers() || !list.is_uav_clean())
+    {
+        global_barriers.push(D3D12_GLOBAL_BARRIER {
+            SyncBefore: D3D12_BARRIER_SYNC(desc.sync_before as i32),
+            SyncAfter: D3D12_BARRIER_SYNC(desc.sync_after as i32),
+            AccessBefore: D3D12_BARRIER_ACCESS(desc.access_before as i32),
+            AccessAfter: D3D12_BARRIER_ACCESS(desc.access_after as i32),
+        });
+        mark_clean = true;
     }
 
     let mut out_groups: [std::mem::MaybeUninit<D3D12_BARRIER_GROUP>; 2] =
@@ -3466,13 +3609,17 @@ fn emit_parsed_barrier_groups(
             let slice = std::slice::from_raw_parts(out_groups.as_ptr().cast(), out_len);
             list7.Barrier(slice);
         }
+        if mark_clean {
+            list.mark_uav_clean();
+        }
         #[cfg(feature = "diagnostics")]
         if !global_barriers.is_empty() {
             crate::copystat::add(crate::copystat::C::WaitsForGroups, 1);
         }
     }
-    if !tex_uav_ptrs.is_empty() {
-        let uavs: Vec<D3D12_RESOURCE_BARRIER> = tex_uav_ptrs
+    if !plan.tex_uavs.is_empty() {
+        let uavs: Vec<D3D12_RESOURCE_BARRIER> = plan
+            .tex_uavs
             .into_iter()
             .map(|raw| D3D12_RESOURCE_BARRIER {
                 Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
@@ -3888,7 +4035,9 @@ mod tests {
             }
         );
 
-        // 3 & 4. RDNA2 GCR GLV and GL1+GLV shader-cache flushes (no PFP sync).
+        // 3 & 4. RDNA2 GCR GLV and GL1+GLV shader-cache flushes (no PFP sync):
+        // flush all shader UAVs globally (`covers_all_uavs: true`) to unlock
+        // back-to-back coalescing.
         let expected_gcr = SyncPlan::Barrier {
             desc: GlobalBarrierDesc {
                 sync_before: SYNC_ALL_SHADING,
@@ -3896,7 +4045,7 @@ mod tests {
                 access_before: ACCESS_UNORDERED_ACCESS,
                 access_after: ACCESS_UNORDERED_ACCESS | ACCESS_SHADER_RESOURCE | ACCESS_VERTEX_BUFFER,
             },
-            covers_all_uavs: false,
+            covers_all_uavs: true,
             coalesce_if_uav_clean: true,
         };
         assert_eq!(decode_sync_shape(0xc280, 0x20000), expected_gcr);
@@ -4011,7 +4160,8 @@ mod tests {
             DecodedBarrier::Fallback(CONSERVATIVE_GLOBAL)
         );
 
-        // Global barriers: compute-to-pixel stays exact; RTV/DSV/ALL/COPY/unknown fall back.
+        // Global barriers preserve exact SYNC_RENDER_TARGET, SYNC_DEPTH_STENCIL, SYNC_COPY,
+        // and RTAS/Raytracing scopes; unknown bits or SYNC_SPLIT fall back conservatively.
         let cs_to_ps = GlobalBarrierDesc {
             sync_before: SYNC_COMPUTE_SHADING,
             sync_after: SYNC_PIXEL_SHADING,
@@ -4026,10 +4176,15 @@ mod tests {
             access_before: ACCESS_RENDER_TARGET,
             access_after: ACCESS_SHADER_RESOURCE,
         };
-        assert_eq!(
-            decode_global_barrier(rt_global),
-            DecodedBarrier::Fallback(CONSERVATIVE_GLOBAL)
-        );
+        assert_eq!(decode_global_barrier(rt_global), DecodedBarrier::Exact(rt_global));
+
+        let ds_global = GlobalBarrierDesc {
+            sync_before: SYNC_DEPTH_STENCIL,
+            sync_after: SYNC_COMPUTE_SHADING,
+            access_before: ACCESS_DEPTH_STENCIL_WRITE,
+            access_after: ACCESS_SHADER_RESOURCE,
+        };
+        assert_eq!(decode_global_barrier(ds_global), DecodedBarrier::Exact(ds_global));
 
         let copy_global = GlobalBarrierDesc {
             sync_before: SYNC_COPY,
@@ -4037,10 +4192,147 @@ mod tests {
             access_before: ACCESS_COPY_DEST,
             access_after: ACCESS_SHADER_RESOURCE,
         };
+        assert_eq!(decode_global_barrier(copy_global), DecodedBarrier::Exact(copy_global));
+
+        let rtas_global = GlobalBarrierDesc {
+            sync_before: SYNC_BUILD_RAYTRACING_AS,
+            sync_after: SYNC_RAYTRACING,
+            access_before: ACCESS_RTAS_WRITE,
+            access_after: ACCESS_RTAS_READ,
+        };
+        assert_eq!(decode_global_barrier(rtas_global), DecodedBarrier::Exact(rtas_global));
+
+        let split_global = GlobalBarrierDesc {
+            sync_before: SYNC_COMPUTE_SHADING,
+            sync_after: SYNC_SPLIT,
+            access_before: ACCESS_UNORDERED_ACCESS,
+            access_after: ACCESS_NO_ACCESS,
+        };
         assert_eq!(
-            decode_global_barrier(copy_global),
-            DecodedBarrier::Fallback(CONSERVATIVE_GLOBAL_COPY)
+            decode_global_barrier(split_global),
+            DecodedBarrier::Fallback(CONSERVATIVE_GLOBAL)
         );
+    }
+
+    #[test]
+    fn mixed_barrier_groups_preserve_narrow_siblings_on_fallback_and_accept_split_textures() {
+        // 1. Valid narrowed compute buffer barrier + 1 unknown-bit buffer barrier in one group.
+        let valid_buf = BufferBarrierDesc {
+            sync_before: SYNC_COMPUTE_SHADING,
+            sync_after: SYNC_COMPUTE_SHADING,
+            access_before: ACCESS_UNORDERED_ACCESS,
+            access_after: ACCESS_SHADER_RESOURCE,
+            resource: 0x1000 as This,
+            offset: 0,
+            size: u64::MAX,
+        };
+        let bad_buf = BufferBarrierDesc {
+            sync_before: 0x4000_0000,
+            sync_after: SYNC_COMPUTE_SHADING,
+            access_before: ACCESS_UNORDERED_ACCESS,
+            access_after: ACCESS_SHADER_RESOURCE,
+            resource: 0x2000 as This,
+            offset: 0,
+            size: u64::MAX,
+        };
+        let buf_items = [valid_buf, bad_buf];
+
+        // 2. Texture group: 1 valid split RT->SRV begin (Skip), 1 valid scoped UAV texture,
+        //    and 1 unrecognized texture bit (Fallback).
+        let split_tex = TextureBarrierDesc {
+            sync_before: SYNC_RENDER_TARGET,
+            sync_after: SYNC_SPLIT,
+            access_before: ACCESS_RENDER_TARGET,
+            access_after: ACCESS_NO_ACCESS,
+            layout_before: 4,
+            layout_after: 5,
+            resource: 0x3000 as This,
+            subresources: [0; 6],
+            flags: 0,
+        };
+        assert_eq!(decode_texture_barrier(&split_tex), TextureBarrierPlan::Skip);
+        let split_end_tex = TextureBarrierDesc {
+            sync_before: SYNC_SPLIT,
+            sync_after: SYNC_PIXEL_SHADING,
+            access_before: ACCESS_NO_ACCESS,
+            access_after: ACCESS_SHADER_RESOURCE,
+            layout_before: 4,
+            layout_after: 5,
+            resource: 0x3000 as This,
+            subresources: [0; 6],
+            flags: 0,
+        };
+        assert_eq!(decode_texture_barrier(&split_end_tex), TextureBarrierPlan::Skip);
+
+        let uav_tex = TextureBarrierDesc {
+            sync_before: SYNC_COMPUTE_SHADING,
+            sync_after: SYNC_COMPUTE_SHADING,
+            access_before: ACCESS_UNORDERED_ACCESS,
+            access_after: ACCESS_UNORDERED_ACCESS,
+            layout_before: 3,
+            layout_after: 3,
+            resource: 0x4000 as This,
+            subresources: [0; 6],
+            flags: 0,
+        };
+        let tex_items = [split_tex, split_end_tex, uav_tex];
+
+        // 3. Global group: exact RT->PS global barrier preserved alongside the buffer fallback.
+        let rt_global = GlobalBarrierDesc {
+            sync_before: SYNC_RENDER_TARGET,
+            sync_after: SYNC_PIXEL_SHADING,
+            access_before: ACCESS_RENDER_TARGET,
+            access_after: ACCESS_SHADER_RESOURCE,
+        };
+        let global_items = [rt_global];
+
+        let groups = [
+            BarrierGroup {
+                kind: BARRIER_GROUP_BUFFER,
+                count: buf_items.len() as u32,
+                barriers: buf_items.as_ptr().cast(),
+            },
+            BarrierGroup {
+                kind: BARRIER_GROUP_TEXTURE,
+                count: tex_items.len() as u32,
+                barriers: tex_items.as_ptr().cast(),
+            },
+            BarrierGroup {
+                kind: BARRIER_GROUP_GLOBAL,
+                count: global_items.len() as u32,
+                barriers: global_items.as_ptr().cast(),
+            },
+        ];
+
+        let plan = plan_parsed_barrier_groups(
+            &groups,
+            |b| (b.resource == 0x1000 as This).then_some(1u32),
+            |t| {
+                if t.resource == 0x4000 as This {
+                    ResolvedTexUav::Uav(42u32)
+                } else {
+                    ResolvedTexUav::Fallback
+                }
+            },
+        );
+
+        // One undecoded buffer item must NOT discard the narrow sibling buffer, texture UAV,
+        // or exact RT global barrier!
+        assert_eq!(
+            plan.buf_barriers,
+            vec![(
+                1u32,
+                GlobalBarrierDesc {
+                    sync_before: SYNC_COMPUTE_SHADING,
+                    sync_after: SYNC_COMPUTE_SHADING,
+                    access_before: ACCESS_UNORDERED_ACCESS,
+                    access_after: ACCESS_SHADER_RESOURCE,
+                }
+            )]
+        );
+        assert_eq!(plan.tex_uavs, vec![42u32]);
+        assert_eq!(plan.global_barriers, vec![rt_global]);
+        assert_eq!(plan.fallback, Some((CONSERVATIVE_GLOBAL, false)));
     }
 
     #[test]

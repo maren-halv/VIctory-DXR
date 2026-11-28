@@ -41,13 +41,15 @@ thread_local! {
 
 const POOL_ALIGN: u64 = 64 << 10;
 const POOL_MIN_MAX_CAP: u64 = 256 << 10;
-const POOL_MAX_BUFFERS: usize = 32;
-const POOL_MAX_BYTES: u64 = 64 << 20;
+const POOL_MAX_BUFFERS: usize = 16;
+const POOL_MAX_BYTES: u64 = 16 << 20;
+const POOL_PRESSURED_BYTES: u64 = 4 << 20;
 
 const FOOTPRINT_CACHE_MAX: usize = 64;
 
-const DIFF_CACHE_MAX_ENTRIES: usize = 32;
-const DIFF_CACHE_MAX_BYTES: usize = 64 << 20;
+const DIFF_CACHE_MAX_ENTRIES: usize = 24;
+const DIFF_CACHE_MAX_BYTES: usize = 16 << 20;
+const DIFF_CACHE_PRESSURED_BYTES: usize = 4 << 20;
 
 const DIRTY_PAGE: usize = 4096;
 const SCRATCH_SHRINK_THRESHOLD: usize = 16 << 20;
@@ -229,8 +231,15 @@ fn acquire_buffer(
 }
 
 fn release_buffer(device_key: usize, capacity: u64, resource: ID3D12Resource) {
-    if capacity > POOL_MAX_BYTES {
-        drop(resource);
+    let max_bytes = if crate::residency::critical_commit() {
+        0
+    } else if crate::residency::pressured() {
+        POOL_PRESSURED_BYTES
+    } else {
+        POOL_MAX_BYTES
+    };
+    if capacity > max_bytes {
+        crate::host::retire_com_async(PooledBuffer { device_key, capacity, resource });
         return;
     }
     let evicted = {
@@ -238,14 +247,55 @@ fn release_buffer(device_key: usize, capacity: u64, resource: ID3D12Resource) {
         pool.entries.push(PooledBuffer { device_key, capacity, resource });
         pool.total_bytes = pool.total_bytes.saturating_add(capacity);
         let mut evicted = Vec::new();
-        while pool.entries.len() > POOL_MAX_BUFFERS || pool.total_bytes > POOL_MAX_BYTES {
+        while pool.entries.len() > POOL_MAX_BUFFERS || pool.total_bytes > max_bytes {
             let old = pool.entries.remove(0);
             pool.total_bytes = pool.total_bytes.saturating_sub(old.capacity);
             evicted.push(old);
         }
         evicted
     };
-    drop(evicted);
+    if !evicted.is_empty() {
+        crate::host::retire_com_async(evicted);
+    }
+}
+
+/// Proactively trims pooled readback buffers and diff snapshots under RAM pressure.
+pub(crate) fn trim_pool(pressured: bool, critical: bool) {
+    if !pressured && !critical {
+        return;
+    }
+    let (pool_cap, diff_cap) = if critical {
+        (0u64, 0usize)
+    } else {
+        (POOL_PRESSURED_BYTES, DIFF_CACHE_PRESSURED_BYTES)
+    };
+    let evicted_bufs = {
+        let mut pool = BUFFER_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        let mut evicted = Vec::new();
+        while pool.total_bytes > pool_cap {
+            let Some(old) = pool.entries.first() else { break };
+            let _ = old;
+            let old = pool.entries.remove(0);
+            pool.total_bytes = pool.total_bytes.saturating_sub(old.capacity);
+            evicted.push(old);
+        }
+        evicted
+    };
+    if !evicted_bufs.is_empty() {
+        crate::host::retire_com_async(evicted_bufs);
+    }
+    let evicted_diffs = {
+        let mut cache = DIFF_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut evicted = Vec::new();
+        while cache.total_bytes > diff_cap {
+            let Some(_) = cache.entries.first() else { break };
+            let old = cache.entries.remove(0);
+            cache.total_bytes = cache.total_bytes.saturating_sub(old.linear.len());
+            evicted.push(old);
+        }
+        evicted
+    };
+    drop(evicted_diffs);
 }
 
 // --- Copyable footprint cache ---

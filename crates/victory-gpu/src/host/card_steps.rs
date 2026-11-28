@@ -548,25 +548,155 @@ enum To {
 /// `between`, bytes). `between` is left readable as constants (and must be
 /// so, unless this is the `first` level), the others in the common state,
 /// as the submission's lists expect them.
+///
+/// When Enhanced Barriers (`list7`) are available, emits resource-scoped
+/// `D3D12_BUFFER_BARRIER`s instead of an unconditional global `UAV(NULL)`
+/// and legacy state transitions.
 fn record(
     first: bool,
     list: &ID3D12GraphicsCommandList,
+    list7: Option<&ID3D12GraphicsCommandList7>,
     between: &ID3D12Resource,
     reads: &[(&ID3D12Resource, u64, u64, u64)],
     writes: &[(&ID3D12Resource, u64, u64, u64)],
 ) {
-    let common = D3D12_RESOURCE_STATE_COMMON;
-    let (source, dest) = (D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
     let mut sources: Vec<&ID3D12Resource> = Vec::new();
     let mut dests: Vec<&ID3D12Resource> = Vec::new();
-    for (all, list) in [(reads, &mut sources), (writes, &mut dests)] {
+    for (all, out) in [(reads, &mut sources), (writes, &mut dests)] {
         for &(buffer, ..) in all {
-            if !list.iter().any(|b| b.as_raw() == buffer.as_raw()) {
-                list.push(buffer);
+            if !out.iter().any(|b| b.as_raw() == buffer.as_raw()) {
+                out.push(buffer);
             }
         }
     }
     let both = |b: &ID3D12Resource| dests.iter().any(|d| d.as_raw() == b.as_raw());
+
+    if let Some(l7) = list7 {
+        let buf_barrier = |res: &ID3D12Resource,
+                           sync_before: D3D12_BARRIER_SYNC,
+                           sync_after: D3D12_BARRIER_SYNC,
+                           access_before: D3D12_BARRIER_ACCESS,
+                           access_after: D3D12_BARRIER_ACCESS|
+         -> D3D12_BUFFER_BARRIER {
+            D3D12_BUFFER_BARRIER {
+                SyncBefore: sync_before,
+                SyncAfter: sync_after,
+                AccessBefore: access_before,
+                AccessAfter: access_after,
+                // SAFETY: borrowed COM pointer valid for the `Barrier` call; caller keeps resource alive.
+                pResource: unsafe { std::mem::transmute_copy(res) },
+                Offset: 0,
+                Size: u64::MAX,
+            }
+        };
+        let emit_bufs = |barriers: &[D3D12_BUFFER_BARRIER]| {
+            if barriers.is_empty() {
+                return;
+            }
+            // SAFETY: open list7; all buffer pointers stay live for this call.
+            unsafe {
+                l7.Barrier(&[D3D12_BARRIER_GROUP {
+                    Type: D3D12_BARRIER_TYPE_BUFFER,
+                    NumBarriers: barriers.len() as u32,
+                    Anonymous: D3D12_BARRIER_GROUP_0 {
+                        pBufferBarriers: barriers.as_ptr(),
+                    },
+                }]);
+            }
+        };
+
+        let mut pre: Vec<D3D12_BUFFER_BARRIER> = Vec::new();
+        if first {
+            // Order earlier flights' shader/copy writes (and shader reads for buffers
+            // we also write) before this level's copies, scoped strictly to touched buffers.
+            for &b in &sources {
+                let access_before = if both(b) {
+                    D3D12_BARRIER_ACCESS_COMMON
+                } else {
+                    D3D12_BARRIER_ACCESS_UNORDERED_ACCESS | D3D12_BARRIER_ACCESS_COPY_DEST
+                };
+                pre.push(buf_barrier(
+                    b,
+                    D3D12_BARRIER_SYNC_ALL_SHADING | D3D12_BARRIER_SYNC_COPY,
+                    D3D12_BARRIER_SYNC_COPY,
+                    access_before,
+                    D3D12_BARRIER_ACCESS_COPY_SOURCE,
+                ));
+            }
+            for &b in &dests {
+                if !sources.iter().any(|s| s.as_raw() == b.as_raw()) {
+                    pre.push(buf_barrier(
+                        b,
+                        D3D12_BARRIER_SYNC_ALL_SHADING | D3D12_BARRIER_SYNC_COPY,
+                        D3D12_BARRIER_SYNC_COPY,
+                        D3D12_BARRIER_ACCESS_COMMON,
+                        D3D12_BARRIER_ACCESS_COPY_DEST,
+                    ));
+                }
+            }
+        } else {
+            pre.push(buf_barrier(
+                between,
+                D3D12_BARRIER_SYNC_COPY,
+                D3D12_BARRIER_SYNC_COPY,
+                D3D12_BARRIER_ACCESS_COPY_SOURCE | D3D12_BARRIER_ACCESS_COPY_DEST,
+                D3D12_BARRIER_ACCESS_COPY_DEST,
+            ));
+        }
+
+        let mut mid: Vec<D3D12_BUFFER_BARRIER> = Vec::with_capacity(1 + sources.len());
+        mid.push(buf_barrier(
+            between,
+            D3D12_BARRIER_SYNC_COPY,
+            D3D12_BARRIER_SYNC_COPY | D3D12_BARRIER_SYNC_ALL_SHADING,
+            D3D12_BARRIER_ACCESS_COPY_DEST,
+            D3D12_BARRIER_ACCESS_COPY_SOURCE | D3D12_BARRIER_ACCESS_CONSTANT_BUFFER,
+        ));
+        for &b in &sources {
+            if both(b) {
+                mid.push(buf_barrier(
+                    b,
+                    D3D12_BARRIER_SYNC_COPY,
+                    D3D12_BARRIER_SYNC_COPY,
+                    D3D12_BARRIER_ACCESS_COPY_SOURCE,
+                    D3D12_BARRIER_ACCESS_COPY_DEST,
+                ));
+            }
+        }
+
+        let post: Vec<D3D12_BUFFER_BARRIER> = dests
+            .iter()
+            .map(|&b| {
+                buf_barrier(
+                    b,
+                    D3D12_BARRIER_SYNC_COPY,
+                    D3D12_BARRIER_SYNC_ALL_SHADING
+                        | D3D12_BARRIER_SYNC_COPY
+                        | D3D12_BARRIER_SYNC_EXECUTE_INDIRECT
+                        | D3D12_BARRIER_SYNC_INDEX_INPUT,
+                    D3D12_BARRIER_ACCESS_COPY_DEST,
+                    D3D12_BARRIER_ACCESS_COMMON,
+                )
+            })
+            .collect();
+
+        // SAFETY: open list; live buffers; all buffers remain in COMMON under Enhanced Barriers.
+        unsafe {
+            emit_bufs(&pre);
+            for &(buffer, offset, at, len) in reads {
+                list.CopyBufferRegion(between, at, buffer, offset, len);
+            }
+            emit_bufs(&mid);
+            for &(buffer, offset, at, len) in writes {
+                list.CopyBufferRegion(buffer, offset, between, at, len);
+            }
+            emit_bufs(&post);
+        }
+        return;
+    }
+
+    let common = D3D12_RESOURCE_STATE_COMMON;
+    let (source, dest) = (D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
     let constants = source | D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
     let mut barriers = vec![transition(between, dest, constants)];
     barriers.extend(sources.iter().map(|b| transition(b, source, if both(b) { dest } else { common })));
@@ -844,7 +974,7 @@ impl Host {
                     To::Slot(..) => {}
                 }
             }
-            record(level == 0, &own.list.list, &own.between, &reads, &writes);
+            record(level == 0, &own.list.list, own.list.enhanced_barriers(), &own.between, &reads, &writes);
         }
         own.list.close();
         // SAFETY: a live buffer.
@@ -1202,12 +1332,20 @@ mod tests {
         record(
             true,
             &own.list.list,
+            own.list.enhanced_barriers(),
             &own.between,
             &[(&a, 33, 0, 100), (&a, 2000, 256, 100), (&a, 5001, 512, 7), (&a, 9, 1024, 4)],
             &[(&a, 2000, 0, 100), (&a, 33, 256, 100), (&b, 77, 512, 7)],
         );
         // A level behind it, of what it wrote.
-        record(false, &own.list.list, &own.between, &[(&b, 77, 2048, 7)], &[(&b, 1077, 2048, 7)]);
+        record(
+            false,
+            &own.list.list,
+            own.list.enhanced_barriers(),
+            &own.between,
+            &[(&b, 77, 2048, 7)],
+            &[(&b, 1077, 2048, 7)],
+        );
         own.list.close();
         // A list behind it that uses the buffers in other ways.
         let next = host.new_list().unwrap();

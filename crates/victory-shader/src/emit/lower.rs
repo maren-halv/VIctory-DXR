@@ -473,14 +473,14 @@ struct Lower<'a> {
     dead_lds_writes: HashSet<Site>,
     /// Whether any lifted `RayLoop` is a `RayLoopKind::AnyHit`.
     has_anyhit_loop: bool,
-    /// Pre-allocated `RayQuery` handles indexed by lifted `rq_group`.
+    /// Pre-allocated `RayQuery` handles indexed by lifted `rq_group` (1 handle per group, `ARCH-14`).
     ray_queries: Vec<V>,
-    /// Optional Pass 1 opaque-only (`CULL_NON_OPAQUE`) `RayQuery` handle per `rq_group`.
-    ray_queries_opaque: Vec<Option<V>>,
     /// IR blocks belonging to a lifted `AnyHit` body, mapped to their `ray_loops` index.
     ray_anyhit_blocks: HashMap<usize, usize>,
-    /// Speculative Pass 1 vs Pass 2 `i1` PHI per `ray_loops` index for `FORCE_NON_OPAQUE` `AnyHit`.
-    ray_anyhit_spec_phi: HashMap<usize, V>,
+    /// `true` while lowering Pass 1's out-of-loop `Committed*` `AnyHit` body for an un-fused `fno_spec` loop.
+    ray_anyhit_pass1: bool,
+    /// Pass 1 `(p1_tail_blk, p1_next_vals)` saved per `ray_loops` index for un-fused `fno_spec` loops.
+    ray_fno_spec_p1: HashMap<usize, (usize, Vec<V>)>,
     /// Cached candidate metadata loads per `(loop_idx, ir_block, kind, num_dwords)`.
     cand_meta_cache: HashMap<(usize, usize, super::rayquery_lift::RayMetaKind, usize), Vec<V>>,
     /// Entry IR blocks of lifted `RayLoop`s per `rq_group`, for dominance/invalidation checks.
@@ -490,16 +490,30 @@ struct Lower<'a> {
     /// Per-`rq_group` `alloca i32` tracking the active `tlas_meta_base` when a group
     /// merges multiple distinct TLASes (e.g. Near + Far) feeding `TriFetchBasis*`.
     ray_group_tlas_slot: Vec<Option<V>>,
+    /// Per-`rq_group` `alloca i32` slots `(q2_hit_slot, q1_field_slots)` used when two-pass loops
+    /// share a non-dominated post-loop `committed_meta_loads` block (`TwoPassQ1::Live` removed).
+    ray_group_early_slots: Vec<Option<(V, HashMap<super::rayquery_lift::EarlyQ1Field, V>)>>,
     /// `tlas_load` site indexed by `ray_loops` index.
     ray_loop_tlas_load: Vec<Site>,
     /// Unique owning `ray_loops` index for post-loop `committed_meta_loads` sites.
     ray_meta_owner: HashMap<Site, usize>,
-    /// Post-loop two-pass predicates and optional early-extracted Pass 1 fields per `ray_loops` index.
+    /// Post-loop two-pass predicates and early-extracted Pass 1 fields per `ray_loops` index.
     two_pass_post: HashMap<usize, (usize, super::rayquery_lift::TwoPassPost)>,
-    /// Cached `(CommittedStatus(rq) == 1, CommittedStatus(q1) == 1)` per `(rq_group, ir_block)`.
-    committed_status_cache: HashMap<(usize, usize), (V, V)>,
     /// Cached post-loop `committed_meta_loads` per `(rq_group, ir_block, kind, num_dwords)`.
     committed_meta_cache: HashMap<(usize, usize, super::rayquery_lift::RayMetaKind, usize), Vec<V>>,
+    /// Shared decoded normal `[nx_f32, ny_f32, nz_f32]` cache per `(rq_group, ir_block)` so paired
+    /// `TriFetchBasisT`/`TriFetchBasisB` and `DirectNormalSub` share 1 `t251` lookup (`ARCH-14`).
+    committed_normal_cache: HashMap<(usize, usize), [V; 3]>,
+    /// Direct-normal substitution fetch trigger site -> `(rq_group, negate, out_vals)`.
+    direct_normal_fetch: HashMap<Site, (usize, bool)>,
+    /// `TriFetch*` load sites suppressed by matched [`DirectNormalSub`]s.
+    direct_normal_dead: HashSet<Site>,
+    /// Direct-normal output instruction site -> `(fetch_site, out_val, component)`.
+    direct_normal_out: HashMap<Site, (Site, Value, usize)>,
+    /// Computed `±N` `i32` bit patterns keyed by `DirectNormalSub::fetch_site`.
+    direct_normal_vals: HashMap<Site, [V; 3]>,
+    /// Cached HostHeap twin-slot Mirror TLAS handles (`ARCH-13`) keyed by `(target_blk, load)`.
+    mirror_tlas_handles: HashMap<(usize, Site), V>,
     /// Lazy candidate triangle queries (`RayT`, `Bary`, `FrontFace`) materialized on demand,
     /// storing `(anyhit_bridge_blk, rq, ci)`.
     cand_inputs: HashMap<Value, (usize, V, super::rayquery_lift::CandidateInput)>,
@@ -1503,6 +1517,21 @@ fn own_bits_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_OWN_BITS").is_none_or(|v| v != "0"))
 }
 
+/// Whether `FrontBackTrack` uses 2 pure HW `FORCE_OPAQUE` passes against the HostHeap
+/// twin-slot cull-enabled Mirror TLAS (`VICTORY_NATIVE_RT_MIRROR_TLAS=0` disables and falls
+/// back to 3-pass `fbt_mask_split`; on by default when `raw_views() != 0`, `ARCH-13`).
+/// Part of the translation: [`host_settings`] keys on it.
+pub(super) fn native_rt_mirror_tlas_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_NATIVE_RT_MIRROR_TLAS.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_NATIVE_RT_MIRROR_TLAS").is_none_or(|v| v != "0")
+    })
+}
+
 /// What the translator was told of the host and active optimization switches,
 /// for a cache's key: the widest wave, the view heap's limit, where the raw
 /// twins of its views start, what it writes for the console's own hardware,
@@ -1519,7 +1548,8 @@ pub fn host_settings() -> [u32; 5] {
         | (u32::from(super::native_rt_twopass_state()) << 8)
         | (u32::from(super::native_rt_fno_mode() & 0x3) << 9)
         | (u32::from(super::native_rt_no_hoist_anyhit()) << 11)
-        | (u32::from(super::native_rt_fbt_split_mask()) << 12);
+        | (u32::from(super::native_rt_fbt_split_mask()) << 12)
+        | (u32::from(native_rt_mirror_tlas_on()) << 20);
     [
         host_max_wave(),
         super::shader::view_heap_limit(),
@@ -1571,6 +1601,8 @@ thread_local! {
     pub(super) static TEST_NATIVE_RT_NO_HOIST_ANYHIT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
     /// Test hook for [`super::native_rt_fbt_split_mask`], for its thread only.
     pub(super) static TEST_NATIVE_RT_FBT_SPLIT_MASK: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
+    /// Test hook for [`native_rt_mirror_tlas_on`], for its thread only.
+    pub(super) static TEST_NATIVE_RT_MIRROR_TLAS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 #[cfg(test)]
@@ -2388,18 +2420,24 @@ impl<'a> Lower<'a> {
             dead_lds_writes: dead_lds_writes.unwrap_or_default(),
             has_anyhit_loop,
             ray_queries: Vec::new(),
-            ray_queries_opaque: Vec::new(),
             ray_anyhit_blocks: HashMap::new(),
-            ray_anyhit_spec_phi: HashMap::new(),
+            ray_anyhit_pass1: false,
+            ray_fno_spec_p1: HashMap::new(),
             cand_meta_cache: HashMap::new(),
             ray_group_entries: Vec::new(),
             ray_group_tlas_load: Vec::new(),
             ray_group_tlas_slot: Vec::new(),
+            ray_group_early_slots: Vec::new(),
             ray_loop_tlas_load: Vec::new(),
             ray_meta_owner: HashMap::new(),
             two_pass_post: HashMap::new(),
-            committed_status_cache: HashMap::new(),
             committed_meta_cache: HashMap::new(),
+            committed_normal_cache: HashMap::new(),
+            direct_normal_fetch: HashMap::new(),
+            direct_normal_dead: HashSet::new(),
+            direct_normal_out: HashMap::new(),
+            direct_normal_vals: HashMap::new(),
+            mirror_tlas_handles: HashMap::new(),
             cand_inputs: HashMap::new(),
             cand_cache: HashMap::new(),
             cand_ir_cache: HashMap::new(),
@@ -3034,12 +3072,18 @@ impl<'a> Lower<'a> {
             .collect();
         self.ray_meta_loads.clear();
         self.ray_anyhit_blocks.clear();
-        self.ray_anyhit_spec_phi.clear();
+        self.ray_anyhit_pass1 = false;
+        self.ray_fno_spec_p1.clear();
         self.cand_meta_cache.clear();
         self.ray_meta_owner.clear();
         self.two_pass_post.clear();
-        self.committed_status_cache.clear();
         self.committed_meta_cache.clear();
+        self.committed_normal_cache.clear();
+        self.direct_normal_fetch.clear();
+        self.direct_normal_dead.clear();
+        self.direct_normal_out.clear();
+        self.direct_normal_vals.clear();
+        self.mirror_tlas_handles.clear();
         self.cand_ir_cache.clear();
         let mut meta_site_owners: HashMap<Site, Vec<usize>> = HashMap::new();
         let mut ray_skipped_insts: HashSet<Site> = self.dead_lds_writes.clone();
@@ -3055,6 +3099,19 @@ impl<'a> Lower<'a> {
                         kind,
                     },
                 );
+            }
+            for sub in &rl.direct_normals {
+                if !self.direct_normal_fetch.contains_key(&sub.fetch_site) {
+                    self.direct_normal_fetch
+                        .insert(sub.fetch_site, (rl.rq_group, sub.negate));
+                    for &ds in &sub.dead_fetch_sites {
+                        self.direct_normal_dead.insert(ds);
+                    }
+                    for k in 0..3 {
+                        self.direct_normal_out
+                            .insert(sub.out_sites[k], (sub.fetch_site, sub.out_vals[k], k));
+                    }
+                }
             }
             if let super::rayquery_lift::RayLoopKind::AnyHit(ah) = &rl.kind {
                 for &ab in &ah.body_blocks {
@@ -3149,13 +3206,12 @@ impl<'a> Lower<'a> {
         } else if self.x.native.stage == HwStage::Cs && crate::spill::is_spilled(self.x.native) {
             self.dispatch_threads_prologue(&order);
         }
-        // Pre-allocate one `RayQuery` handle per `rq_group` in the function entry block so every
-        // handle strictly dominates both in-loop any-hit blocks and shared post-loop metadata queries.
-        // Eligible closest-hit `AnyHit` groups extract Pass 1 fields before Pass 2 starts whenever
-        // all post-loop metadata is dominated and small (<= `EARLY_Q1_MAX_DWORDS`), reusing the
-        // single `RayQuery` handle; otherwise they allocate a Pass 1 `CULL_NON_OPAQUE` handle.
+        // Pre-allocate EXACTLY ONE `RayQuery` handle per `rq_group` in the function entry block
+        // (`ARCH-14`: `TwoPassQ1::Live` removed; all two-pass / mask-split loops extract Pass 1
+        // fields early and reuse the single handle, using per-group `alloca i32` slots only when
+        // multiple loops share a non-dominated post-loop `committed_meta_loads` block).
         self.ray_queries.clear();
-        self.ray_queries_opaque.clear();
+        self.ray_group_early_slots.clear();
         let entry_dxil_blk = self.block[order[0]].expect("entry block");
         let num_groups = ray_loops
             .iter()
@@ -3205,78 +3261,75 @@ impl<'a> Lower<'a> {
             })
             .collect();
         let mut group_flags: Vec<Option<u32>> = vec![None; num_groups];
-        let mut group_two_pass: Vec<bool> = vec![super::native_rt_two_pass(); num_groups];
+        let two_pass_enabled = super::native_rt_two_pass();
         let fbt_split_mask = super::native_rt_fbt_split_mask();
-        let mut group_fbt_split: Vec<bool> = vec![fbt_split_mask != 0; num_groups];
-        for rl in &ray_loops {
+        let mut loop_two_pass: Vec<bool> = vec![false; ray_loops.len()];
+        let mut loop_fbt_mirror: Vec<bool> = vec![false; ray_loops.len()];
+        let mut loop_fbt_split: Vec<bool> = vec![false; ray_loops.len()];
+        for (idx, rl) in ray_loops.iter().enumerate() {
             let f = super::rayquery_lift::effective_const_ray_flags(rl).unwrap_or(0);
             group_flags[rl.rq_group] = Some(match group_flags[rl.rq_group] {
                 Some(prev) => prev & f,
                 None => f,
             });
-            group_two_pass[rl.rq_group] &= super::rayquery_lift::is_two_pass_eligible(rl);
-            group_fbt_split[rl.rq_group] &=
-                super::rayquery_lift::is_front_back_mask_split_eligible(rl);
+            loop_two_pass[idx] =
+                two_pass_enabled && super::rayquery_lift::is_two_pass_eligible(rl);
+            loop_fbt_mirror[idx] = super::rayquery_lift::is_front_back_mirror_tlas_eligible(rl);
+            loop_fbt_split[idx] =
+                !loop_fbt_mirror[idx] && super::rayquery_lift::is_front_back_mask_split_eligible(rl);
         }
         let mut loop_early_fields: Vec<Option<Vec<super::rayquery_lift::EarlyQ1Field>>> =
             vec![None; ray_loops.len()];
-        let mut group_all_early: Vec<bool> = (0..num_groups)
-            .map(|g| group_two_pass[g] || group_fbt_split[g])
-            .collect();
+        let mut group_shared_early_fields: Vec<Vec<super::rayquery_lift::EarlyQ1Field>> =
+            vec![Vec::new(); num_groups];
+        let mut group_needs_early_slots: Vec<bool> = vec![false; num_groups];
         for (idx, rl) in ray_loops.iter().enumerate() {
-            if !group_two_pass[rl.rq_group] && !group_fbt_split[rl.rq_group] {
+            if !loop_two_pass[idx] && !loop_fbt_split[idx] {
                 continue;
             }
+            let meta_dwords: Vec<_> = rl
+                .committed_meta_loads
+                .iter()
+                .map(|&(site, kind)| (kind, p.blocks[site.0].insts[site.1].writes.len()))
+                .collect();
+            let fields = super::rayquery_lift::collect_early_q1_fields(rl, &meta_dwords);
             let meta_dominated = self.dominates(rl.entry_block, rl.exit_block)
                 && rl.committed_meta_loads.iter().all(|&(site, _)| {
                     self.ray_meta_owner.get(&site) == Some(&idx)
                         && self.dominates(rl.exit_block, site.0)
                         && self.no_group_trace_between(rl.rq_group, rl.exit_block, site.0)
                 });
-            if meta_dominated {
-                let meta_dwords: Vec<_> = rl
-                    .committed_meta_loads
-                    .iter()
-                    .map(|&(site, kind)| (kind, p.blocks[site.0].insts[site.1].writes.len()))
-                    .collect();
-                let fields = super::rayquery_lift::collect_early_q1_fields(rl, &meta_dwords);
-                if fields.len() <= super::rayquery_lift::EARLY_Q1_MAX_DWORDS {
-                    loop_early_fields[idx] = Some(fields);
-                    continue;
+            if !meta_dominated && !rl.committed_meta_loads.is_empty() {
+                group_needs_early_slots[rl.rq_group] = true;
+                for &f in &fields {
+                    if !group_shared_early_fields[rl.rq_group].contains(&f) {
+                        group_shared_early_fields[rl.rq_group].push(f);
+                    }
                 }
             }
-            group_all_early[rl.rq_group] = false;
+            loop_early_fields[idx] = Some(fields);
+        }
+        for g in 0..num_groups {
+            if group_needs_early_slots[g] {
+                let q2_slot = self.s.m.alloca(entry_dxil_blk, i32t);
+                self.s.m.store(entry_dxil_blk, q2_slot, zero);
+                let mut fslots = HashMap::with_capacity(group_shared_early_fields[g].len());
+                for &f in &group_shared_early_fields[g] {
+                    let ptr = self.s.m.alloca(entry_dxil_blk, i32t);
+                    self.s.m.store(entry_dxil_blk, ptr, zero);
+                    fslots.insert(f, ptr);
+                }
+                self.ray_group_early_slots.push(Some((q2_slot, fslots)));
+            } else {
+                self.ray_group_early_slots.push(None);
+            }
         }
         let mut group_q2_flags: Vec<u32> = Vec::with_capacity(num_groups);
-        let mut group_q1_flags: Vec<u32> = Vec::with_capacity(num_groups);
         for g in 0..num_groups {
             let base_fl = group_flags[g].unwrap_or(0);
-            if group_flags[g].is_some() && group_two_pass[g] && !group_all_early[g] {
-                let q1_fl = base_fl | super::rayquery_lift::ray_flag::CULL_NON_OPAQUE;
-                let q2_fl = base_fl | super::rayquery_lift::ray_flag::CULL_OPAQUE;
-                self.ray_queries
-                    .push(self.s.allocate_ray_query(entry_dxil_blk, q2_fl));
-                self.ray_queries_opaque
-                    .push(Some(self.s.allocate_ray_query(entry_dxil_blk, q1_fl)));
-                group_q2_flags.push(q2_fl);
-                group_q1_flags.push(q1_fl);
-            } else if group_flags[g].is_some() && group_fbt_split[g] && !group_all_early[g] {
-                let q1_fl = (base_fl & !super::rayquery_lift::ray_flag::FORCE_NON_OPAQUE)
-                    | super::rayquery_lift::ray_flag::FORCE_OPAQUE;
-                let q2_fl = base_fl | super::rayquery_lift::ray_flag::FORCE_NON_OPAQUE;
-                self.ray_queries
-                    .push(self.s.allocate_ray_query(entry_dxil_blk, q2_fl));
-                self.ray_queries_opaque
-                    .push(Some(self.s.allocate_ray_query(entry_dxil_blk, q1_fl)));
-                group_q2_flags.push(q2_fl);
-                group_q1_flags.push(q1_fl);
-            } else {
-                self.ray_queries
-                    .push(self.s.allocate_ray_query(entry_dxil_blk, base_fl));
-                self.ray_queries_opaque.push(None);
-                group_q2_flags.push(base_fl);
-                group_q1_flags.push(0);
-            }
+            self.ray_queries
+                .push(self.s.allocate_ray_query(entry_dxil_blk, base_fl));
+            group_q2_flags.push(base_fl);
         }
         let mut pending_anyhits: HashMap<usize, super::rayquery_lift::PendingAnyHit> =
             HashMap::new();
@@ -3303,9 +3356,15 @@ impl<'a> Lower<'a> {
                     load: rl.tlas_load,
                     first: 0,
                 };
-                let tlas = self
-                    .handle(rl.tlas_load, &tlas_src, false, (16, 0))
-                    .map_err(|w| unsupported(offset, w))?;
+                // ARCH-13: Mirror-TLAS `FrontBackTrack` indexes the HostHeap twin slot
+                // `UMin(tlas_index, raw_views - 1) | raw_views` (`createHandleFromHeap` + `RTAS`).
+                let tlas = if loop_fbt_mirror[idx] {
+                    self.mirror_tlas_handle(rl.tlas_load)
+                        .map_err(|w| unsupported(offset, w))?
+                } else {
+                    self.handle(rl.tlas_load, &tlas_src, false, (16, 0))
+                        .map_err(|w| unsupported(offset, w))?
+                };
                 let active_ray = if let Some(mask_val) = rl.active_ray_mask {
                     match self.x.st.masks.get(&mask_val).copied() {
                         Some(bm) if bm != Bool::TRUE => {
@@ -3397,7 +3456,6 @@ impl<'a> Lower<'a> {
                 }
                 let inputs = super::rayquery_lift::ResolvedRayInputs {
                     rq: self.ray_queries[rl.rq_group],
-                    rq_opaque: self.ray_queries_opaque[rl.rq_group],
                     two_pass_early_fields: loop_early_fields[idx].clone(),
                     tlas,
                     active_ray,
@@ -3408,12 +3466,12 @@ impl<'a> Lower<'a> {
                     instance_mask,
                     ray_flags,
                     group_const_flags: group_q2_flags[rl.rq_group],
-                    group_opaque_const_flags: group_q1_flags[rl.rq_group],
-                    fbt_split_mask: if group_fbt_split[rl.rq_group] {
+                    fbt_split_mask: if loop_fbt_split[idx] {
                         fbt_split_mask
                     } else {
                         0
                     },
+                    fbt_mirror_tlas: loop_fbt_mirror[idx],
                     init_min_front_t,
                     anyhit_inits,
                     anyhit_entry_dxil,
@@ -3431,6 +3489,42 @@ impl<'a> Lower<'a> {
                     self.vals.insert(val, Val::I32(dxil_v));
                 }
                 self.tail[rl.exit_pred] = Some(emitted.tail);
+                if let Some((q2_slot, ref fslots)) = self.ray_group_early_slots[rl.rq_group] {
+                    let store_blk = emitted.tail;
+                    let one = self.s.m.i32(1);
+                    let zero = self.s.m.i32(0);
+                    if let Some(ref tp) = emitted.two_pass_post {
+                        let q2_i = self.s.m.select(store_blk, tp.q2_hit, one, zero);
+                        let q2_store = if let Some(act) = active_ray {
+                            let prev = self.s.m.load(store_blk, q2_slot);
+                            self.s.m.select(store_blk, act, q2_i, prev)
+                        } else {
+                            q2_i
+                        };
+                        self.s.m.store(store_blk, q2_slot, q2_store);
+                        for (&field, &ptr) in fslots {
+                            if let Some(&v) = tp.q1_fields.get(&field) {
+                                let v_store = if let Some(act) = active_ray {
+                                    let prev = self.s.m.load(store_blk, ptr);
+                                    self.s.m.select(store_blk, act, v, prev)
+                                } else {
+                                    v
+                                };
+                                self.s.m.store(store_blk, ptr, v_store);
+                            }
+                        }
+                    } else {
+                        // Non-two-pass loop sharing the same group: mark `q2_hit = 1` so shared
+                        // post-loop metadata queries read directly from `rq`.
+                        let q2_store = if let Some(act) = active_ray {
+                            let prev = self.s.m.load(store_blk, q2_slot);
+                            self.s.m.select(store_blk, act, one, prev)
+                        } else {
+                            one
+                        };
+                        self.s.m.store(store_blk, q2_slot, q2_store);
+                    }
+                }
                 if let Some(tp) = emitted.two_pass_post {
                     self.two_pass_post.insert(idx, (rl.exit_block, tp));
                 }
@@ -3438,31 +3532,35 @@ impl<'a> Lower<'a> {
                     && let Some(pending) = emitted.pending_anyhit
                 {
                     let rq = self.ray_queries[rl.rq_group];
+                    // ARCH-12: Lower Pass 1's out-of-loop `Committed*` AnyHit copy immediately
+                    // before Pass 2's clean `while (Proceed())` copy lowers in the main loop.
                     if let Some(spec) = &pending.spec {
-                        self.ray_anyhit_spec_phi.insert(idx, spec.spec_phi);
-                    } else {
-                        for &(val_id, ci) in &ah.inputs {
-                            if matches!(
+                        let (p1_tail_blk, p1_next_vals) =
+                            self.lower_anyhit_pass1(idx, ah, spec, &ray_skipped_insts)?;
+                        self.ray_fno_spec_p1.insert(idx, (p1_tail_blk, p1_next_vals));
+                    }
+                    // Pass 2 (and non-speculative AnyHit): lazy `Candidate*` inputs, zero `spec_phi`.
+                    for &(val_id, ci) in &ah.inputs {
+                        if matches!(
+                            ci,
+                            super::rayquery_lift::CandidateInput::RayT
+                                | super::rayquery_lift::CandidateInput::Bary(_)
+                                | super::rayquery_lift::CandidateInput::FrontFace
+                        ) {
+                            let hoist_blk = if matches!(
                                 ci,
                                 super::rayquery_lift::CandidateInput::RayT
-                                    | super::rayquery_lift::CandidateInput::Bary(_)
-                                    | super::rayquery_lift::CandidateInput::FrontFace
                             ) {
-                                let hoist_blk = if matches!(
-                                    ci,
-                                    super::rayquery_lift::CandidateInput::RayT
-                                ) {
-                                    self.anyhit_ray_t_hoist_block(
-                                        p,
-                                        ah,
-                                        val_id,
-                                        pending.anyhit_bridge_blk,
-                                    )
-                                } else {
-                                    pending.anyhit_bridge_blk
-                                };
-                                self.cand_inputs.insert(val_id, (hoist_blk, rq, ci));
-                            }
+                                self.anyhit_ray_t_hoist_block(
+                                    p,
+                                    ah,
+                                    val_id,
+                                    pending.anyhit_bridge_blk,
+                                )
+                            } else {
+                                pending.anyhit_bridge_blk
+                            };
+                            self.cand_inputs.insert(val_id, (hoist_blk, rq, ci));
                         }
                     }
                     for &(atom_v, const_b) in &ah.const_lane_atoms {
@@ -3566,40 +3664,30 @@ impl<'a> Lower<'a> {
                     next_vals.push(self.i32_of(sv.next).map_err(|w| unsupported(offset, w))?);
                 }
                 let tail_blk = self.cur;
-                if let Some(spec) = &pending.spec {
-                    self.s.m.terminate(
-                        tail_blk,
-                        Term::CondBr(
-                            spec.spec_phi,
-                            spec.spec_decide_blk,
-                            spec.non_spec_decide_blk,
-                        ),
-                    );
-                    self.s.m.terminate(
-                        spec.spec_decide_blk,
-                        Term::CondBr(accept, spec.after_blk, spec.p2_trace_blk),
-                    );
-                    self.s.m.terminate(
-                        spec.non_spec_decide_blk,
-                        Term::CondBr(accept, pending.do_commit_blk, pending.latch_blk),
-                    );
-                } else {
-                    self.s.m.terminate(
-                        tail_blk,
-                        Term::CondBr(accept, pending.do_commit_blk, pending.latch_blk),
-                    );
+                self.s.m.terminate(
+                    tail_blk,
+                    Term::CondBr(accept, pending.do_commit_blk, pending.latch_blk),
+                );
+                if let Some(spec) = &pending.spec
+                    && let Some((pt_phi, pt_latch, ct)) = spec.p2_t_track
+                {
+                    let mut pt_latch_inc = vec![(pt_phi, tail_blk), (ct, pending.do_commit_blk)];
+                    if let Some(cb) = pending.cand_check_blk {
+                        pt_latch_inc.push((pt_phi, cb));
+                    }
+                    self.s.m.set_phi(pt_latch, pt_latch_inc);
                 }
-                let reject_pred = pending
+                let p1_info = pending
                     .spec
                     .as_ref()
-                    .map_or(tail_blk, |spec| spec.non_spec_decide_blk);
+                    .and_then(|_| self.ray_fno_spec_p1.remove(&loop_idx));
                 for k in 0..ah.state_vars.len() {
                     let back_val = if let Some(cb) = pending.cand_check_blk {
                         self.s.m.set_phi(
                             pending.latch_phis[k],
                             vec![
                                 (pending.state_phis[k], cb),
-                                (next_vals[k], reject_pred),
+                                (next_vals[k], tail_blk),
                                 (next_vals[k], pending.do_commit_blk),
                             ],
                         );
@@ -3607,30 +3695,24 @@ impl<'a> Lower<'a> {
                     } else {
                         next_vals[k]
                     };
-                    if let Some(spec) = &pending.spec {
-                        let mut hdr_inc = vec![
-                            (pending.init_vals[k], spec.p1_check_blk),
-                            (pending.init_vals[k], spec.spec_decide_blk),
+                    // Guard 3 (State-Var Reset Rule): Pass 2's `state_phis[k]` ALWAYS starts from
+                    // `init_vals[k]` on `pending.start_blk` (`p2_trace_blk` when un-fused `fno_spec`).
+                    self.s.m.set_phi(
+                        pending.state_phis[k],
+                        vec![
+                            (pending.init_vals[k], pending.start_blk),
                             (back_val, pending.latch_blk),
-                        ];
-                        if let Some(bypass) = spec.dyn_bypass_blk {
-                            hdr_inc.push((pending.init_vals[k], bypass));
-                        }
-                        self.s.m.set_phi(pending.state_phis[k], hdr_inc);
+                        ],
+                    );
+                    if let Some(spec) = &pending.spec {
+                        let (p1_tail_blk, ref p1_next_vals) =
+                            *p1_info.as_ref().expect("pass 1 fno_spec info");
                         self.s.m.set_phi(
                             spec.final_state_phis[k],
                             vec![
                                 (pending.init_vals[k], spec.p1_check_blk),
-                                (next_vals[k], spec.spec_decide_blk),
-                                (pending.state_phis[k], spec.proceed_blk),
-                            ],
-                        );
-                    } else {
-                        self.s.m.set_phi(
-                            pending.state_phis[k],
-                            vec![
-                                (pending.init_vals[k], pending.start_blk),
-                                (back_val, pending.latch_blk),
+                                (p1_next_vals[k], p1_tail_blk),
+                                (pending.state_phis[k], spec.p2_exit_blk),
                             ],
                         );
                     }
@@ -4166,57 +4248,432 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// Returns cached `(CommittedStatus(rq) == 1, CommittedStatus(q1) == 1)` for a two-pass
-    /// group at `cur_ir`, reusing either the owning loop's post-loop `TwoPassPost` or a
-    /// dominating block's cached status before querying `CommittedStatus` once in `self.cur`.
-    fn committed_two_pass_preds(
+    /// Lowers Pass 1's out-of-loop `Committed*` `AnyHit` sub-CFG for an un-fused `fno_spec` loop
+    /// (`ARCH-12`), isolating all per-block/per-value lowering state so Pass 2 lowers cleanly into
+    /// its own `while (Proceed())` loop with zero `spec_phi` branches.
+    fn lower_anyhit_pass1(
+        &mut self,
+        loop_idx: usize,
+        ah: &super::rayquery_lift::AnyHitInfo,
+        spec: &super::rayquery_lift::SpeculativeAnyHit,
+        ray_skipped_insts: &HashSet<Site>,
+    ) -> Result<(usize, Vec<V>), Stop> {
+        let p = self.x.p;
+        let mut body_rpo = ah.body_blocks.clone();
+        body_rpo.sort_by_key(|&ab| self.rpo[ab]);
+
+        // Collect every IR `Value` defined inside `ah.body_blocks` or injected via `ah.inputs`.
+        let mut local_vals: HashSet<Value> = HashSet::new();
+        for &(v, _) in &ah.inputs {
+            local_vals.insert(v);
+        }
+        for &ab in &body_rpo {
+            for phi in &p.blocks[ab].phis {
+                local_vals.insert(phi.value);
+            }
+            for inst in &p.blocks[ab].insts {
+                for &(_, w) in &inst.writes {
+                    local_vals.insert(w);
+                }
+            }
+        }
+        let mut local_lane_vals = local_vals.clone();
+        for &(av, _) in &ah.const_lane_atoms {
+            local_lane_vals.insert(av);
+        }
+
+        // Save per-block/per-value state touched during Pass 1 lowering.
+        let saved_cur = self.cur;
+        let saved_cur_ir = self.cur_ir;
+        let saved_mask_ok = self.mask_ok;
+        let saved_pass1 = self.ray_anyhit_pass1;
+        let saved_blocks: Vec<(usize, Option<usize>)> =
+            body_rpo.iter().map(|&ab| (ab, self.block[ab])).collect();
+        let saved_tails: Vec<(usize, Option<usize>)> = body_rpo
+            .iter()
+            .copied()
+            .chain(std::iter::once(ah.opacity_block))
+            .map(|ab| (ab, self.tail[ab]))
+            .collect();
+        let saved_exported: Vec<(usize, bool)> =
+            body_rpo.iter().map(|&ab| (ab, self.exported[ab])).collect();
+        let saved_vals: Vec<(Value, Option<Val>)> = local_vals
+            .iter()
+            .map(|&v| (v, self.vals.get(&v).copied()))
+            .collect();
+        let saved_floats: Vec<(Value, Option<V>)> = local_vals
+            .iter()
+            .map(|&v| (v, self.floats.get(&v).copied()))
+            .collect();
+        let saved_lane_bits: Vec<(Value, Option<V>)> = local_lane_vals
+            .iter()
+            .map(|&v| (v, self.lane_bits.get(&v).copied()))
+            .collect();
+        let saved_mask_phis: Vec<(Value, Option<V>)> = local_vals
+            .iter()
+            .map(|&v| (v, self.mask_phis.get(&v).copied()))
+            .collect();
+        let saved_ballots: Vec<(Value, Option<(V, V)>)> = local_vals
+            .iter()
+            .map(|&v| (v, self.ballots.get(&v).copied()))
+            .collect();
+        let existing_edges: HashSet<(usize, usize)> = self.edges.keys().copied().collect();
+        let outer_data_phis = std::mem::take(&mut self.data_phis);
+        let outer_pending_masks = std::mem::take(&mut self.pending_masks);
+        let outer_counters = std::mem::take(&mut self.counters);
+        let outer_cand_inputs = std::mem::take(&mut self.cand_inputs);
+        let outer_cand_meta = std::mem::take(&mut self.cand_meta_cache);
+        let outer_cand_ir = std::mem::take(&mut self.cand_ir_cache);
+
+        // Allocate fresh DXIL blocks for Pass 1's copy of `ah.body_blocks`.
+        for &ab in &body_rpo {
+            let fresh = self.s.m.new_block();
+            self.block[ab] = Some(fresh);
+            self.tail[ab] = None;
+            if outer_counters.contains_key(&ab) {
+                let phi = self.s.m.phi(fresh, self.s.t.i32);
+                self.counters.insert(ab, (phi, Vec::new()));
+            }
+        }
+        let p1_entry_dxil = self.block[ah.entry_block].expect("pass 1 anyhit entry");
+        self.s.m.terminate(spec.p1_bridge_blk, Term::Br(p1_entry_dxil));
+        self.tail[ah.opacity_block] = Some(spec.p1_bridge_blk);
+        for &v in &local_vals {
+            self.vals.remove(&v);
+            self.floats.remove(&v);
+            self.mask_phis.remove(&v);
+            self.ballots.remove(&v);
+        }
+        for &v in &local_lane_vals {
+            self.lane_bits.remove(&v);
+        }
+        for &(val, dxil_v) in &spec.p1_cand_outs {
+            self.vals.insert(val, Val::I32(dxil_v));
+        }
+        for &(atom_v, const_b) in &ah.const_lane_atoms {
+            let bv = self.s.m.bool(const_b);
+            self.lane_bits.insert(atom_v, bv);
+        }
+        self.ray_anyhit_pass1 = true;
+
+        let res = (|| -> Result<(usize, Vec<V>), Stop> {
+            let mut p1_tail_info: Option<(usize, V, Vec<V>)> = None;
+            for &ab in &body_rpo {
+                self.cur = self.block[ab].expect("pass 1 block");
+                self.cur_ir = ab;
+                let preds: Vec<usize> = p.blocks[ab]
+                    .preds
+                    .iter()
+                    .copied()
+                    .filter(|&q| self.block[q].is_some())
+                    .collect();
+                self.exported[ab] =
+                    !preds.is_empty() && preds.iter().all(|&q| self.exported_out(q));
+                for (i, phi) in p.blocks[ab].phis.iter().enumerate() {
+                    let val = match phi.reg {
+                        Reg::S(c) if c == EXEC || c == EXEC + 1 => Val::Missing("a lane mask"),
+                        _ if self.bad.contains_key(&phi.value) => Val::Missing(self.bad[&phi.value]),
+                        Reg::Scc => {
+                            let v = self.s.m.phi(self.cur, self.s.t.i1);
+                            self.data_phis.push((v, ab, i));
+                            Val::Bit(v)
+                        }
+                        _ => {
+                            let v = self.s.m.phi(self.cur, self.s.t.i32);
+                            self.data_phis.push((v, ab, i));
+                            Val::I32(v)
+                        }
+                    };
+                    self.vals.insert(phi.value, val);
+                }
+                if self.lds_meet.as_ref().is_some_and(|(_, meet)| meet[ab].0) {
+                    self.lds_meeting();
+                }
+                let mut i = 0;
+                while i < p.blocks[ab].insts.len() {
+                    if ray_skipped_insts.contains(&(ab, i)) {
+                        i += 1;
+                        continue;
+                    }
+                    self.inst(ab, i)?;
+                    if let Some(end) = self.sections.get(&ab).and_then(|s| s.get(&i)).map(|s| s.end)
+                    {
+                        for j in i + 1..end {
+                            self.section_inst(ab, j, i);
+                        }
+                        i = end;
+                        continue;
+                    }
+                    i += 1;
+                }
+                self.mask_ok = self.mask_data == MaskData::Console;
+                if self.lds_meet.as_ref().is_some_and(|(_, meet)| meet[ab].1) {
+                    self.lds_meeting();
+                }
+                self.tail[ab] = Some(self.cur);
+                if ab == ah.tail_block {
+                    let offset = p.blocks[ab].offset;
+                    let mut accept = match self.x.st.masks.get(&ah.accept_mask).copied() {
+                        Some(bm) => {
+                            self.boolean(bm, self.cur).map_err(|w| unsupported(offset, w))?
+                        }
+                        None => self
+                            .lane_bits
+                            .get(&ah.accept_mask)
+                            .copied()
+                            .ok_or_else(|| unsupported(offset, "any-hit accept mask"))?,
+                    };
+                    if ah.accept_invert {
+                        let t = self.s.m.bool(true);
+                        accept = self.s.m.bin(self.cur, Bin::Xor, accept, t);
+                    }
+                    let mut next_vals = Vec::with_capacity(ah.state_vars.len());
+                    for sv in &ah.state_vars {
+                        next_vals.push(self.i32_of(sv.next).map_err(|w| unsupported(offset, w))?);
+                    }
+                    p1_tail_info = Some((self.cur, accept, next_vals));
+                } else {
+                    self.exit(ab)?;
+                }
+            }
+            // Resolve Pass 1's own internal PHIs & counters before restoring outer state.
+            self.fill_phis()?;
+            let (p1_tail_blk, p1_accept, p1_next_vals) =
+                p1_tail_info.expect("pass 1 tail block reached");
+            super::rayquery_lift::finish_fno_spec_pass1(&mut self.s, spec, p1_tail_blk, p1_accept);
+            let _ = loop_idx;
+            Ok((p1_tail_blk, p1_next_vals))
+        })();
+
+        // Restore all saved state so Pass 2 lowers cleanly with zero contamination.
+        self.ray_anyhit_pass1 = saved_pass1;
+        self.cur = saved_cur;
+        self.cur_ir = saved_cur_ir;
+        self.mask_ok = saved_mask_ok;
+        for (ab, blk) in saved_blocks {
+            self.block[ab] = blk;
+        }
+        for (ab, tail) in saved_tails {
+            self.tail[ab] = tail;
+        }
+        for (ab, exp) in saved_exported {
+            self.exported[ab] = exp;
+        }
+        for (v, old) in saved_vals {
+            match old {
+                Some(val) => {
+                    self.vals.insert(v, val);
+                }
+                None => {
+                    self.vals.remove(&v);
+                }
+            }
+        }
+        for (v, old) in saved_floats {
+            match old {
+                Some(val) => {
+                    self.floats.insert(v, val);
+                }
+                None => {
+                    self.floats.remove(&v);
+                }
+            }
+        }
+        for (v, old) in saved_lane_bits {
+            match old {
+                Some(val) => {
+                    self.lane_bits.insert(v, val);
+                }
+                None => {
+                    self.lane_bits.remove(&v);
+                }
+            }
+        }
+        for (v, old) in saved_mask_phis {
+            match old {
+                Some(val) => {
+                    self.mask_phis.insert(v, val);
+                }
+                None => {
+                    self.mask_phis.remove(&v);
+                }
+            }
+        }
+        for (v, old) in saved_ballots {
+            match old {
+                Some(val) => {
+                    self.ballots.insert(v, val);
+                }
+                None => {
+                    self.ballots.remove(&v);
+                }
+            }
+        }
+        self.edges.retain(|k, _| existing_edges.contains(k));
+        self.data_phis = outer_data_phis;
+        self.pending_masks = outer_pending_masks;
+        self.counters = outer_counters;
+        self.cand_inputs = outer_cand_inputs;
+        self.cand_meta_cache = outer_cand_meta;
+        self.cand_ir_cache = outer_cand_ir;
+        res
+    }
+
+    /// Looks up a previously decoded committed triangle normal `[nx, ny, nz]` (`f32`) in `cur_ir`
+    /// or a strictly dominating IR block with no intervening trace in `rq_group`.
+    fn lookup_committed_normal(&self, rq_group: usize, cur_ir: usize) -> Option<[V; 3]> {
+        let mut dom = cur_ir;
+        loop {
+            if let Some(&n) = self.committed_normal_cache.get(&(rq_group, dom)) {
+                if self.no_group_trace_between(rq_group, dom, cur_ir) {
+                    return Some(n);
+                }
+                return None;
+            }
+            if dom >= self.idom.len() {
+                return None;
+            }
+            let parent = self.idom[dom];
+            if parent == dom || parent == usize::MAX {
+                return None;
+            }
+            dom = parent;
+        }
+    }
+
+    /// Resolves `tlas_meta_base` (`SLOT_DXR_NORMALS` instance-map base) for a metadata site.
+    fn resolve_tlas_meta_base(
+        &mut self,
+        site: Site,
+        rq_group: usize,
+        candidate: bool,
+        offset: usize,
+    ) -> Result<Option<V>, Stop> {
+        let tlas_site = if candidate {
+            self.ray_anyhit_blocks
+                .get(&site.0)
+                .and_then(|&li| self.ray_loop_tlas_load.get(li).copied())
+                .or_else(|| self.ray_group_tlas_load[rq_group])
+        } else {
+            self.ray_meta_owner
+                .get(&site)
+                .and_then(|&li| self.ray_loop_tlas_load.get(li).copied())
+                .or_else(|| self.ray_group_tlas_load[rq_group])
+        };
+        if let Some(load) = tlas_site {
+            let tlas_src = Source::Loaded { load, first: 0 };
+            self.slot_word(&tlas_src, true)
+                .map_err(|w| unsupported(offset, w))
+        } else if let Some(slot_ptr) = self.ray_group_tlas_slot[rq_group] {
+            Ok(Some(self.s.m.load(self.cur, slot_ptr)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Resolves the winning `(inst_idx, geom_idx, prim_idx)` once (Pre-Lookup Merge after
+    /// TwoPass!) and performs 1 `t251` lookup + 1 octahedral decode -> `[nx, ny, nz]` (`f32`),
+    /// caching the result in `committed_normal_cache` when unguarded (`ARCH-14`).
+    fn emit_committed_tri_normal(
         &mut self,
         site: Site,
         rq_group: usize,
         rq: V,
-        q1: V,
-    ) -> (V, V) {
-        let cur_ir = site.0;
-        if let Some(&owner) = self.ray_meta_owner.get(&site)
-            && let Some((exit_blk, tp)) = self.two_pass_post.get(&owner)
-            && self.dominates(*exit_blk, cur_ir)
-            && self.no_group_trace_between(rq_group, *exit_blk, cur_ir)
+        guard: Option<V>,
+        offset: usize,
+    ) -> Result<[V; 3], Stop> {
+        let b = site.0;
+        if let Some(cached) = self.lookup_committed_normal(rq_group, b) {
+            return Ok(cached);
+        }
+        let tlas_meta_base = self
+            .resolve_tlas_meta_base(site, rq_group, false, offset)?
+            .unwrap_or_else(|| self.s.m.i32(0));
+        let i32t = self.s.t.i32;
+
+        // Pre-Lookup Merge: select winning `(inst, geom, prim)` BEFORE querying `t251`!
+        let early_ssa = self.ray_meta_owner.get(&site).and_then(|&owner| {
+            let (exit_blk, tp) = self.two_pass_post.get(&owner)?;
+            if self.dominates(*exit_blk, b) && self.no_group_trace_between(rq_group, *exit_blk, b)
+            {
+                Some((
+                    tp.q2_hit,
+                    *tp.q1_fields.get(&super::rayquery_lift::EarlyQ1Field::InstanceIndex)?,
+                    *tp.q1_fields.get(&super::rayquery_lift::EarlyQ1Field::GeometryIndex)?,
+                    *tp.q1_fields.get(&super::rayquery_lift::EarlyQ1Field::PrimitiveIndex)?,
+                ))
+            } else {
+                None
+            }
+        });
+        let (inst_idx, geom_idx, prim_idx) = if let Some((q2_hit, i1, g1, p1)) = early_ssa {
+            let orig = self.cur;
+            let b_q2 = self.s.m.new_block();
+            let b_join = self.s.m.new_block();
+            self.s.m.terminate(orig, Term::CondBr(q2_hit, b_q2, b_join));
+            let i2 = self.s.ray_query_state_i32(b_q2, super::shader::rq_op::COMMITTED_INSTANCE_INDEX, rq);
+            let g2 = self.s.ray_query_state_i32(b_q2, super::shader::rq_op::COMMITTED_GEOMETRY_INDEX, rq);
+            let p2 = self.s.ray_query_state_i32(b_q2, super::shader::rq_op::COMMITTED_PRIMITIVE_INDEX, rq);
+            self.s.m.terminate(b_q2, Term::Br(b_join));
+            let inst = self.s.m.phi(b_join, i32t);
+            self.s.m.set_phi(inst, vec![(i2, b_q2), (i1, orig)]);
+            let geom = self.s.m.phi(b_join, i32t);
+            self.s.m.set_phi(geom, vec![(g2, b_q2), (g1, orig)]);
+            let prim = self.s.m.phi(b_join, i32t);
+            self.s.m.set_phi(prim, vec![(p2, b_q2), (p1, orig)]);
+            self.cur = b_join;
+            (inst, geom, prim)
+        } else if let Some((q2_slot, ref fslots)) = self.ray_group_early_slots[rq_group]
+            && let (Some(&is), Some(&gs), Some(&ps)) = (
+                fslots.get(&super::rayquery_lift::EarlyQ1Field::InstanceIndex),
+                fslots.get(&super::rayquery_lift::EarlyQ1Field::GeometryIndex),
+                fslots.get(&super::rayquery_lift::EarlyQ1Field::PrimitiveIndex),
+            )
         {
-            return (tp.q2_hit, tp.q1_hit);
-        }
-        let mut dom = cur_ir;
-        loop {
-            if let Some(&preds) = self.committed_status_cache.get(&(rq_group, dom)) {
-                if self.no_group_trace_between(rq_group, dom, cur_ir) {
-                    return preds;
-                }
-                break;
-            }
-            if dom >= self.idom.len() {
-                break;
-            }
-            let parent = self.idom[dom];
-            if parent == dom || parent == usize::MAX {
-                break;
-            }
-            dom = parent;
-        }
-        let one = self.s.m.i32(1);
-        let s2 = self.s.ray_query_state_i32(
+            let orig = self.cur;
+            let zero = self.s.m.i32(0);
+            let q2_i = self.s.m.load(orig, q2_slot);
+            let q2_hit = self.s.m.cmp(orig, pred::NE, q2_i, zero);
+            let b_q2 = self.s.m.new_block();
+            let b_q1 = self.s.m.new_block();
+            let b_join = self.s.m.new_block();
+            self.s.m.terminate(orig, Term::CondBr(q2_hit, b_q2, b_q1));
+            let i2 = self.s.ray_query_state_i32(b_q2, super::shader::rq_op::COMMITTED_INSTANCE_INDEX, rq);
+            let g2 = self.s.ray_query_state_i32(b_q2, super::shader::rq_op::COMMITTED_GEOMETRY_INDEX, rq);
+            let p2 = self.s.ray_query_state_i32(b_q2, super::shader::rq_op::COMMITTED_PRIMITIVE_INDEX, rq);
+            self.s.m.terminate(b_q2, Term::Br(b_join));
+            let i1 = self.s.m.load(b_q1, is);
+            let g1 = self.s.m.load(b_q1, gs);
+            let p1 = self.s.m.load(b_q1, ps);
+            self.s.m.terminate(b_q1, Term::Br(b_join));
+            let inst = self.s.m.phi(b_join, i32t);
+            self.s.m.set_phi(inst, vec![(i2, b_q2), (i1, b_q1)]);
+            let geom = self.s.m.phi(b_join, i32t);
+            self.s.m.set_phi(geom, vec![(g2, b_q2), (g1, b_q1)]);
+            let prim = self.s.m.phi(b_join, i32t);
+            self.s.m.set_phi(prim, vec![(p2, b_q2), (p1, b_q1)]);
+            self.cur = b_join;
+            (inst, geom, prim)
+        } else {
+            let inst = self.s.ray_query_state_i32(self.cur, super::shader::rq_op::COMMITTED_INSTANCE_INDEX, rq);
+            let geom = self.s.ray_query_state_i32(self.cur, super::shader::rq_op::COMMITTED_GEOMETRY_INDEX, rq);
+            let prim = self.s.ray_query_state_i32(self.cur, super::shader::rq_op::COMMITTED_PRIMITIVE_INDEX, rq);
+            (inst, geom, prim)
+        };
+
+        let (next_blk, n) = super::rayquery_lift::emit_tri_fetch_normal(
+            &mut self.s,
             self.cur,
-            super::shader::rq_op::COMMITTED_STATUS,
-            rq,
+            tlas_meta_base,
+            inst_idx,
+            geom_idx,
+            prim_idx,
         );
-        let use_q2 = self.s.m.cmp(self.cur, pred::EQ, s2, one);
-        let s1 = self.s.ray_query_state_i32(
-            self.cur,
-            super::shader::rq_op::COMMITTED_STATUS,
-            q1,
-        );
-        let use_q1 = self.s.m.cmp(self.cur, pred::EQ, s1, one);
-        self.committed_status_cache
-            .insert((rq_group, cur_ir), (use_q2, use_q1));
-        (use_q2, use_q1)
+        self.cur = next_blk;
+        if guard.is_none() {
+            self.committed_normal_cache.insert((rq_group, b), n);
+        }
+        Ok(n)
     }
 
     fn materialize_cand_input(
@@ -7764,6 +8221,45 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
+        // ARCH-14: Direct-normal substitution output sites replace the final `normalize(cross(...))`
+        // component writes directly with the pre-fetched `±N` without emitting extra `Rsqrt`s.
+        if let Some(&(fetch_site, out_val, comp)) = self.direct_normal_out.get(&(b, i))
+            && let Some(&n_bits) = self.direct_normal_vals.get(&fetch_site)
+        {
+            self.vals.insert(out_val, Val::I32(n_bits[comp]));
+            return Ok(());
+        }
+        if let Some(&(rq_group, negate)) = self.direct_normal_fetch.get(&(b, i)) {
+            let guard = self.guard(b, i).map_err(|w| unsupported(offset, w))?;
+            let rq = self.ray_queries[rq_group];
+            let [mut nx, mut ny, mut nz] =
+                self.emit_committed_tri_normal((b, i), rq_group, rq, guard, offset)?;
+            if negate {
+                let f_zero = self.s.m.f32(0.0f32.to_bits());
+                nx = self.s.m.bin(self.cur, Bin::Sub, f_zero, nx);
+                ny = self.s.m.bin(self.cur, Bin::Sub, f_zero, ny);
+                nz = self.s.m.bin(self.cur, Bin::Sub, f_zero, nz);
+            }
+            let i32t = self.s.t.i32;
+            let n_bits = [
+                self.s.m.cast(self.cur, Cast::Bitcast, nx, i32t),
+                self.s.m.cast(self.cur, Cast::Bitcast, ny, i32t),
+                self.s.m.cast(self.cur, Cast::Bitcast, nz, i32t),
+            ];
+            self.direct_normal_vals.insert((b, i), n_bits);
+            let zero = self.s.m.i32(0);
+            for &(_, v) in &inst.writes {
+                self.vals.insert(v, Val::I32(zero));
+            }
+            return Ok(());
+        }
+        if self.direct_normal_dead.contains(&(b, i)) {
+            let zero = self.s.m.i32(0);
+            for &(_, v) in &inst.writes {
+                self.vals.insert(v, Val::I32(zero));
+            }
+            return Ok(());
+        }
         if let Some(&meta) = self.ray_meta_loads.get(&(b, i)) {
             let guard = self.guard(b, i).map_err(|w| unsupported(offset, w))?;
             let rq = self.ray_queries[meta.loop_idx];
@@ -7773,45 +8269,48 @@ impl<'a> Lower<'a> {
                 super::rayquery_lift::RayMetaKind::BlasBaseZero
                     | super::rayquery_lift::RayMetaKind::TriFetchZero3
             );
-            let tlas_meta_base = if matches!(
+            let is_tri_basis = matches!(
                 meta.kind,
                 super::rayquery_lift::RayMetaKind::TriFetchBasisT
                     | super::rayquery_lift::RayMetaKind::TriFetchBasisB
-            ) {
-                let tlas_site = if meta.candidate {
-                    self.ray_anyhit_blocks
-                        .get(&b)
-                        .and_then(|&li| self.ray_loop_tlas_load.get(li).copied())
-                        .or_else(|| self.ray_group_tlas_load[meta.loop_idx])
-                } else {
-                    self.ray_meta_owner
-                        .get(&(b, i))
-                        .and_then(|&li| self.ray_loop_tlas_load.get(li).copied())
-                        .or_else(|| self.ray_group_tlas_load[meta.loop_idx])
-                };
-                if let Some(load) = tlas_site {
-                    let tlas_src = Source::Loaded { load, first: 0 };
-                    self.slot_word(&tlas_src, true)
-                        .map_err(|w| unsupported(offset, w))?
-                } else if let Some(slot_ptr) = self.ray_group_tlas_slot[meta.loop_idx] {
-                    Some(self.s.m.load(self.cur, slot_ptr))
-                } else {
-                    None
-                }
+            );
+            let tlas_meta_base = if is_tri_basis && meta.candidate {
+                self.resolve_tlas_meta_base((b, i), meta.loop_idx, true, offset)?
             } else {
                 None
             };
             let vals = if !meta.candidate && !is_zero_meta {
                 if let Some(cached) = self.lookup_committed_meta(meta.loop_idx, b, meta.kind, n) {
                     cached
+                } else if is_tri_basis {
+                    // ARCH-14: Pre-Lookup Merge + Shared Normal Cache even for paired `(T, B)`
+                    // fallback: fetch & decode `N` once, then derive `T` or `B`.
+                    let norm = self.emit_committed_tri_normal(
+                        (b, i),
+                        meta.loop_idx,
+                        rq,
+                        guard,
+                        offset,
+                    )?;
+                    let computed = super::rayquery_lift::emit_basis_from_normal(
+                        &mut self.s,
+                        self.cur,
+                        norm,
+                        matches!(meta.kind, super::rayquery_lift::RayMetaKind::TriFetchBasisB),
+                        n,
+                    );
+                    if guard.is_none() {
+                        self.committed_meta_cache
+                            .insert((meta.loop_idx, b, meta.kind, n), computed.clone());
+                    }
+                    computed
                 } else {
                     let early = self.ray_meta_owner.get(&(b, i)).and_then(|&owner| {
                         let (exit_blk, tp) = self.two_pass_post.get(&owner)?;
-                        let fields = tp.q1_fields.as_ref()?;
                         if self.dominates(*exit_blk, b)
                             && self.no_group_trace_between(meta.loop_idx, *exit_blk, b)
                         {
-                            Some((tp.q2_hit, fields.clone()))
+                            Some((tp.q2_hit, tp.q1_fields.clone()))
                         } else {
                             None
                         }
@@ -7835,7 +8334,7 @@ impl<'a> Lower<'a> {
                             .m
                             .terminate(check_blk, Term::CondBr(q2_hit, b_q2, b_q1));
 
-                        let v2 = super::rayquery_lift::emit_ray_meta_load(
+                        let (b_q2_end, v2) = super::rayquery_lift::emit_ray_meta_load(
                             &mut self.s,
                             b_q2,
                             rq,
@@ -7844,9 +8343,9 @@ impl<'a> Lower<'a> {
                             n,
                             tlas_meta_base,
                         );
-                        self.s.m.terminate(b_q2, Term::Br(b_join));
+                        self.s.m.terminate(b_q2_end, Term::Br(b_join));
 
-                        let v1 = super::rayquery_lift::resolve_early_q1_meta(
+                        let (b_q1_end, v1) = super::rayquery_lift::resolve_early_q1_meta(
                             &mut self.s,
                             b_q1,
                             &fields,
@@ -7855,13 +8354,13 @@ impl<'a> Lower<'a> {
                             tlas_meta_base,
                         )
                         .expect("early q1 field pre-extracted");
-                        self.s.m.terminate(b_q1, Term::Br(b_join));
+                        self.s.m.terminate(b_q1_end, Term::Br(b_join));
 
                         let zero = self.s.m.i32(0);
                         let mut merged = Vec::with_capacity(n);
                         for k in 0..n {
                             let phi = self.s.m.phi(b_join, i32t);
-                            let mut inc = vec![(v2[k], b_q2), (v1[k], b_q1)];
+                            let mut inc = vec![(v2[k], b_q2_end), (v1[k], b_q1_end)];
                             if let Some(ze) = zero_edge {
                                 inc.push((zero, ze));
                             }
@@ -7870,14 +8369,14 @@ impl<'a> Lower<'a> {
                         }
                         self.cur = b_join;
                         merged
-                    } else if let Some(q1) = self.ray_queries_opaque[meta.loop_idx] {
-                        // Reuse or emit `CommittedStatus` predicates once per block/dominator.
-                        let (use_q2, use_q1) =
-                            self.committed_two_pass_preds((b, i), meta.loop_idx, rq, q1);
+                    } else if let Some((q2_slot, ref fslots)) =
+                        self.ray_group_early_slots[meta.loop_idx]
+                    {
+                        let fslots_cloned = fslots.clone();
                         let i32t = self.s.t.i32;
                         let orig = self.cur;
+                        let zero = self.s.m.i32(0);
                         let b_q2 = self.s.m.new_block();
-                        let b_q1_check = self.s.m.new_block();
                         let b_q1 = self.s.m.new_block();
                         let b_join = self.s.m.new_block();
                         let mut zero_edge: Option<usize> = None;
@@ -7889,11 +8388,13 @@ impl<'a> Lower<'a> {
                         } else {
                             orig
                         };
+                        let q2_i = self.s.m.load(check_blk, q2_slot);
+                        let q2_hit = self.s.m.cmp(check_blk, pred::NE, q2_i, zero);
                         self.s
                             .m
-                            .terminate(check_blk, Term::CondBr(use_q2, b_q2, b_q1_check));
+                            .terminate(check_blk, Term::CondBr(q2_hit, b_q2, b_q1));
 
-                        let v2 = super::rayquery_lift::emit_ray_meta_load(
+                        let (b_q2_end, v2) = super::rayquery_lift::emit_ray_meta_load(
                             &mut self.s,
                             b_q2,
                             rq,
@@ -7902,29 +8403,28 @@ impl<'a> Lower<'a> {
                             n,
                             tlas_meta_base,
                         );
-                        self.s.m.terminate(b_q2, Term::Br(b_join));
+                        self.s.m.terminate(b_q2_end, Term::Br(b_join));
 
-                        self.s
-                            .m
-                            .terminate(b_q1_check, Term::CondBr(use_q1, b_q1, b_join));
-
-                        let v1 = super::rayquery_lift::emit_ray_meta_load(
+                        let mut loaded_fields = HashMap::new();
+                        for (f, ptr) in fslots_cloned {
+                            let val = self.s.m.load(b_q1, ptr);
+                            loaded_fields.insert(f, val);
+                        }
+                        let (b_q1_end, v1) = super::rayquery_lift::resolve_early_q1_meta(
                             &mut self.s,
                             b_q1,
-                            q1,
-                            false,
+                            &loaded_fields,
                             meta.kind,
                             n,
                             tlas_meta_base,
-                        );
-                        self.s.m.terminate(b_q1, Term::Br(b_join));
+                        )
+                        .expect("shared early q1 field pre-extracted");
+                        self.s.m.terminate(b_q1_end, Term::Br(b_join));
 
-                        let zero = self.s.m.i32(0);
                         let mut merged = Vec::with_capacity(n);
                         for k in 0..n {
                             let phi = self.s.m.phi(b_join, i32t);
-                            let mut inc =
-                                vec![(v2[k], b_q2), (v1[k], b_q1), (zero, b_q1_check)];
+                            let mut inc = vec![(v2[k], b_q2_end), (v1[k], b_q1_end)];
                             if let Some(ze) = zero_edge {
                                 inc.push((zero, ze));
                             }
@@ -7934,7 +8434,7 @@ impl<'a> Lower<'a> {
                         self.cur = b_join;
                         merged
                     } else {
-                        super::rayquery_lift::emit_ray_meta_load(
+                        let (next_blk, v) = super::rayquery_lift::emit_ray_meta_load(
                             &mut self.s,
                             self.cur,
                             rq,
@@ -7942,7 +8442,9 @@ impl<'a> Lower<'a> {
                             meta.kind,
                             n,
                             tlas_meta_base,
-                        )
+                        );
+                        self.cur = next_blk;
+                        v
                     };
                     if guard.is_none() {
                         self.committed_meta_cache
@@ -7957,73 +8459,18 @@ impl<'a> Lower<'a> {
                 {
                     cached
                 } else {
-                    let computed = if let Some(loop_idx) = ah_loop
-                        && let Some(&spec_phi) = self.ray_anyhit_spec_phi.get(&loop_idx)
-                    {
-                        let i32t = self.s.t.i32;
-                        let orig = self.cur;
-                        let b_comm = self.s.m.new_block();
-                        let b_cand = self.s.m.new_block();
-                        let b_join = self.s.m.new_block();
-                        let mut zero_edge: Option<usize> = None;
-                        let check_blk = if let Some(g) = guard {
-                            let b_check = self.s.m.new_block();
-                            self.s.m.terminate(orig, Term::CondBr(g, b_check, b_join));
-                            zero_edge = Some(orig);
-                            b_check
-                        } else {
-                            orig
-                        };
-                        self.s
-                            .m
-                            .terminate(check_blk, Term::CondBr(spec_phi, b_comm, b_cand));
-
-                        let v_comm = super::rayquery_lift::emit_ray_meta_load(
-                            &mut self.s,
-                            b_comm,
-                            rq,
-                            false,
-                            meta.kind,
-                            n,
-                            tlas_meta_base,
-                        );
-                        self.s.m.terminate(b_comm, Term::Br(b_join));
-
-                        let v_cand = super::rayquery_lift::emit_ray_meta_load(
-                            &mut self.s,
-                            b_cand,
-                            rq,
-                            true,
-                            meta.kind,
-                            n,
-                            tlas_meta_base,
-                        );
-                        self.s.m.terminate(b_cand, Term::Br(b_join));
-
-                        let zero = self.s.m.i32(0);
-                        let mut merged = Vec::with_capacity(n);
-                        for k in 0..n {
-                            let phi = self.s.m.phi(b_join, i32t);
-                            let mut inc = vec![(v_comm[k], b_comm), (v_cand[k], b_cand)];
-                            if let Some(ze) = zero_edge {
-                                inc.push((zero, ze));
-                            }
-                            self.s.m.set_phi(phi, inc);
-                            merged.push(phi);
-                        }
-                        self.cur = b_join;
-                        merged
-                    } else {
-                        super::rayquery_lift::emit_ray_meta_load(
-                            &mut self.s,
-                            self.cur,
-                            rq,
-                            true,
-                            meta.kind,
-                            n,
-                            tlas_meta_base,
-                        )
-                    };
+                    // ARCH-12: Zero `spec_phi` diamond! Pass 1 emits `Committed*` directly
+                    // (`candidate = false`); Pass 2 emits `Candidate*` directly (`candidate = true`).
+                    let (next_blk, computed) = super::rayquery_lift::emit_ray_meta_load(
+                        &mut self.s,
+                        self.cur,
+                        rq,
+                        !self.ray_anyhit_pass1,
+                        meta.kind,
+                        n,
+                        tlas_meta_base,
+                    );
+                    self.cur = next_blk;
                     if guard.is_none()
                         && let Some(loop_idx) = ah_loop
                     {
@@ -8033,15 +8480,17 @@ impl<'a> Lower<'a> {
                     computed
                 }
             } else {
-                super::rayquery_lift::emit_ray_meta_load(
+                let (next_blk, v) = super::rayquery_lift::emit_ray_meta_load(
                     &mut self.s,
                     self.cur,
                     rq,
-                    meta.candidate,
+                    meta.candidate && !self.ray_anyhit_pass1,
                     meta.kind,
                     n,
                     tlas_meta_base,
-                )
+                );
+                self.cur = next_blk;
+                v
             };
             for (&(reg, _), x) in inst.writes.iter().zip(vals) {
                 self.write(inst, reg, x, guard);
@@ -10475,6 +10924,43 @@ impl<'a> Lower<'a> {
                 Ok(self.s.heap_handle_at(self.cur, index, sampler, true, props, bounded))
             }
         }
+    }
+
+    /// Resolves the HostHeap twin-slot cull-enabled Mirror TLAS SRV handle for `load` (`ARCH-13`)
+    /// using the exact `raw_twin` formula: `twin_idx = UMin(tlas_index, raw_views - 1) | raw_views`,
+    /// then `createHandleFromHeap(twin_idx, false, per_lane)` + `annotateHandle(RTAS (16, 0))`.
+    fn mirror_tlas_handle(&mut self, load: Site) -> Result<V, Why> {
+        let per_lane = self.x.res.waterfall.loads.contains(&load);
+        let target_blk = self.hoist_loaded_block(load);
+        if let Some(&h) = self.mirror_tlas_handles.get(&(target_blk, load)) {
+            return Ok(h);
+        }
+        let saved_cur = std::mem::replace(&mut self.cur, target_blk);
+        let next_ir = if target_blk == saved_cur {
+            self.cur_ir
+        } else {
+            load.0
+        };
+        let saved_ir = std::mem::replace(&mut self.cur_ir, next_ir);
+        let res = (|| -> Result<V, Why> {
+            let index = self.heap_index(load, 0, false)?;
+            let first = super::shader::raw_views();
+            debug_assert_ne!(first, 0, "mirror_tlas_handle requires raw_views() != 0");
+            let c = self.cur;
+            let (last_v, first_v) = (self.s.m.i32(first - 1), self.s.m.i32(first));
+            let i32t = self.s.t.i32;
+            let clamped = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[index, last_v]);
+            self.s.m.tag(clamped, Tag::Clamp);
+            let twin_idx = self.s.m.bin(c, Bin::Or, clamped, first_v);
+            Ok(self
+                .s
+                .heap_handle_at(target_blk, twin_idx, false, per_lane, (16, 0), true))
+        })();
+        self.cur = saved_cur;
+        self.cur_ir = saved_ir;
+        let h = res?;
+        self.mirror_tlas_handles.insert((target_blk, load), h);
+        Ok(h)
     }
 
     /// The heap index to read descriptor `src` at, `index` being the title's:
@@ -18240,6 +18726,7 @@ mod tests {
                 fallback: Some(Value(0)),
             }],
             committed_meta_loads: vec![],
+            direct_normals: vec![],
         };
 
         let rq = lower.s.allocate_ray_query(entry, flags);
@@ -18248,7 +18735,6 @@ mod tests {
         let ten_f = lower.s.m.i32(10.0f32.to_bits());
         let inputs = ResolvedRayInputs {
             rq,
-            rq_opaque: None,
             two_pass_early_fields: None,
             tlas,
             active_ray: None,
@@ -18259,8 +18745,8 @@ mod tests {
             instance_mask: None,
             ray_flags: None,
             group_const_flags: flags,
-            group_opaque_const_flags: 0,
             fbt_split_mask: 0,
+            fbt_mirror_tlas: false,
             init_min_front_t: None,
             anyhit_inits: vec![],
             anyhit_entry_dxil: Some(ah_head),
@@ -18351,7 +18837,6 @@ mod tests {
         let dom_blk = lower.s.m.new_block();
         let child_blk = lower.s.m.new_block();
         let rq = lower.s.allocate_ray_query(entry, ray_flag::CULL_OPAQUE);
-        let q1 = lower.s.allocate_ray_query(entry, ray_flag::CULL_NON_OPAQUE);
 
         // Simulate IR dominator chain: 0 -> 1 -> 2 (all in the same AnyHit body for bary test).
         lower.idom = vec![0, 0, 1];
@@ -18371,17 +18856,18 @@ mod tests {
             "CandidateTriangleBarycentrics in dominated IR block must reuse dominating query"
         );
 
-        // 2) `CommittedStatus` dedup: calling `committed_two_pass_preds` in block 1 and dominated
-        //    block 2 returns the exact same cached `(use_q2, use_q1)` SSA values.
-        lower.cur_ir = 1;
-        lower.cur = dom_blk;
-        let p1 = lower.committed_two_pass_preds((1, 0), 0, rq, q1);
-        let p1_again = lower.committed_two_pass_preds((1, 1), 0, rq, q1);
-        assert_eq!(p1, p1_again, "same-block CommittedStatus must be cached");
-        lower.cur_ir = 2;
-        lower.cur = child_blk;
-        let p2 = lower.committed_two_pass_preds((2, 0), 0, rq, q1);
-        assert_eq!(p1, p2, "dominated-block CommittedStatus must reuse cached predicates");
+        // 2) `committed_normal_cache` lookup reuses same/dominating block decoded normals.
+        let fake_norm = [
+            lower.s.m.f32(0),
+            lower.s.m.f32(0),
+            lower.s.m.f32(1.0f32.to_bits()),
+        ];
+        lower.committed_normal_cache.insert((0, 1), fake_norm);
+        assert_eq!(
+            lower.lookup_committed_normal(0, 2),
+            Some(fake_norm),
+            "dominated-block committed normal lookup must hit shared normal cache"
+        );
 
         // 3) `committed_meta_cache` lookup reuses same/dominating block metadata queries.
         let fake_val = vec![lower.s.m.i32(42)];

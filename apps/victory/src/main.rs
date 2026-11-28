@@ -168,6 +168,12 @@ enum Console {
 }
 
 fn main() -> Result<()> {
+    // Out-of-process cold shader translation worker (`victory.exe --compile-worker`).
+    // Handle BEFORE logging::init so stdout stays 100% binary VCW1 IPC frames.
+    #[cfg(windows)]
+    if std::env::args_os().nth(1).is_some_and(|a| a == "--compile-worker") {
+        return victory_hle::known_pipelines::run_compile_worker().map_err(Into::into);
+    }
     victory_core::logging::init("info");
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
@@ -224,6 +230,8 @@ fn main() -> Result<()> {
             console,
             title_args,
         } => {
+            #[cfg(windows)]
+            victory_hle::known_pipelines::enable_compile_worker();
             victory_hle::runtime::set_title_args(title_args);
             run::run(&exe, unimplemented, strict, execute, console)
         }

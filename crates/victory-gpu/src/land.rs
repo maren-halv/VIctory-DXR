@@ -195,28 +195,34 @@ pub(crate) fn log(frames: f64) {
     );
 }
 
-/// Threads kept for landing, and the work they are at.
+/// Cache-line padded wrapper to eliminate cross-core false sharing on hot atomics.
+#[repr(align(64))]
+struct CachePadded<T>(T);
+
+/// One active parallel batch submitted to a [`Pool`]. Lives on the caller's
+/// stack until every helper has exited it (`active_helpers == 0`).
+struct Batch {
+    work: Work,
+    count: usize,
+    next: CachePadded<std::sync::atomic::AtomicUsize>,
+    active_helpers: CachePadded<std::sync::atomic::AtomicUsize>,
+    panicked: std::sync::atomic::AtomicBool,
+}
+
+/// Shared bounded Tier-1 worker pool. Supports concurrent external batches
+/// without a global `turn` lock and falls back to inline execution on any
+/// re-entrant call from inside a Tier-1 worker so deadlock is impossible.
 struct Pool {
     state: Mutex<State>,
     more: Condvar,
     idle: Condvar,
-    /// One batch at a time.
-    turn: Mutex<()>,
     threads: usize,
-    /// Next job index claimed lock-free by workers and caller.
-    next: std::sync::atomic::AtomicUsize,
-    /// Active helper threads currently executing a batch.
-    running: std::sync::atomic::AtomicUsize,
-    /// Whether any helper panicked during the current batch.
-    panicked: std::sync::atomic::AtomicBool,
+    pending: CachePadded<std::sync::atomic::AtomicUsize>,
 }
 
 struct State {
-    /// What to do with each number below `count`.
-    work: Option<Work>,
-    count: usize,
-    /// Incremented once per batch so each helper enters a batch at most once.
-    generation: u64,
+    /// Active batches in LIFO order so the most recent batch drains first.
+    active: Vec<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -226,6 +232,13 @@ struct Work(*const (dyn Fn(usize) + Sync));
 // `Pool::each` keeps it alive until no helper is inside a call.
 unsafe impl Send for Work {}
 
+thread_local! {
+    /// True while executing on a Tier-1 worker thread so any re-entrant call
+    /// to `each` / `each_under` / `each_view` runs inline instead of blocking
+    /// on other Tier-1 workers.
+    static IN_TIER1_WORKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 impl Pool {
     fn state(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
@@ -233,29 +246,18 @@ impl Pool {
 
     fn new(name: &'static str, threads: usize) -> &'static Pool {
         let pool: &'static Pool = Box::leak(Box::new(Pool {
-            state: Mutex::new(State { work: None, count: 0, generation: 0 }),
+            state: Mutex::new(State { active: Vec::with_capacity(8) }),
             more: Condvar::new(),
             idle: Condvar::new(),
-            turn: Mutex::new(()),
             threads,
-            next: std::sync::atomic::AtomicUsize::new(0),
-            running: std::sync::atomic::AtomicUsize::new(0),
-            panicked: std::sync::atomic::AtomicBool::new(false),
+            pending: CachePadded(std::sync::atomic::AtomicUsize::new(0)),
         }));
         for i in 1..threads {
             // (A helper that is not there is only missed.)
             let _ = std::thread::Builder::new().name(format!("{name}-{i}")).spawn(move || {
-                if name == "victory-records" || name == "victory-under" {
-                    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL};
-                    // SAFETY: matches `victory-heap-sync` / `victory-submit` priority so
-                    // `sync_heaps` and `send::take` helpers are not preempted behind `victory-list`.
-                    unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) };
-                }
-                if name == "victory-land" {
-                    crate::cores::keep_helper_on_fast_cores(name);
-                } else {
-                    crate::cores::keep_many_on_fast_cores(name);
-                }
+                // Tier-1 burst workers always run at THREAD_PRIORITY_NORMAL.
+                crate::cores::keep_helper_on_fast_cores(name);
+                IN_TIER1_WORKER.set(true);
                 pool.help()
             });
         }
@@ -264,36 +266,45 @@ impl Pool {
 
     fn help(&self) {
         use std::sync::atomic::Ordering;
-        let mut seen = 0u64;
         loop {
-            let (work, count) = {
+            let batch_ptr = {
                 let mut state = self.state();
-                while state.generation == seen || state.work.is_none() {
+                loop {
+                    // Pick the newest (LIFO) batch with unclaimed work.
+                    let found = state.active.iter().rev().copied().find(|&ptr| {
+                        // SAFETY: every pointer in `state.active` points to a live stack `Batch`
+                        // whose caller holds `state` to remove it and waits for `active_helpers == 0`.
+                        let b = unsafe { &*(ptr as *const Batch) };
+                        b.next.0.load(Ordering::Relaxed) < b.count
+                    });
+                    if let Some(ptr) = found {
+                        // SAFETY: valid while `state` is held; incrementing `active_helpers`
+                        // pins the `Batch` until we decrement it below.
+                        let b = unsafe { &*(ptr as *const Batch) };
+                        b.active_helpers.0.fetch_add(1, Ordering::AcqRel);
+                        break ptr;
+                    }
                     state = self.more.wait(state).unwrap_or_else(|e| e.into_inner());
                 }
-                seen = state.generation;
-                let work = state.work.unwrap();
-                let count = state.count;
-                // Count this helper under `state` before `each` can clear `work`.
-                self.running.fetch_add(1, Ordering::AcqRel);
-                (work, count)
             };
+            // SAFETY: pinned by `active_helpers` until we decrement it below.
+            let batch = unsafe { &*(batch_ptr as *const Batch) };
             let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 loop {
-                    let i = self.next.fetch_add(1, Ordering::Relaxed);
-                    if i >= count {
+                    let i = batch.next.0.fetch_add(1, Ordering::Relaxed);
+                    if i >= batch.count {
                         break;
                     }
                     let working = crate::timeline::span("a landing's job");
-                    // SAFETY: counted in `running`, so `each` has not returned.
-                    unsafe { (*work.0)(i) };
+                    // SAFETY: pinned by `active_helpers`, so `each` has not returned.
+                    unsafe { (*batch.work.0)(i) };
                     working.end();
                 }
             }));
             if ran.is_err() {
-                self.panicked.store(true, Ordering::Release);
+                batch.panicked.store(true, Ordering::Release);
             }
-            if self.running.fetch_sub(1, Ordering::AcqRel) == 1 {
+            if batch.active_helpers.0.fetch_sub(1, Ordering::AcqRel) == 1 {
                 let _state = self.state();
                 self.idle.notify_all();
             }
@@ -301,25 +312,30 @@ impl Pool {
     }
 
     /// Calls `f` with every number below `count`, on the pool's threads and
-    /// this one, and returns when every call has.
+    /// this one, and returns when every call has. Re-entrant calls from inside
+    /// a Tier-1 worker execute inline to guarantee zero deadlock.
     fn each(&self, count: usize, f: &(dyn Fn(usize) + Sync)) {
         use std::sync::atomic::Ordering;
-        if count < 2 || self.threads < 2 {
+        if count < 2 || self.threads < 2 || IN_TIER1_WORKER.get() {
             (0..count).for_each(f);
             return;
         }
         let _spread = crate::timeline::span("landing: spread over threads");
-        let _turn = self.turn.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: the lifetime is left out only until this call returns, and
-        // it does not before no helper is inside `f` and none can enter.
+        // it does not before `active_helpers == 0` and `batch` is removed from `state.active`.
         let work = Work(unsafe { std::mem::transmute::<*const (dyn Fn(usize) + Sync + '_), *const (dyn Fn(usize) + Sync + 'static)>(f) });
+        let batch = Batch {
+            work,
+            count,
+            next: CachePadded(std::sync::atomic::AtomicUsize::new(0)),
+            active_helpers: CachePadded(std::sync::atomic::AtomicUsize::new(0)),
+            panicked: std::sync::atomic::AtomicBool::new(false),
+        };
+        let batch_ptr = (&raw const batch) as usize;
         {
             let mut state = self.state();
-            self.next.store(0, Ordering::Relaxed);
-            self.panicked.store(false, Ordering::Relaxed);
-            state.work = Some(work);
-            state.count = count;
-            state.generation = state.generation.wrapping_add(1);
+            state.active.push(batch_ptr);
+            self.pending.0.fetch_add(1, Ordering::Release);
         }
         if count >= self.threads {
             self.more.notify_all();
@@ -328,7 +344,7 @@ impl Pool {
         }
         let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             loop {
-                let i = self.next.fetch_add(1, Ordering::Relaxed);
+                let i = batch.next.0.fetch_add(1, Ordering::Relaxed);
                 if i >= count {
                     break;
                 }
@@ -336,12 +352,14 @@ impl Pool {
             }
         }));
         let mut state = self.state();
-        // (After a panic here: nothing more is begun.)
-        state.work = None;
-        while self.running.load(Ordering::Acquire) > 0 {
+        if let Some(pos) = state.active.iter().rposition(|&p| p == batch_ptr) {
+            state.active.remove(pos);
+        }
+        self.pending.0.fetch_sub(1, Ordering::AcqRel);
+        while batch.active_helpers.0.load(Ordering::Acquire) > 0 {
             state = self.idle.wait(state).unwrap_or_else(|e| e.into_inner());
         }
-        let panicked = self.panicked.load(Ordering::Acquire);
+        let panicked = batch.panicked.load(Ordering::Acquire);
         drop(state);
         if let Err(panic) = ran {
             std::panic::resume_unwind(panic);
@@ -350,36 +368,48 @@ impl Pool {
     }
 }
 
-/// [`Pool::each`] on the threads kept for landing.
+/// Unified bounded Tier-1 worker pool (`6` `THREAD_PRIORITY_NORMAL` workers by
+/// default) shared by `land`, `under`, `records`, and `views`.
+fn tier1_pool() -> &'static Pool {
+    static POOL: OnceLock<&'static Pool> = OnceLock::new();
+    POOL.get_or_init(|| Pool::new("victory-tier1", crate::cores::tier1_worker_count() + 1))
+}
+
+fn single_threaded_override(var: &'static str) -> bool {
+    std::env::var(var).ok().and_then(|v| v.trim().parse::<usize>().ok()) == Some(1)
+}
+
+/// [`Pool::each`] on the shared bounded Tier-1 pool for landing.
 pub(crate) fn each(count: usize, f: &(dyn Fn(usize) + Sync)) {
-    static POOL: OnceLock<&'static Pool> = OnceLock::new();
-    POOL.get_or_init(|| Pool::new("victory-land", threads())).each(count, f);
+    if threads() < 2 {
+        (0..count).for_each(f);
+        return;
+    }
+    tier1_pool().each(count, f);
 }
 
-/// [`Pool::each`] on threads kept for the title's bytes under flights' writes
-/// (`VICTORY_UNDER_THREADS`, 6 with this one).
+/// [`Pool::each`] on the shared bounded Tier-1 pool for the title's bytes
+/// under flights' writes (`VICTORY_UNDER_THREADS=1`: inline on caller).
 pub(crate) fn each_under(count: usize, f: &(dyn Fn(usize) + Sync)) {
-    static POOL: OnceLock<&'static Pool> = OnceLock::new();
-    POOL.get_or_init(|| {
-        let threads = std::env::var("VICTORY_UNDER_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(6usize);
-        Pool::new("victory-under", threads.clamp(1, 16))
-    })
-    .each(count, f);
+    static INLINE: OnceLock<bool> = OnceLock::new();
+    if *INLINE.get_or_init(|| single_threaded_override("VICTORY_UNDER_THREADS")) {
+        (0..count).for_each(f);
+        return;
+    }
+    tier1_pool().each(count, f);
 }
 
-/// Calls `f` with every number below `count`, on this thread and on threads
-/// kept for making descriptors (`VICTORY_VIEW_THREADS`, 6 with this one; 1:
-/// on this one alone). Those for `records`, the heaps' records copied as
-/// bytes, are others than those for the views picked by index: submissions
-/// wait for the first, lists for the second, and each kept the other waiting.
-pub(crate) fn each_view(records: bool, count: usize, f: &(dyn Fn(usize) + Sync)) {
-    static POOLS: [OnceLock<&'static Pool>; 2] = [const { OnceLock::new() }; 2];
-    POOLS[usize::from(records)]
-        .get_or_init(|| {
-            let threads = std::env::var("VICTORY_VIEW_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(6usize);
-            Pool::new(if records { "victory-records" } else { "victory-views" }, threads.clamp(1, 16))
-        })
-        .each(count, f);
+/// Calls `f` with every number below `count` on this thread and the shared
+/// bounded Tier-1 pool (`VICTORY_VIEW_THREADS=1`: inline on caller).
+/// Concurrent `records` and `views` callers run simultaneously on the shared
+/// multi-batch pool without serializing behind one another.
+pub(crate) fn each_view(_records: bool, count: usize, f: &(dyn Fn(usize) + Sync)) {
+    static INLINE: OnceLock<bool> = OnceLock::new();
+    if *INLINE.get_or_init(|| single_threaded_override("VICTORY_VIEW_THREADS")) {
+        (0..count).for_each(f);
+        return;
+    }
+    tier1_pool().each(count, f);
 }
 
 /// A piece to land: the copy's number, the title address, its bytes.
@@ -743,3 +773,61 @@ fn for_pages(title: usize, parts: &[(usize, usize)], mut f: impl FnMut(usize, us
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod tier1_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    /// Re-entrant nested calls across `each`, `each_under`, and `each_view`
+    /// on the shared Tier-1 pool never deadlock and execute every item once.
+    #[test]
+    fn reentrant_and_concurrent_tier1_pool_calls_never_deadlock() {
+        let outer = AtomicUsize::new(0);
+        let inner_under = AtomicUsize::new(0);
+        let inner_view = AtomicUsize::new(0);
+
+        each(24, &|i| {
+            outer.fetch_add(1, Ordering::Relaxed);
+            each_under(8, &|j| {
+                inner_under.fetch_add(i + j + 1, Ordering::Relaxed);
+                each_view(i % 2 == 0, 4, &|_| {
+                    inner_view.fetch_add(1, Ordering::Relaxed);
+                });
+            });
+        });
+
+        assert_eq!(outer.load(Ordering::Relaxed), 24);
+        assert_eq!(inner_view.load(Ordering::Relaxed), 24 * 8 * 4);
+        let expected_under: usize = (0..24).flat_map(|i| (0..8).map(move |j| i + j + 1)).sum();
+        assert_eq!(inner_under.load(Ordering::Relaxed), expected_under);
+
+        // Concurrent external callers across all 4 entrypoints share the single Tier-1 pool.
+        let hits = [const { AtomicUsize::new(0) }; 4];
+        std::thread::scope(|s| {
+            s.spawn(|| each(64, &|_| { hits[0].fetch_add(1, Ordering::Relaxed); }));
+            s.spawn(|| each_under(64, &|_| { hits[1].fetch_add(1, Ordering::Relaxed); }));
+            s.spawn(|| each_view(true, 64, &|_| { hits[2].fetch_add(1, Ordering::Relaxed); }));
+            s.spawn(|| each_view(false, 64, &|_| { hits[3].fetch_add(1, Ordering::Relaxed); }));
+        });
+        for (idx, h) in hits.iter().enumerate() {
+            assert_eq!(h.load(Ordering::Relaxed), 64, "caller {idx}");
+        }
+    }
+
+    #[test]
+    fn tier1_workers_run_at_normal_priority() {
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadPriority, THREAD_PRIORITY_NORMAL};
+        let bad = AtomicUsize::new(0);
+        each(32, &|_| {
+            if IN_TIER1_WORKER.get() {
+                // SAFETY: queries only the calling worker thread's priority.
+                let p = unsafe { GetThreadPriority(GetCurrentThread()) };
+                if p != THREAD_PRIORITY_NORMAL {
+                    bad.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        });
+        assert_eq!(bad.load(Ordering::Relaxed), 0);
+    }
+}

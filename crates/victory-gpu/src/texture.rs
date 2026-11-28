@@ -77,6 +77,9 @@ pub(crate) struct Staging {
     /// Whether this staging buffer holds raw tiled bytes to be detiled on the
     /// GPU during `PreludeUpload::record` (`VICTORY_GPU_DETILE=1`).
     gpu_detile: bool,
+    /// Whether `record_gpu_detiled` has already emitted the first-upload
+    /// aliasing barrier for this pooled texture.
+    gpu_detile_aliased: std::sync::atomic::AtomicBool,
     memory: *const u8,
     last: Mutex<Last>,
     /// Whether the staging buffer was detiled since a list's prelude last
@@ -699,37 +702,35 @@ pub(crate) fn let_go() -> [u64; 2] {
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
-    if STAGING_COUNT.load(Ordering::Acquire) == 0 {
-        return;
-    }
-    let mut map = STAGING.write().unwrap_or_else(|e| e.into_inner());
-    let Some(map) = map.as_mut() else {
-        return;
-    };
-    if map.is_empty() {
-        return;
-    }
-    let idle_ms = crate::host::ram_idle_ms(crate::residency::headroom());
-    // A list that recorded an upload or a check holds the staging until it
-    // is reset: one only the table holds is named by no list, recorded or
-    // running.
-    let (mut went, mut bytes) = (0u64, 0u64);
-    map.retain(|_, s| {
-        let keep = Arc::strong_count(s) > 1
-            || !crate::host::long_ago(s.used.load(Relaxed), idle_ms, IDLE_FRAMES);
-        if !keep {
-            LET_GO[0].fetch_add(1, Relaxed);
-            LET_GO[1].fetch_add(s.bytes, Relaxed);
-            went += 1;
-            bytes += s.bytes;
+    if STAGING_COUNT.load(Ordering::Acquire) > 0 {
+        let mut guard = STAGING.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(map) = guard.as_mut()
+            && !map.is_empty()
+        {
+            let idle_ms = crate::host::ram_idle_ms(crate::residency::headroom());
+            // A list that recorded an upload or a check holds the staging until it
+            // is reset: one only the table holds is named by no list, recorded or
+            // running.
+            let (mut went, mut bytes) = (0u64, 0u64);
+            map.retain(|_, s| {
+                let keep = Arc::strong_count(s) > 1
+                    || !crate::host::long_ago(s.used.load(Relaxed), idle_ms, IDLE_FRAMES);
+                if !keep {
+                    LET_GO[0].fetch_add(1, Relaxed);
+                    LET_GO[1].fetch_add(s.bytes, Relaxed);
+                    went += 1;
+                    bytes += s.bytes;
+                }
+                keep
+            });
+            if went > 0 {
+                STAGING_COUNT.store(map.len(), Ordering::Release);
+                STAGING_EPOCH.fetch_add(1, Ordering::Release);
+                crate::host::trail(|| format!("sweep: {went} staging buffers of textures let go ({} KiB), held by no list", bytes >> 10));
+            }
         }
-        keep
-    });
-    if went > 0 {
-        STAGING_COUNT.store(map.len(), Ordering::Release);
-        STAGING_EPOCH.fetch_add(1, Ordering::Release);
-        crate::host::trail(|| format!("sweep: {went} staging buffers of textures let go ({} KiB), held by no list", bytes >> 10));
     }
+    crate::tiles::sweep_demotions();
 }
 
 /// Textures the host GPU wrote by a copy or resolve: their contents are on
@@ -1028,6 +1029,12 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     if !list.first_use(resource as usize) && staged_from(resource) <= first {
         return;
     }
+    // Under `VICTORY_HEAP_WORKER=1`, `host.mirror()` runs at batch publish
+    // rather than before upload recording; request the needed mip level here
+    // so a clamped or lower-mip host copy grows before staging.
+    if crate::resource::held_only() {
+        crate::resource::want_level(resource, first);
+    }
     let Some(copy) = crate::resource::host_copy(resource) else {
         return;
     };
@@ -1049,6 +1056,18 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     let now = crate::host::moment();
     if staging.used.load(Relaxed) != now {
         staging.used.store(now, Relaxed);
+    }
+    // Levels on demand (`crate::tiles`): touch recency for tier-2 mip-tail
+    // demotion and immediately re-promote if this texture was demoted while idle
+    // so active close-up Series X textures always render at full resolution.
+    if staging.on_demand
+        && let Some(tiled) = copy.tiled.as_ref()
+    {
+        tiled.touch(now);
+        crate::tiles::register_candidate(copy.serial, &copy, staging.memory as u64, resource as usize);
+        if tiled.promote() {
+            staging.dirty.store(true, Relaxed);
+        }
     }
     // Levels on demand: a view of the texture now starts at another
     // level, or another texture now starts inside its span, with no byte
@@ -1349,8 +1368,8 @@ impl PreludeUpload {
     }
 
     /// Dispatches the native compute detiler from `self.staging.buffer` (raw
-    /// tiled bytes) into a shared device-local UAV scratch buffer, then copies
-    /// the selected subresources VRAM-to-VRAM into `texture`.
+    /// tiled bytes) into a ring-buffered device-local UAV scratch slice, then
+    /// copies the selected subresources VRAM-to-VRAM into `texture`.
     fn record_gpu_detiled(
         &self,
         cmd_list: &ID3D12GraphicsCommandList,
@@ -1359,11 +1378,6 @@ impl PreludeUpload {
         sub_count: usize,
     ) {
         let Some(host) = host() else {
-            return;
-        };
-        let scratch_len = self.staging.linear_bytes.next_multiple_of(4).max(4);
-        let Some(scratch) = crate::gpu_detile::shared_scratch(host, scratch_len) else {
-            once!("gpu detile: no device-local scratch buffer");
             return;
         };
         let held = if self.staging.on_demand {
@@ -1403,53 +1417,27 @@ impl PreludeUpload {
         }
         // SAFETY: live staging upload buffer.
         let src_va = unsafe { self.staging.buffer.GetGPUVirtualAddress() } + self.staging.base;
-        let common = D3D12_RESOURCE_STATE_COMMON;
-        let uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-        let copy_src = D3D12_RESOURCE_STATE_COPY_SOURCE;
-        // SAFETY: open prelude direct list; `scratch` rests in COMMON between uses.
-        unsafe {
-            cmd_list.ResourceBarrier(&[crate::host::transition(&scratch, common, uav)]);
-        }
-        let ok = crate::gpu_detile::record_detile_subresources(
+        let need_alias = crate::pool::on()
+            && !self
+                .staging
+                .gpu_detile_aliased
+                .swap(true, std::sync::atomic::Ordering::AcqRel);
+        let ok = crate::gpu_detile::record_prelude_detile(
+            host,
             cmd_list,
             &self.staging.layout,
             src_va,
             self.staging.read as u64,
-            &scratch,
-            self.staging.linear_bytes,
+            texture,
+            self.staging.first - self.staging.level0,
+            &self.staging.footprints,
             &jobs,
+            &indices,
+            self.staging.linear_bytes,
+            need_alias,
         );
         if !ok {
-            // SAFETY: restore COMMON state before returning.
-            unsafe {
-                cmd_list.ResourceBarrier(&[crate::host::transition(&scratch, uav, common)]);
-            }
             once!("gpu detile dispatch validation failed; skipping texture upload");
-            return;
-        }
-        // SAFETY: open prelude direct list; transition UAV output to COPY_SOURCE,
-        // copy selected subresources into `texture`, then restore COMMON.
-        unsafe {
-            cmd_list.ResourceBarrier(&[crate::host::transition(&scratch, uav, copy_src)]);
-            for i in indices {
-                let footprint = &self.staging.footprints[i];
-                let to = D3D12_TEXTURE_COPY_LOCATION {
-                    pResource: std::mem::transmute_copy(texture),
-                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                        SubresourceIndex: self.staging.first - self.staging.level0 + i as u32,
-                    },
-                };
-                let from = D3D12_TEXTURE_COPY_LOCATION {
-                    pResource: std::mem::transmute_copy(&scratch),
-                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                        PlacedFootprint: *footprint,
-                    },
-                };
-                cmd_list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
-            }
-            cmd_list.ResourceBarrier(&[crate::host::transition(&scratch, copy_src, common)]);
         }
     }
 }
@@ -2491,7 +2479,9 @@ pub(crate) fn unchanged(resource: This, first: u32) -> bool {
         return false;
     };
     let layout = &layout.planes[0].layout;
-    if from > crate::resource::read_from(layout, first).max(copy.base) {
+    let wanted = crate::resource::read_from(layout, first);
+    let target = crate::resource::base_level_for(&desc, first);
+    if copy.base > target || from > wanted.max(target) {
         return false;
     }
     let size = layout.bytes_from(from) as usize;
@@ -2810,7 +2800,11 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
     let d = unsafe { texture.GetDesc() };
     let level0 = copy.base;
     let mips = level0 + u32::from(d.MipLevels);
-    let first = crate::resource::read_from(&layout, first).max(level0).min(mips - 1);
+    let first = if copy.grown.load(Ordering::Relaxed) {
+        level0
+    } else {
+        crate::resource::read_from(&layout, first).max(level0).min(mips - 1)
+    };
     let read = layout.bytes_from(first) as usize;
     let count = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
         mips - first
@@ -2884,6 +2878,7 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         bytes: alloc_bytes,
         linear_bytes: total,
         gpu_detile: use_gpu_detile,
+        gpu_detile_aliased: std::sync::atomic::AtomicBool::new(false),
         memory,
         last: Mutex::default(),
         dirty: std::sync::atomic::AtomicBool::new(true),
@@ -3490,6 +3485,7 @@ mod prelude_upload_tests {
             bytes: 0,
             linear_bytes: 0,
             gpu_detile: false,
+            gpu_detile_aliased: AtomicBool::new(false),
             memory: std::ptr::null(),
             last: std::sync::Mutex::default(),
             dirty: AtomicBool::new(false),

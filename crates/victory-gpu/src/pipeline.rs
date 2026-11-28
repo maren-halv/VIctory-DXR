@@ -17,11 +17,280 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::collections::HashMap;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::mem::offset_of;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, PIPELINE, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
+
+/// 16-character lowercase hex shader hash stored inline (zero heap allocation).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct Hex16([u8; 16]);
+
+impl Hex16 {
+    pub(crate) fn from_hash(full: &blake3::Hash) -> Self {
+        let hex = full.to_hex();
+        let mut out = [0u8; 16];
+        out.copy_from_slice(&hex.as_bytes()[..16]);
+        Self(out)
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        // SAFETY: `self.0` contains only ASCII hex digits.
+        unsafe { std::str::from_utf8_unchecked(&self.0) }
+    }
+}
+
+impl std::ops::Deref for Hex16 {
+    type Target = str;
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::fmt::Display for Hex16 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::fmt::Debug for Hex16 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Formats a 16-byte pipeline key as 32 lowercase ASCII hex bytes on the stack.
+#[cfg(windows)]
+pub(crate) fn key_hex(key: &[u8; 16]) -> [u8; 32] {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = [0u8; 32];
+    for (i, &b) in key.iter().enumerate() {
+        out[2 * i] = HEX[usize::from(b >> 4)];
+        out[2 * i + 1] = HEX[usize::from(b & 0xf)];
+    }
+    out
+}
+
+#[cfg(windows)]
+pub(crate) fn key_hex_str(buf: &[u8; 32]) -> &str {
+    // SAFETY: `key_hex` produces only ASCII hex digits.
+    unsafe { std::str::from_utf8_unchecked(buf) }
+}
+
+/// Parses a 32-character hex pipeline key into 16 inline bytes.
+#[cfg(windows)]
+pub(crate) fn parse_key_hex(s: &str) -> Option<[u8; 16]> {
+    let bytes = s.as_bytes();
+    if bytes.len() != 32 {
+        return None;
+    }
+    let hex_val = |b: u8| match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    };
+    let mut out = [0u8; 16];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let hi = hex_val(bytes[2 * i])?;
+        let lo = hex_val(bytes[2 * i + 1])?;
+        *slot = (hi << 4) | lo;
+    }
+    Some(out)
+}
+
+/// Precomputed container flags evaluated once while the raw `.cdxil` bytes are
+/// in hand so `CreatePipelineState` never needs to read back from disk.
+pub(crate) const FLAG_BUILDER: u8 = 1 << 0;
+pub(crate) const FLAG_RT_RESOLVE: u8 = 1 << 1;
+pub(crate) const FLAG_ACTIVATE_RAYS: u8 = 1 << 2;
+pub(crate) const FLAG_LOCAL_LIGHTS: u8 = 1 << 3;
+
+const PACK_MAGIC: [u8; 4] = *b"VCP1";
+const PACK_HEADER_LEN: usize = 4 + 32 + 4;
+const PACK_FILE: &str = "shader-containers.pack";
+
+/// Append-only, deduplicated on-disk pack of raw `.cdxil` containers so
+/// `SHADERS` does not retain ~220 MB of raw containers in RAM forever.
+struct ContainerPack {
+    read: std::fs::File,
+    writer: Mutex<PackWriter>,
+}
+
+struct PackWriter {
+    file: std::fs::File,
+    end: u64,
+    index: HashMap<[u8; 32], (u64, u32)>,
+}
+
+impl ContainerPack {
+    fn open(dir: &std::path::Path) -> Option<Self> {
+        if std::env::var_os("VICTORY_CONTAINER_PACK").is_some_and(|v| v == "0") {
+            return None;
+        }
+        std::fs::create_dir_all(dir).ok()?;
+        let path = dir.join(PACK_FILE);
+        // Exclusive writer share mode (`FILE_SHARE_READ = 1`) ensures only one
+        // process appends to the pack at a time; concurrent helper processes
+        // (e.g. `victory warm` children) cleanly fall back to inline buffers.
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true).write(true).create(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_SHARE_READ: u32 = 1;
+            opts.share_mode(FILE_SHARE_READ);
+        }
+        let mut write_file = opts.open(&path).ok()?;
+        let file_len = write_file.metadata().ok()?.len();
+        let mut index = HashMap::new();
+        let mut at = 0u64;
+        {
+            let mut reader = std::io::BufReader::new(&mut write_file);
+            let mut head = [0u8; PACK_HEADER_LEN];
+            while reader.read_exact(&mut head).is_ok() {
+                if head[0..4] != PACK_MAGIC {
+                    break;
+                }
+                let len = u32::from_le_bytes([head[36], head[37], head[38], head[39]]);
+                let next = at.saturating_add(PACK_HEADER_LEN as u64).saturating_add(u64::from(len));
+                if next > file_len || reader.seek_relative(i64::from(len)).is_err() {
+                    break;
+                }
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(&head[4..36]);
+                index.insert(hash, (at + PACK_HEADER_LEN as u64, len));
+                at = next;
+            }
+        }
+        if file_len > at {
+            let _ = write_file.set_len(at);
+        }
+        write_file.seek(SeekFrom::Start(at)).ok()?;
+        let read = {
+            let mut ropts = std::fs::OpenOptions::new();
+            ropts.read(true);
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                // Must share read+write with our own writer handle.
+                ropts.share_mode(1 | 2);
+            }
+            ropts.open(&path).ok()?
+        };
+        tracing::info!(
+            entries = index.len(),
+            bytes = at,
+            path = %path.display(),
+            "shader container pack ready"
+        );
+        Some(Self {
+            read,
+            writer: Mutex::new(PackWriter {
+                file: write_file,
+                end: at,
+                index,
+            }),
+        })
+    }
+
+    fn spill(&self, hash: [u8; 32], bytes: &[u8]) -> Option<(u64, u32)> {
+        let len = u32::try_from(bytes.len()).ok()?;
+        let mut w = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(&(off, existing_len)) = w.index.get(&hash)
+            && existing_len == len
+        {
+            return Some((off, len));
+        }
+        let mut head = [0u8; PACK_HEADER_LEN];
+        head[0..4].copy_from_slice(&PACK_MAGIC);
+        head[4..36].copy_from_slice(&hash);
+        head[36..40].copy_from_slice(&len.to_le_bytes());
+        let start = w.end;
+        if w.file.seek(SeekFrom::Start(start)).is_err()
+            || w.file.write_all(&head).is_err()
+            || w.file.write_all(bytes).is_err()
+        {
+            let _ = w.file.set_len(start);
+            return None;
+        }
+        let payload_offset = start + PACK_HEADER_LEN as u64;
+        w.end = payload_offset + u64::from(len);
+        w.index.insert(hash, (payload_offset, len));
+        Some((payload_offset, len))
+    }
+
+    fn read_at(&self, offset: u64, len: u32) -> Option<Vec<u8>> {
+        let mut buf = vec![0u8; len as usize];
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::FileExt;
+            let mut filled = 0usize;
+            while filled < buf.len() {
+                let n = self
+                    .read
+                    .seek_read(&mut buf[filled..], offset + filled as u64)
+                    .ok()?;
+                if n == 0 {
+                    return None;
+                }
+                filled += n;
+            }
+            Some(buf)
+        }
+        #[cfg(not(windows))]
+        {
+            let mut file = self.read.try_clone().ok()?;
+            file.seek(SeekFrom::Start(offset)).ok()?;
+            file.read_exact(&mut buf).ok()?;
+            Some(buf)
+        }
+    }
+}
+
+static CONTAINER_PACK: Mutex<Option<Option<Arc<ContainerPack>>>> = Mutex::new(None);
+
+fn container_pack() -> Option<Arc<ContainerPack>> {
+    let mut slot = CONTAINER_PACK.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(existing) = slot.as_ref() {
+        return existing.clone();
+    }
+    #[cfg(windows)]
+    let dir = crate::shader_cache::dir()
+        .map(PathBuf::from)
+        .or_else(library::folder);
+    #[cfg(not(windows))]
+    let dir: Option<PathBuf> = None;
+    let Some(dir) = dir else {
+        // Cache dir not configured yet (e.g. unit tests); do not latch None
+        // permanently in case `use_shader_cache` is called later.
+        return None;
+    };
+    let opened = ContainerPack::open(&dir).map(Arc::new);
+    *slot = Some(opened.clone());
+    opened
+}
+
+enum ContainerBacking {
+    Packed {
+        pack: Arc<ContainerPack>,
+        offset: u64,
+        len: u32,
+    },
+    Inline(Vec<u8>),
+}
+
+impl ContainerBacking {
+    fn read(&self) -> Option<Vec<u8>> {
+        match self {
+            Self::Packed { pack, offset, len } => pack.read_at(*offset, *len),
+            Self::Inline(bytes) => Some(bytes.clone()),
+        }
+    }
+}
 
 const PIPELINE_IIDS: [Iid; 4] = [
     guid(
@@ -55,17 +324,32 @@ pub(crate) struct ComputeHead {
 }
 
 /// A shader container a title passed, shared by every pipeline with the
-/// same bytes.
+/// same bytes. Raw `.cdxil` containers spill to `shader-containers.pack` when
+/// a writable cache dir is configured, keeping zero raw container bytes in RAM.
 pub(crate) struct Shader {
     pub(crate) stage: &'static str,
-    /// The first 8 bytes of its BLAKE3, as logged.
-    pub(crate) hash: String,
-    container: Vec<u8>,
+    /// The first 8 bytes of its BLAKE3, as logged (inline, zero heap alloc).
+    pub(crate) hash: Hex16,
+    pub(crate) full_hash: [u8; 32],
+    /// Raw container byte length (kept inline for logging without reading disk).
+    pub(crate) size: u32,
+    flags: u8,
+    container: ContainerBacking,
     /// Its part in the stand-in for the indirect light.
     #[cfg(windows)]
     pub(crate) ambient: Option<crate::ambient::Role>,
     #[cfg(windows)]
-    translated: OnceLock<Option<Translated>>,
+    translated: OnceLock<Option<Box<Translated>>>,
+}
+
+impl Shader {
+    pub(crate) fn has_flag(&self, bit: u8) -> bool {
+        (self.flags & bit) != 0
+    }
+
+    pub(crate) fn container_bytes(&self) -> Option<Vec<u8>> {
+        self.container.read()
+    }
 }
 
 impl std::fmt::Debug for Shader {
@@ -77,8 +361,8 @@ impl std::fmt::Debug for Shader {
 /// Every container seen, by full content hash.
 static SHADERS: Mutex<Option<HashMap<[u8; 32], Arc<Shader>>>> = Mutex::new(None);
 
-/// For the memory lines: containers kept and their bytes, translations
-/// kept and the bytes of their host code. None of them is ever let go.
+/// For the memory lines: containers kept and their resident RAM bytes,
+/// translations kept and their resident metadata bytes.
 static KEPT: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// What the shader table and the pipeline library keep in memory:
@@ -100,22 +384,78 @@ pub(crate) fn kept() -> [u64; 7] {
     ]
 }
 
+fn compute_container_flags(stage: &'static str, bytes: &[u8]) -> u8 {
+    if stage != "compute" {
+        return 0;
+    }
+    let mut flags = 0u8;
+    if bytes.windows(b"CS_RaytracingResolve".len()).any(|w| w == b"CS_RaytracingResolve") {
+        flags |= FLAG_RT_RESOLVE;
+    }
+    if bytes
+        .windows(b"CS_ScreenProbes_ActivateRays".len())
+        .any(|w| w == b"CS_ScreenProbes_ActivateRays")
+    {
+        flags |= FLAG_ACTIVATE_RAYS;
+    }
+    if bytes
+        .windows(b"CS_GatherRaymarchedLocalLightsClassified".len())
+        .any(|w| w == b"CS_GatherRaymarchedLocalLightsClassified")
+    {
+        flags |= FLAG_LOCAL_LIGHTS;
+    }
+    #[cfg(windows)]
+    {
+        use victory_shader::{Container, FourCC};
+        if let Ok(c) = Container::parse(bytes)
+            && c.part(FourCC::DXIL)
+                .and_then(|part| victory_shader::native_programs(part.data).ok())
+                .is_some_and(|programs| programs.iter().any(victory_shader::spill::is_spilled))
+        {
+            flags |= FLAG_BUILDER;
+        }
+    }
+    flags
+}
+
 /// The shared container for `bytes`.
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let full = blake3::hash(bytes);
+    let full_bytes = *full.as_bytes();
+    {
+        let shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = shaders.as_ref().and_then(|m| m.get(&full_bytes)) {
+            return existing.clone();
+        }
+    }
+    let flags = compute_container_flags(stage, bytes);
+    #[cfg(windows)]
+    let ambient = (stage == "compute")
+        .then(|| crate::ambient::role(bytes))
+        .flatten();
+    let (container, ram_bytes) = if let Some(pack) = container_pack()
+        && let Some((offset, len)) = pack.spill(full_bytes, bytes)
+    {
+        (ContainerBacking::Packed { pack, offset, len }, 0u64)
+    } else {
+        (ContainerBacking::Inline(bytes.to_vec()), bytes.len() as u64)
+    };
     let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
     shaders
         .get_or_insert_with(HashMap::new)
-        .entry(*full.as_bytes())
+        .entry(full_bytes)
         .or_insert_with(|| {
             KEPT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            KEPT[1].fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            KEPT[1].fetch_add(ram_bytes, std::sync::atomic::Ordering::Relaxed);
             Arc::new(Shader {
                 stage,
-                hash: full.to_hex()[..16].to_owned(),
-                container: bytes.to_vec(),
+                hash: Hex16::from_hash(&full),
+                full_hash: full_bytes,
+                size: bytes.len().min(u32::MAX as usize) as u32,
+                flags,
+                container,
                 #[cfg(windows)]
-                ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
+                ambient,
                 #[cfg(windows)]
                 translated: OnceLock::new(),
             })
@@ -123,10 +463,48 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         .clone()
 }
 
-/// A translated shader and the console resources its code reads.
+/// Compact resident metadata of a translated host shader: zero `.dxil` bytes
+/// retained in RAM, zero disk I/O on draw threads.
+#[cfg(windows)]
+pub(crate) struct HostMeta {
+    pub(crate) user_data: Vec<victory_shader::emit::UserData>,
+    pub(crate) static_samplers: Vec<victory_shader::emit::StaticSampler>,
+    pub(crate) root_cbvs: Vec<u8>,
+    pub(crate) root_srvs: Vec<u8>,
+    pub(crate) root_uavs: Vec<u8>,
+    pub(crate) half_views: Vec<(u8, u32)>,
+}
+
+#[cfg(windows)]
+impl HostMeta {
+    pub(crate) fn user_data_dwords(&self) -> u32 {
+        let n = self
+            .user_data
+            .iter()
+            .map(|u| u.index + 1)
+            .max()
+            .unwrap_or(0);
+        n.next_multiple_of(4)
+    }
+
+    fn resident_bytes(&self) -> usize {
+        self.user_data.len() * size_of::<victory_shader::emit::UserData>()
+            + self.static_samplers.len() * size_of::<victory_shader::emit::StaticSampler>()
+            + self.root_cbvs.len()
+            + self.root_srvs.len()
+            + self.root_uavs.len()
+            + self.half_views.len() * size_of::<(u8, u32)>()
+    }
+}
+
+/// Resident metadata of a translated shader and the console resources its code
+/// reads. Compiled `.dxil` bytecode is dropped immediately after `HostPipeline`
+/// creation and transiently reloaded from `shader_cache` only if another PSO
+/// uses the same shader or a dormant PSO is re-materialized.
 #[cfg(windows)]
 pub(crate) struct Translated {
-    pub(crate) host: victory_shader::emit::HostShader,
+    pub(crate) host: HostMeta,
+    dxil_cache_path: Option<PathBuf>,
     /// A compute program's threads in a group.
     pub(crate) threads: Option<[u32; 3]>,
     pub(crate) used: Vec<victory_shader::UsedResource>,
@@ -143,45 +521,90 @@ pub(crate) struct Translated {
 
 #[cfg(windows)]
 impl Shader {
-    /// The translation, made on first use; a shader that does not
-    /// translate is logged once.
+    /// The resident translation metadata, made on first use; zero disk I/O
+    /// once initialized. A shader that does not translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {
-        self.translated
-            .get_or_init(|| {
-                let done = translate(&self.container);
-                // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
-                // translated (`.dxil`), by the hash crash reports name it with
-                if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {
-                    let dir = std::path::PathBuf::from(dir);
-                    let _ = std::fs::create_dir_all(&dir);
-                    let stem = format!("{}.{}", self.hash, self.stage);
-                    let _ = std::fs::write(dir.join(format!("{stem}.cdxil")), &self.container);
-                    if let Ok(t) = &done {
-                        let _ = std::fs::write(dir.join(format!("{stem}.dxil")), &t.host.dxil);
-                    }
+        if let Some(existing) = self.translated.get() {
+            return existing.as_deref();
+        }
+        self.init_translated().0
+    }
+
+    /// Returns resident translation metadata plus transient `.dxil` bytecode
+    /// for `HostPipeline::new`. On first translation, returns the freshly
+    /// produced `dxil` directly without an extra disk read; on subsequent PSOs
+    /// or dormant re-materialization, reloads only `dxil` from `shader_cache`.
+    pub(crate) fn translate_with_dxil(&self) -> Option<(&Translated, Vec<u8>)> {
+        let (meta, initial_dxil) = self.init_translated();
+        let meta = meta?;
+        if let Some(dxil) = initial_dxil {
+            return Some((meta, dxil));
+        }
+        if let Some(path) = meta.dxil_cache_path.as_deref()
+            && let Some(dxil) = crate::shader_cache::load_dxil_only(path)
+        {
+            return Some((meta, dxil));
+        }
+        let container = self.container_bytes()?;
+        let host = crate::shader_cache::host_shader(&container).ok()?;
+        Some((meta, host.dxil))
+    }
+
+    fn init_translated(&self) -> (Option<&Translated>, Option<Vec<u8>>) {
+        if let Some(existing) = self.translated.get() {
+            return (existing.as_deref(), None);
+        }
+        let mut transient_dxil: Option<Vec<u8>> = None;
+        let slot = self.translated.get_or_init(|| {
+            let Some(container) = self.container_bytes() else {
+                tracing::warn!(
+                    stage = self.stage,
+                    hash = %self.hash,
+                    "shader container could not be read back from pack"
+                );
+                return None;
+            };
+            let done = translate(&container);
+            // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
+            // translated (`.dxil`), by the hash crash reports name it with
+            if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {
+                let dir = PathBuf::from(dir);
+                let _ = std::fs::create_dir_all(&dir);
+                let stem = format!("{}.{}", self.hash, self.stage);
+                let _ = std::fs::write(dir.join(format!("{stem}.cdxil")), &container);
+                if let Ok((_, dxil)) = &done {
+                    let _ = std::fs::write(dir.join(format!("{stem}.dxil")), dxil);
                 }
-                if let Ok(t) = &done {
+            }
+            match done {
+                Ok((t, dxil)) => {
                     KEPT[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    KEPT[3].fetch_add(t.host.dxil.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                }
-                match &done {
-                    Ok(t) => tracing::info!(
+                    KEPT[3].fetch_add(
+                        t.host.resident_bytes() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    tracing::info!(
                         stage = self.stage,
                         hash = %self.hash,
                         user_data = t.host.user_data.len(),
-                        samplers = t.host.samplers.len(),
+                        static_samplers = t.host.static_samplers.len(),
                         "shader translated"
-                    ),
-                    Err(e) => tracing::warn!(
+                    );
+                    transient_dxil = Some(dxil);
+                    Some(Box::new(t))
+                }
+                Err(e) => {
+                    tracing::warn!(
                         stage = self.stage,
                         hash = %self.hash,
                         error = %e,
                         "shader does not translate; its pipelines' draws are dropped"
-                    ),
+                    );
+                    None
                 }
-                done.ok()
-            })
-            .as_ref()
+            }
+        });
+        (slot.as_deref(), transient_dxil)
     }
 }
 
@@ -190,14 +613,15 @@ impl Shader {
     /// The console programs of the container; `None` if they are not known.
     pub(crate) fn programs(&self) -> Option<Vec<victory_shader::NativeProgram>> {
         use victory_shader::{Container, FourCC};
-        let c = Container::parse(&self.container).ok()?;
+        let container = self.container_bytes()?;
+        let c = Container::parse(&container).ok()?;
         let part = c.part(FourCC::DXIL).or(c.part(FourCC::ACCC))?;
         victory_shader::native_programs(part.data).ok()
     }
 }
 
 #[cfg(windows)]
-fn translate(container: &[u8]) -> Result<Translated, String> {
+fn translate(container: &[u8]) -> Result<(Translated, Vec<u8>), String> {
     use victory_shader::{Container, FourCC, HwStage};
     // The translation depends on it (a view index past a capped heap).
     crate::descriptor::host::probe_view_limit();
@@ -206,7 +630,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
         None => Vec::new(),
     };
-    let host = crate::shader_cache::host_shader(container)?;
+    let (host, dxil_cache_path) = crate::shader_cache::host_shader_with_path(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
     let threads = programs.iter().find_map(|p| match &p.io {
         victory_shader::native::StageIo::Cs(cs) if cs.threads.iter().all(|&n| n > 0) => Some(cs.threads),
@@ -224,15 +648,28 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         .map(|p| p.used)
         .unwrap_or_default();
     let tables = crate::draw::TablePlan::new(&used, &host.root_indexed_views);
-    Ok(Translated {
-        host,
-        threads,
-        used,
-        tables,
-        stores,
-        stores_by_address,
-        picks: Default::default(),
-    })
+    let dxil = host.dxil;
+    let meta = HostMeta {
+        user_data: host.user_data,
+        static_samplers: host.static_samplers,
+        root_cbvs: host.root_cbvs,
+        root_srvs: host.root_srvs,
+        root_uavs: host.root_uavs,
+        half_views: host.half_views,
+    };
+    Ok((
+        Translated {
+            host: meta,
+            dxil_cache_path,
+            threads,
+            used,
+            tables,
+            stores,
+            stores_by_address,
+            picks: Default::default(),
+        },
+        dxil,
+    ))
 }
 
 /// The compute pipelines of the console's ray-tracing structure builder
@@ -280,17 +717,8 @@ static BUILDER: Mutex<Builder> = Mutex::new(Builder {
 /// Whether `shaders` are a pipeline of the structure builder.
 #[cfg(windows)]
 fn of_builder(shaders: &[Arc<Shader>]) -> bool {
-    use victory_shader::{Container, FourCC};
     let [shader] = shaders else { return false };
-    if shader.stage != "compute" {
-        return false;
-    }
-    let Ok(c) = Container::parse(&shader.container) else {
-        return false;
-    };
-    c.part(FourCC::DXIL)
-        .and_then(|part| victory_shader::native_programs(part.data).ok())
-        .is_some_and(|programs| programs.iter().any(victory_shader::spill::is_spilled))
+    shader.has_flag(FLAG_BUILDER)
 }
 
 /// `VICTORY_BVH_QUARANTINE=1`: what the structure builder's stages store
@@ -420,19 +848,34 @@ fn stores_by_address(program: &victory_shader::NativeProgram) -> bool {
 struct Pipeline {
     object: Object,
     packet: [u32; 8],
-    /// Each used stage's container.
+    /// Each used stage's container (on Windows, shared with `host` to avoid
+    /// duplicating `Vec<Arc<Shader>>` across 84,000 pipelines).
+    #[cfg(not(windows))]
     shaders: Vec<Arc<Shader>>,
-    /// Whether a list has bound it yet (its shaders are logged then).
-    bound: std::sync::atomic::AtomicBool,
     /// What its host pipeline is made from, and the host pipeline once made
     /// (by a worker: the title may release the pipeline meanwhile).
     #[cfg(windows)]
     host: Arc<make::Pending>,
+    /// Whether a list has bound it yet (its shaders are logged then).
+    bound: std::sync::atomic::AtomicBool,
     /// One of the ray-tracing structure builder's ([`Builder`]).
     #[cfg(windows)]
     builder: bool,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
+
+impl Pipeline {
+    fn shaders(&self) -> &[Arc<Shader>] {
+        #[cfg(windows)]
+        {
+            self.host.shaders()
+        }
+        #[cfg(not(windows))]
+        {
+            &self.shaders
+        }
+    }
+}
 
 /// Stage names, in description order.
 const GRAPHICS_STAGES: [&str; 5] = ["vertex", "pixel", "domain", "hull", "geometry"];
@@ -453,8 +896,8 @@ pub(crate) fn bound(this: This) {
         return;
     }
     let frame = crate::frame::current();
-    for shader in &p.shaders {
-        tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.container.len(), hash = %shader.hash, "first bind");
+    for shader in p.shaders() {
+        tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.size, hash = %shader.hash, "first bind");
     }
 }
 
@@ -511,9 +954,9 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
     if hashes.is_empty() {
         return None;
     }
-    p.shaders
+    p.shaders()
         .iter()
-        .find(|shader| hashes.contains(&shader.hash))
+        .find(|shader| hashes.iter().any(|h| h == shader.hash.as_str()))
         .map(|shader| shader.hash.as_str())
 }
 
@@ -571,19 +1014,19 @@ fn copy(stage: &'static str, code: &Bytecode) -> Option<Arc<Shader>> {
 
 fn hand_out(
     shaders: Vec<Arc<Shader>>,
-    #[cfg(windows)] graphics: Option<Box<host::GraphicsState>>,
+    #[cfg(windows)] graphics: Option<Arc<host::GraphicsState>>,
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
     tracing::trace!(?shaders, "pipeline state");
     #[cfg(windows)]
-    let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
+    let builder = of_builder(&shaders);
     #[cfg(windows)]
-    known::note(host.key(), &shaders, host.graphics.as_deref());
+    let host = Arc::new(make::Pending::new(shaders, graphics, builder));
+    #[cfg(windows)]
+    known::note(host.key(), host.shaders(), host.graphics.as_deref());
     #[cfg(windows)]
     make::early(&host);
-    #[cfg(windows)]
-    let builder = of_builder(&shaders);
     #[cfg(windows)]
     if builder {
         // Another stage: the group is looked at again at its next dispatch.
@@ -594,11 +1037,12 @@ fn hand_out(
     let pipeline = Box::new(Pipeline {
         object: Object::new(&FUNCTIONS),
         packet: [0; 8],
+        #[cfg(not(windows))]
+        shaders,
         #[cfg(windows)]
         host,
         #[cfg(windows)]
         builder,
-        shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });
     object::hand_out(PIPELINE, pipeline, iid, &PIPELINE_IIDS, out)
@@ -742,7 +1186,7 @@ pub(crate) extern "system" fn create_stream(
     hand_out(
         shaders,
         #[cfg(windows)]
-        Some(Box::new(graphics)),
+        Some(graphics.intern()),
         iid,
         out,
     )
@@ -774,11 +1218,12 @@ mod library;
 #[cfg(windows)]
 mod make;
 
-/// Lets the pipeline library's mapped file go from memory when no pipeline
-/// has loaded for a while (`library::trim`); called by the host's sweep.
+/// Lets the pipeline library's mapped file go (or tears it down when idle)
+/// and evicts 60 s dormant non-pinned PSO COM objects; called by the host's sweep.
 #[cfg(windows)]
 pub(crate) fn trim_library() {
     library::trim();
+    make::evict_dormant();
 }
 
 /// The pipeline library's part of the report when the host device is
@@ -818,9 +1263,9 @@ mod tests {
 
     fn shaders(p: This) -> Vec<(&'static str, Vec<u8>)> {
         pipeline(p)
-            .shaders
+            .shaders()
             .iter()
-            .map(|s| (s.stage, s.container.clone()))
+            .map(|s| (s.stage, s.container_bytes().unwrap()))
             .collect()
     }
 
@@ -860,8 +1305,8 @@ mod tests {
         let mut q = std::ptr::null();
         create_graphics(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut q);
         assert!(Arc::ptr_eq(
-            &pipeline(p).shaders[1],
-            &pipeline(q).shaders[1]
+            &pipeline(p).shaders()[1],
+            &pipeline(q).shaders()[1]
         ));
         assert_eq!(slot::<extern "system" fn(This) -> u32>(p, 0x10)(p), 0);
     }
@@ -933,5 +1378,53 @@ mod tests {
         // Suppress-builder with BVH_BUILDER=0: rehydrate_via_builder allows rehydration dispatches.
         assert!(builder_allowed_for(None, true));
         assert!(builder_allowed_for(Some(OsStr::new("0")), true));
+    }
+
+    #[test]
+    fn container_pack_spills_dedups_reads_concurrently_and_truncates_torn_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let pack = Arc::new(ContainerPack::open(dir.path()).expect("open pack"));
+        let a = b"fake-cdxil-container-alpha-0123456789".as_slice();
+        let b = b"fake-cdxil-container-beta-9876543210abcdef".as_slice();
+        let ha = *blake3::hash(a).as_bytes();
+        let hb = *blake3::hash(b).as_bytes();
+
+        let (off_a, len_a) = pack.spill(ha, a).expect("spill a");
+        let (off_b, len_b) = pack.spill(hb, b).expect("spill b");
+        // Duplicate spill returns exact same offset without growing the file.
+        assert_eq!(pack.spill(ha, a), Some((off_a, len_a)));
+        assert_eq!(pack.read_at(off_a, len_a).as_deref(), Some(a));
+        assert_eq!(pack.read_at(off_b, len_b).as_deref(), Some(b));
+
+        // Concurrent positional reads return exact bytes.
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let p = pack.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..32 {
+                        assert_eq!(p.read_at(off_a, len_a).as_deref(), Some(a));
+                        assert_eq!(p.read_at(off_b, len_b).as_deref(), Some(b));
+                    }
+                })
+            })
+            .collect();
+        for r in readers {
+            r.join().unwrap();
+        }
+        drop(pack);
+
+        // Append a torn record tail and reopen: existing records survive and torn tail is cut.
+        let pack_path = dir.path().join(PACK_FILE);
+        let good_len = std::fs::metadata(&pack_path).unwrap().len();
+        {
+            let mut f = std::fs::OpenOptions::new().append(true).open(&pack_path).unwrap();
+            f.write_all(&PACK_MAGIC).unwrap();
+            f.write_all(&[0x55; 12]).unwrap();
+        }
+        let reopened = ContainerPack::open(dir.path()).expect("reopen pack");
+        assert_eq!(std::fs::metadata(&pack_path).unwrap().len(), good_len);
+        assert_eq!(reopened.spill(ha, a), Some((off_a, len_a)));
+        assert_eq!(reopened.read_at(off_a, len_a).as_deref(), Some(a));
+        assert_eq!(reopened.read_at(off_b, len_b).as_deref(), Some(b));
     }
 }

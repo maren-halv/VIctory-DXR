@@ -38,9 +38,12 @@ pub struct Site {
     pub bytes: &'static [u8],
 }
 
-/// The six record stores of the table fillers (the target executable
-/// 1.0.2.1, image offsets).
-pub const SITES: [Site; 6] = [
+/// The ten record/allocator stores of the title's heap writers
+/// (the target executable 1.0.2.1, image offsets):
+/// - 6 per-record `vmovups [base+index], ymm0` table fillers (`+0x4d9efd0`, `+0x4eec8e0`)
+/// - 1 4x32B block `vmovups [rbx+0x60..0x00], ymm3..0` store (`+0x4d9f25f`)
+/// - 3 heap-resident allocator/header stores (`+0x18849c`, `+0x4e9b4e2`, `+0x2474afc`)
+pub const SITES: [Site; 10] = [
     // +0x4d9efd0, loop 1: [rcx+rsi]
     Site { window: 0x4d9f04f, store: 10, len: 5, bytes: &[0x81, 0xe1, 0xe0, 0x7f, 0x00, 0x00, 0xc5, 0xfc, 0x10, 0x00, 0xc5, 0xfc, 0x11, 0x04, 0x31, 0x0f, 0xb6, 0x47, 0x0b, 0x39, 0xc5] },
     // loop 2: [rcx+rsi]
@@ -53,6 +56,63 @@ pub const SITES: [Site; 6] = [
     Site { window: 0x4eeca08, store: 10, len: 6, bytes: &[0x81, 0xe7, 0xe0, 0x7f, 0x00, 0x00, 0xc5, 0xfc, 0x10, 0x06, 0xc4, 0xa1, 0x7c, 0x11, 0x04, 0x07, 0x0f, 0xb6, 0x72, 0x0d, 0x39, 0xf0] },
     // loop 3: [r10+r8]
     Site { window: 0x4eeca82, store: 11, len: 6, bytes: &[0x41, 0x81, 0xe2, 0xe0, 0x7f, 0x00, 0x00, 0xc5, 0xfc, 0x10, 0x00, 0xc4, 0x81, 0x7c, 0x11, 0x04, 0x02, 0x0f, 0xb6, 0x42, 0x0f, 0x41, 0x39, 0xc6] },
+    // +0x4d9f25f: 4x32B block copy `vmovups [rbx+0x60..0x00], ymm3..0` (4 contiguous slots)
+    Site {
+        window: 0x4d9f24a,
+        store: 21,
+        len: 19,
+        bytes: &[
+            0xc4, 0xc1, 0x7c, 0x10, 0x4c, 0x24, 0x20, // vmovups ymm1, [r12+0x20]
+            0xc4, 0xc1, 0x7c, 0x10, 0x54, 0x24, 0x40, // vmovups ymm2, [r12+0x40]
+            0xc4, 0xc1, 0x7c, 0x10, 0x5c, 0x24, 0x60, // vmovups ymm3, [r12+0x60]
+            0xc5, 0xfc, 0x11, 0x5b, 0x60, // vmovups [rbx+0x60], ymm3
+            0xc5, 0xfc, 0x11, 0x53, 0x40, // vmovups [rbx+0x40], ymm2
+            0xc5, 0xfc, 0x11, 0x4b, 0x20, // vmovups [rbx+0x20], ymm1
+            0xc5, 0xfc, 0x11, 0x03, // vmovups [rbx], ymm0
+            0x4c, 0x89, 0xf9, // mov rcx, r15
+            0x48, 0x89, 0xf2, // mov rdx, rsi
+            0x49, 0x89, 0xd8, // mov r8, rbx
+            0x45, 0x31, 0xc9, // xor r9d, r9d
+        ],
+    },
+    // +0x18849c: `mov [rbx], rdx ; mov [rcx+rax+0x48], rbx`
+    Site {
+        window: 0x188493,
+        store: 9,
+        len: 8,
+        bytes: &[
+            0x48, 0x89, 0x57, 0x10, // mov [rdi+0x10], rdx
+            0x48, 0x8b, 0x54, 0x01, 0x48, // mov rdx, [rcx+rax+0x48]
+            0x48, 0x89, 0x13, // mov [rbx], rdx
+            0x48, 0x89, 0x5c, 0x01, 0x48, // mov [rcx+rax+0x48], rbx
+            0x48, 0xba, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, // movabs rdx, 0xffffffff00000000
+        ],
+    },
+    // +0x4e9b4e2: `mov qword ptr [r14], 0`
+    Site {
+        window: 0x4e9b4da,
+        store: 8,
+        len: 7,
+        bytes: &[
+            0x4d, 0x8d, 0x74, 0x07, 0xe8, // lea r14, [r15+rax-0x18]
+            0x48, 0x89, 0xd9, // mov rcx, rbx
+            0x49, 0xc7, 0x06, 0x00, 0x00, 0x00, 0x00, // mov qword ptr [r14], 0
+            0x49, 0x89, 0x5e, 0x08, // mov [r14+8], rbx
+        ],
+    },
+    // +0x2474afc: `mov [rbx], rdx ; mov [rcx+rax+0x48], rbx`
+    Site {
+        window: 0x2474af3,
+        store: 9,
+        len: 8,
+        bytes: &[
+            0x48, 0x89, 0x57, 0x10, // mov [rdi+0x10], rdx
+            0x48, 0x8b, 0x54, 0x01, 0x48, // mov rdx, [rcx+rax+0x48]
+            0x48, 0x89, 0x13, // mov [rbx], rdx
+            0x48, 0x89, 0x5c, 0x01, 0x48, // mov [rcx+rax+0x48], rbx
+            0x48, 0xba, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, // movabs rdx, 0xffffffff00000000
+        ],
+    },
 ];
 
 /// `lea rax, [base+index]` for a `vmovups [base+index], ymm0` (VEX, ModRM
@@ -81,26 +141,120 @@ fn lea_of(store: &[u8]) -> Option<[u8; 4]> {
     Some([0x48 | u8::from(x) << 1 | u8::from(b), 0x8d, 0x04, sib])
 }
 
+/// Decoded target address expression for a hooked store instruction sequence.
+enum StoreTarget {
+    /// `vmovups [base+index], ymm0`: 4-byte `lea rax, [base+index]` (flags may be clobbered).
+    Lea([u8; 4]),
+    /// Direct base register (`mov rax, reg`, 3 bytes) writing `slots` consecutive 32-byte slots
+    /// (preserves `rflags` via `pushfq`/`popfq`).
+    BaseReg { mov_rax: [u8; 3], slots: u8 },
+}
+
+fn target_of(store: &[u8]) -> Option<StoreTarget> {
+    if let Some(lea) = lea_of(store) {
+        return Some(StoreTarget::Lea(lea));
+    }
+    match store {
+        // +0x4d9f25f: 4x32B `vmovups [rbx+0x60..0x00], ymm3..0`
+        [
+            0xc5, 0xfc, 0x11, 0x5b, 0x60,
+            0xc5, 0xfc, 0x11, 0x53, 0x40,
+            0xc5, 0xfc, 0x11, 0x4b, 0x20,
+            0xc5, 0xfc, 0x11, 0x03,
+        ] => Some(StoreTarget::BaseReg { mov_rax: [0x48, 0x89, 0xd8], slots: 4 }), // mov rax, rbx
+        // +0x18849c & +0x2474afc: `mov [rbx], rdx ; mov [rcx+rax+0x48], rbx`
+        [0x48, 0x89, 0x13, 0x48, 0x89, 0x5c, 0x01, 0x48] => {
+            Some(StoreTarget::BaseReg { mov_rax: [0x48, 0x89, 0xd8], slots: 1 }) // mov rax, rbx
+        }
+        // +0x4e9b4e2: `mov qword ptr [r14], 0`
+        [0x49, 0xc7, 0x06, 0x00, 0x00, 0x00, 0x00] => {
+            Some(StoreTarget::BaseReg { mov_rax: [0x4c, 0x89, 0xf0], slots: 1 }) // mov rax, r14
+        }
+        _ => None,
+    }
+}
+
 /// The code at `to` for the store `store` at `at`: the store, the marks, back
 /// to `at + store.len()`.
+///
+/// TSO invariant: every stub writes `slots[s] = 1` followed UNCONDITIONALLY by
+/// `chunks[s / 128] = 1` (never test-before-write on `chunks[]`).
 fn stub(store: &[u8], at: usize, to: usize, marks: usize) -> Option<Vec<u8>> {
-    let lea = lea_of(store)?;
+    let target = target_of(store)?;
     let mut out = store.to_vec();
-    out.push(0x50); // push rax
-    out.extend(lea); // lea rax, [base+index]
-    out.extend([0x52, 0x51]); // push rdx ; push rcx
-    out.extend([0x48, 0xba]); // mov rdx, marks
-    out.extend((marks as u64).to_le_bytes());
-    out.extend([0x48, 0x2b, 0x02]); // sub rax, [rdx]
-    out.extend([0x48, 0x3b, 0x42, 0x08]); // cmp rax, [rdx+8]
-    out.extend([0x73, 0x18]); // jae past the marks
-    out.extend([0x48, 0xc1, 0xe8, 0x05]); // shr rax, 5: the slot
-    out.extend([0x48, 0x8b, 0x4a, 0x10]); // mov rcx, [rdx+16]
-    out.extend([0xc6, 0x04, 0x01, 0x01]); // mov byte [rcx+rax], 1
-    out.extend([0x48, 0xc1, 0xe8, 0x07]); // shr rax, 7: the chunk
-    out.extend([0x48, 0x8b, 0x4a, 0x18]); // mov rcx, [rdx+24]
-    out.extend([0xc6, 0x04, 0x01, 0x01]); // mov byte [rcx+rax], 1
-    out.extend([0x59, 0x5a, 0x58]); // pop rcx ; pop rdx ; pop rax
+    match target {
+        StoreTarget::Lea(lea) => {
+            out.push(0x50); // push rax
+            out.extend(lea); // lea rax, [base+index]
+            out.extend([0x52, 0x51]); // push rdx ; push rcx
+            out.extend([0x48, 0xba]); // mov rdx, marks
+            out.extend((marks as u64).to_le_bytes());
+            out.extend([0x48, 0x2b, 0x02]); // sub rax, [rdx]
+            out.extend([0x48, 0x3b, 0x42, 0x08]); // cmp rax, [rdx+8]
+            out.extend([0x73, 0x18]); // jae past the marks
+            out.extend([0x48, 0xc1, 0xe8, 0x05]); // shr rax, 5: the slot
+            out.extend([0x48, 0x8b, 0x4a, 0x10]); // mov rcx, [rdx+16]
+            out.extend([0xc6, 0x04, 0x01, 0x01]); // mov byte [rcx+rax], 1
+            out.extend([0x48, 0xc1, 0xe8, 0x07]); // shr rax, 7: the chunk
+            out.extend([0x48, 0x8b, 0x4a, 0x18]); // mov rcx, [rdx+24]
+            out.extend([0xc6, 0x04, 0x01, 0x01]); // mov byte [rcx+rax], 1
+            out.extend([0x59, 0x5a, 0x58]); // pop rcx ; pop rdx ; pop rax
+        }
+        StoreTarget::BaseReg { mov_rax, slots: 1 } => {
+            out.push(0x9c); // pushfq
+            out.push(0x50); // push rax
+            out.extend(mov_rax); // mov rax, base_reg
+            out.extend([0x52, 0x51]); // push rdx ; push rcx
+            out.extend([0x48, 0xba]); // mov rdx, marks
+            out.extend((marks as u64).to_le_bytes());
+            out.extend([0x48, 0x2b, 0x02]); // sub rax, [rdx]
+            out.extend([0x48, 0x3b, 0x42, 0x08]); // cmp rax, [rdx+8]
+            out.extend([0x73, 0x18]); // jae past the marks
+            out.extend([0x48, 0xc1, 0xe8, 0x05]); // shr rax, 5: the slot
+            out.extend([0x48, 0x8b, 0x4a, 0x10]); // mov rcx, [rdx+16]
+            out.extend([0xc6, 0x04, 0x01, 0x01]); // mov byte [rcx+rax], 1
+            out.extend([0x48, 0xc1, 0xe8, 0x07]); // shr rax, 7: the chunk
+            out.extend([0x48, 0x8b, 0x4a, 0x18]); // mov rcx, [rdx+24]
+            out.extend([0xc6, 0x04, 0x01, 0x01]); // mov byte [rcx+rax], 1
+            out.extend([0x59, 0x5a, 0x58]); // pop rcx ; pop rdx ; pop rax
+            out.push(0x9d); // popfq
+        }
+        StoreTarget::BaseReg { mov_rax, slots } => {
+            out.push(0x9c); // pushfq
+            out.extend([0x50, 0x52, 0x51, 0x56]); // push rax ; push rdx ; push rcx ; push rsi
+            out.extend([0x48, 0xba]); // mov rdx, marks
+            out.extend((marks as u64).to_le_bytes());
+            out.extend(mov_rax); // mov rax, base_reg
+            out.extend([0x48, 0x2b, 0x02]); // sub rax, [rdx]
+            out.extend([0x48, 0x3b, 0x42, 0x08]); // cmp rax, [rdx+8]
+            let jae_outer = out.len();
+            out.extend([0x73, 0x00]); // jae done (patched below)
+            out.extend([0xbe, slots, 0x00, 0x00, 0x00]); // mov esi, slots
+            let loop_top = out.len();
+            out.extend([0x48, 0x3b, 0x42, 0x08]); // cmp rax, [rdx+8]
+            let jae_inner = out.len();
+            out.extend([0x73, 0x00]); // jae done (patched below)
+            out.extend([0x48, 0x89, 0xc1]); // mov rcx, rax
+            out.extend([0x48, 0xc1, 0xe9, 0x05]); // shr rcx, 5: the slot
+            out.push(0x50); // push rax
+            out.extend([0x48, 0x8b, 0x42, 0x10]); // mov rax, [rdx+16]
+            out.extend([0xc6, 0x04, 0x08, 0x01]); // mov byte [rax+rcx], 1
+            out.extend([0x48, 0xc1, 0xe9, 0x07]); // shr rcx, 7: the chunk
+            out.extend([0x48, 0x8b, 0x42, 0x18]); // mov rax, [rdx+24]
+            out.extend([0xc6, 0x04, 0x08, 0x01]); // mov byte [rax+rcx], 1
+            out.push(0x58); // pop rax
+            out.extend([0x48, 0x83, 0xc0, 0x20]); // add rax, 32
+            out.extend([0xff, 0xce]); // dec esi
+            let jnz_at = out.len();
+            let back_rel = (loop_top as isize) - ((jnz_at + 2) as isize);
+            out.extend([0x75, i8::try_from(back_rel).ok()? as u8]); // jnz loop_top
+            let done_at = out.len();
+            out[jae_outer + 1] = u8::try_from(done_at - (jae_outer + 2)).ok()?;
+            out[jae_inner + 1] = u8::try_from(done_at - (jae_inner + 2)).ok()?;
+            out.extend([0x5e, 0x59, 0x5a, 0x58]); // pop rsi ; pop rcx ; pop rdx ; pop rax
+            out.push(0x9d); // popfq
+        }
+    }
     let back = crate::console_insn::jump(to + out.len(), at + store.len())?;
     out.extend(back);
     Some(out)
@@ -141,7 +295,7 @@ pub unsafe fn apply(base: usize, size: usize, marks: usize, sites: &[Site]) -> V
                 return Hooked::Differs;
             }
             let at = window + site.store;
-            if room.is_none() {
+            if room.is_none_or(|(place, used)| crate::console_insn::jump(at, place + used).is_none()) {
                 room = crate::console_insn::near(at).map(|place| (place, 0));
             }
             let Some((place, used)) = room.as_mut() else {
@@ -189,20 +343,24 @@ mod tests {
 
     #[test]
     fn the_sites_lea_their_stores_address() {
-        let leas: Vec<[u8; 4]> = SITES.iter().map(|s| lea_of(&s.bytes[s.store..s.store + s.len]).unwrap()).collect();
+        let leas: Vec<[u8; 4]> = SITES[..6].iter().map(|s| lea_of(&s.bytes[s.store..s.store + s.len]).unwrap()).collect();
         assert_eq!(leas[0], [0x48, 0x8d, 0x04, 0x31]); // lea rax, [rcx+rsi]
         assert_eq!(leas[1], [0x48, 0x8d, 0x04, 0x31]);
         assert_eq!(leas[2], [0x49, 0x8d, 0x04, 0x31]); // [r9+rsi]
         assert_eq!(leas[3], [0x4b, 0x8d, 0x04, 0x01]); // [r9+r8]
         assert_eq!(leas[4], [0x4a, 0x8d, 0x04, 0x07]); // [rdi+r8]
         assert_eq!(leas[5], [0x4b, 0x8d, 0x04, 0x02]); // [r10+r8]
-        // Each window: the store follows the record's load and is followed
-        // by a movzx and the cmp that sets the flags.
-        for s in &SITES {
+        // Each table-filler window: the store follows the record's load and is
+        // followed by a movzx and the cmp that sets the flags.
+        for s in &SITES[..6] {
             let after = &s.bytes[s.store + s.len..];
             let movzx = if after[0] == 0x0f { 0 } else { 1 };
             assert_eq!(&after[movzx..movzx + 2], &[0x0f, 0xb6]);
             assert_eq!(after[after.len() - 2], 0x39, "cmp");
+        }
+        // All 10 sites decode cleanly via `target_of`.
+        for s in &SITES {
+            assert!(target_of(&s.bytes[s.store..s.store + s.len]).is_some());
         }
         // A store with a displacement, of the stack, of another kind: not taken.
         assert!(lea_of(&[0xc5, 0xfc, 0x11, 0x44, 0x31, 0x08]).is_none());
@@ -228,7 +386,7 @@ mod tests {
         use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc};
         // mov to, from (64 bits)
         let mov = |to: u8, from: u8| [0x48 | (from >> 3) << 2 | (to >> 3), 0x89, 0xc0 | (from & 7) << 3 | (to & 7)];
-        for site in &SITES {
+        for site in &SITES[..6] {
             let store = &site.bytes[site.store..site.store + site.len];
             let lea = lea_of(store).unwrap();
             let base = lea[3] & 7 | (lea[0] & 1) << 3;
@@ -313,6 +471,126 @@ mod tests {
             assert_eq!(std::slice::from_raw_parts(place.add(0x100), bytes.len()), &bytes[..]);
             let outside = [Site { window: 0xfff0, ..SITES[0] }];
             assert!(matches!(apply(place as usize, 0x10000, 0, &outside)[..], [Hooked::Failed(_)]));
+        }
+    }
+
+    /// Executes the four newly added writer sites (+0x4d9f25f 4x32B block store,
+    /// +0x18849c / +0x2474afc [rbx] store, +0x4e9b4e2 [r14] store) in live
+    /// JIT buffers and verifies exact writes, mark bits, chunk boundaries, and
+    /// bounds safety.
+    #[test]
+    fn new_sites_store_and_mark_slots() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc};
+        // SAFETY: allocates fresh RWX buffers exclusively for this test.
+        unsafe {
+            let heap = VirtualAlloc(std::ptr::null(), 0x20000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) as *mut u8;
+            assert!(!heap.is_null());
+            let (mut slots, mut chunks) = (vec![0u8; 0x8000 / 32], vec![0u8; 0x8000 / 32 / 128]);
+            let marks = Box::new(Marks {
+                start: heap as u64 + 0x2000,
+                len: 0x8000,
+                slots: slots.as_mut_ptr(),
+                chunks: chunks.as_mut_ptr(),
+            });
+
+            // 1) Site 6 (+0x4d9f25f): 4x32B vmovups [rbx+0x60..0x00] crossing chunk boundary (slots 126..130).
+            {
+                let site = &SITES[6];
+                let place = VirtualAlloc(std::ptr::null(), 0x10000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) as usize;
+                let mut code: Vec<u8> = Vec::new();
+                // fn(dst_rbx: rcx, src_r12: rdx)
+                code.extend([0x53, 0x41, 0x54]); // push rbx ; push r12
+                code.extend([0x48, 0x89, 0xcb]); // mov rbx, rcx
+                code.extend([0x49, 0x89, 0xd4]); // mov r12, rdx
+                code.extend([0xc4, 0xc1, 0x7c, 0x10, 0x04, 0x24]); // vmovups ymm0, [r12]
+                let win_at = code.len();
+                code.extend(site.bytes);
+                code.extend([0x41, 0x5c, 0x5b]); // pop r12 ; pop rbx
+                code.extend([0xc5, 0xf8, 0x77, 0xc3]); // vzeroupper ; ret
+                let entry = place + 0x200 - win_at;
+                std::ptr::copy_nonoverlapping(code.as_ptr(), entry as *mut u8, code.len());
+                let mine = [Site { window: 0x200, ..*site }];
+                assert_eq!(apply(place, 0x10000, &raw const *marks as usize, &mine), [Hooked::Done]);
+                let f: unsafe extern "system" fn(*mut u8, *const u8) = std::mem::transmute(entry);
+                let src: [u8; 128] = std::array::from_fn(|k| (k as u8).wrapping_mul(3) ^ 0xa5);
+                let dst = heap.add(0x2000 + 126 * 32);
+                f(dst, src.as_ptr());
+                assert_eq!(std::slice::from_raw_parts(dst, 128), &src);
+                for s in 126..130 {
+                    assert_eq!(slots[s], 1, "slot {s} must be marked");
+                }
+                assert_eq!(slots.iter().filter(|&&b| b != 0).count(), 4);
+                assert_eq!(chunks[0], 1);
+                assert_eq!(chunks[1], 1);
+                // Out-of-bounds below heap: stores cleanly, marks nothing.
+                slots.fill(0);
+                chunks.fill(0);
+                let below = heap.add(0x1000);
+                f(below, src.as_ptr());
+                assert_eq!(std::slice::from_raw_parts(below, 128), &src);
+                assert!(slots.iter().chain(&chunks).all(|&b| b == 0));
+            }
+
+            // 2) Sites 7 & 9 (+0x18849c / +0x2474afc): `mov [rbx], rdx ; mov [rcx+rax+0x48], rbx`.
+            for &idx in &[7usize, 9usize] {
+                slots.fill(0);
+                chunks.fill(0);
+                let site = &SITES[idx];
+                let place = VirtualAlloc(std::ptr::null(), 0x10000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) as usize;
+                let mut code: Vec<u8> = Vec::new();
+                // fn(dst_rbx: rcx, node_buf: rdx)
+                code.extend([0x53, 0x57]); // push rbx ; push rdi
+                code.extend([0x48, 0x89, 0xcb]); // mov rbx, rcx
+                code.extend([0x48, 0x89, 0xd7]); // mov rdi, rdx
+                code.extend([0x48, 0x89, 0xd1]); // mov rcx, rdx
+                code.extend([0x31, 0xc0]); // xor eax, eax
+                let win_at = code.len();
+                code.extend(site.bytes);
+                code.extend([0x5f, 0x5b, 0xc3]); // pop rdi ; pop rbx ; ret
+                let entry = place + 0x200 - win_at;
+                std::ptr::copy_nonoverlapping(code.as_ptr(), entry as *mut u8, code.len());
+                let mine = [Site { window: 0x200, ..*site }];
+                assert_eq!(apply(place, 0x10000, &raw const *marks as usize, &mine), [Hooked::Done]);
+                let f: unsafe extern "system" fn(*mut u8, *mut u64) = std::mem::transmute(entry);
+                let mut node = [0u64; 16];
+                node[9] = 0x1122_3344_5566_7788; // offset 0x48
+                let dst = heap.add(0x2000 + 200 * 32);
+                f(dst, node.as_mut_ptr());
+                assert_eq!((dst as *const u64).read_unaligned(), 0x1122_3344_5566_7788);
+                assert_eq!(node[9], dst as u64);
+                assert_eq!(slots[200], 1);
+                assert_eq!(chunks[200 / 128], 1);
+            }
+
+            // 3) Site 8 (+0x4e9b4e2): `mov qword ptr [r14], 0`.
+            {
+                slots.fill(0);
+                chunks.fill(0);
+                let site = &SITES[8];
+                let place = VirtualAlloc(std::ptr::null(), 0x10000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) as usize;
+                let mut code: Vec<u8> = Vec::new();
+                // fn(dst_base_plus_18: rcx, rbx_val: rdx)
+                code.extend([0x53, 0x41, 0x56, 0x41, 0x57]); // push rbx ; push r14 ; push r15
+                code.extend([0x48, 0x89, 0xd3]); // mov rbx, rdx
+                code.extend([0x49, 0x89, 0xcf]); // mov r15, rcx
+                code.extend([0x31, 0xc0]); // xor eax, eax
+                let win_at = code.len();
+                code.extend(site.bytes);
+                code.extend([0x41, 0x5f, 0x41, 0x5e, 0x5b, 0xc3]); // pop r15 ; pop r14 ; pop rbx ; ret
+                let entry = place + 0x200 - win_at;
+                std::ptr::copy_nonoverlapping(code.as_ptr(), entry as *mut u8, code.len());
+                let mine = [Site { window: 0x200, ..*site }];
+                assert_eq!(apply(place, 0x10000, &raw const *marks as usize, &mine), [Hooked::Done]);
+                let f: unsafe extern "system" fn(*mut u8, u64) = std::mem::transmute(entry);
+                let dst = heap.add(0x2000 + 300 * 32);
+                (dst as *mut u64).write_unaligned(0xdead_beef_cafe_babe);
+                f(dst.add(0x18), 0x1234_5678);
+                assert_eq!((dst as *const u64).read_unaligned(), 0);
+                assert_eq!((dst.add(8) as *const u64).read_unaligned(), 0x1234_5678);
+                assert_eq!(slots[300], 1);
+                assert_eq!(chunks[300 / 128], 1);
+            }
+            drop(marks);
         }
     }
 }

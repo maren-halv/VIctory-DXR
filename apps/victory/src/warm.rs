@@ -139,6 +139,7 @@ fn child(these: &[usize], mut each: impl FnMut(usize, f64, bool)) -> (usize, Opt
         const IDLE_PRIORITY_CLASS: u32 = 0x40;
         Command::new(exe)
             .args(["warm", "--these", &list.join(",")])
+            .env("VICTORY_COMPILE_WORKER", "0")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())

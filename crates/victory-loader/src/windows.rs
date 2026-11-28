@@ -82,7 +82,7 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
     // A DLL indexes its TLS properly; only an exe assumes index 0.
     if !loaded.info.is_dll() {
         // SAFETY: just mapped, and no title code has run.
-        unsafe { crate::tls::redirect(loaded.base(), &loaded.info) }?;
+        unsafe { crate::tls::redirect(loaded.base(), &loaded.info, prepared.vtls_rva) }?;
     }
     tracing::info!(
         base = format_args!("{:#x}", loaded.base()),

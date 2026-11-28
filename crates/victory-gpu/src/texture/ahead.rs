@@ -37,13 +37,25 @@ const MOST: u64 = 96 << 20;
 const BATCH: (u64, usize) = (16 << 20, 64);
 
 /// Whether it is on (`VICTORY_UPLOAD_AHEAD`; off).
+///
+/// Spec-Trap #15 guard: never enables ahead uploads unless `VICTORY_SHOW_AFTER=1`
+/// is also active (otherwise COPY/COMPUTE uploads race live DIRECT reads).
 pub(crate) fn on() -> bool {
     #[cfg(feature = "diagnostics")]
     if let Some(on) = crate::ab::pick("VICTORY_UPLOAD_AHEAD") {
-        return on;
+        return on && crate::descriptor::host::show_after();
     }
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_UPLOAD_AHEAD").is_some_and(|v| v != "0"))
+    *ON.get_or_init(|| {
+        let asked = std::env::var_os("VICTORY_UPLOAD_AHEAD").is_some_and(|v| v != "0");
+        if asked && !crate::descriptor::host::show_after() {
+            tracing::warn!(
+                "VICTORY_UPLOAD_AHEAD=1 ignored because VICTORY_SHOW_AFTER=1 is not set (Spec-Trap #15)"
+            );
+            return false;
+        }
+        asked
+    })
 }
 
 /// An upload on its way.
@@ -121,8 +133,14 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
     if copy.ahead.compare_exchange(NONE, PENDING, Relaxed, Relaxed).is_err() {
         return turned_down();
     }
+    // Decouple linear vs tiled ahead uploads (`ARCH-15`): when `gpu_detile` is
+    // enabled with its dedicated compute queue, tiled textures keep
+    // `gpu_detile = true` (dispatched in batches on `ComputeQ`) while linear
+    // textures (`Swizzle::LINEAR`) continue using `CopyQ`. Only force
+    // `COPY_QUEUE_ONLY` when compute-queue GPU detiling is disabled.
+    let allow_compute_detile = crate::gpu_detile::on() && crate::gpu_detile::compute_queue_enabled();
     super::PICKING.set(Some(there));
-    super::COPY_QUEUE_ONLY.set(true);
+    super::COPY_QUEUE_ONLY.set(!allow_compute_detile);
     let staging = super::staging(resource, &copy, first);
     super::COPY_QUEUE_ONLY.set(false);
     super::PICKING.set(None);
@@ -266,19 +284,108 @@ impl Worker {
         for job in jobs {
             job.staging.refresh();
         }
-        // SAFETY: this worker's allocator and list, whose last submission has
-        // run; the jobs hold what the list names until after the wait.
-        unsafe {
-            self.allocator.Reset()?;
-            self.list.Reset(&self.allocator, None)?;
-            for job in jobs {
-                job.record(&self.list);
+        let mut copy_jobs: Vec<&Arc<Job>> = Vec::with_capacity(jobs.len());
+        let mut detile_jobs: Vec<&Arc<Job>> = Vec::new();
+        for job in jobs {
+            if job.staging.gpu_detile {
+                detile_jobs.push(job);
+            } else {
+                copy_jobs.push(job);
             }
-            self.list.Close()?;
-            self.queue.ExecuteCommandLists(&[Some(self.list.cast()?)]);
-            self.queue.Signal(&self.fence, value)?;
-            // (Without an event: this waits.)
-            self.fence.SetEventOnCompletion(value, windows::Win32::Foundation::HANDLE::default())?;
+        }
+
+        // Kick off batched tiled GPU detiling on the dedicated ComputeQ first so
+        // linear CopyQ uploads overlap with ComputeQ detiling in parallel.
+        let mut compute_fence = 0u64;
+        if !detile_jobs.is_empty()
+            && let Some(host) = crate::host::host()
+        {
+            let mut per_job_subjobs: Vec<Vec<crate::gpu_detile::SubresourceJob>> =
+                Vec::with_capacity(detile_jobs.len());
+            let mut per_job_indices: Vec<Vec<usize>> = Vec::with_capacity(detile_jobs.len());
+            let mut per_job_meta: Vec<(u64, bool)> = Vec::with_capacity(detile_jobs.len());
+            for job in &detile_jobs {
+                let s = &job.staging;
+                let n = s.footprints.len();
+                let mut subjobs = Vec::with_capacity(n);
+                let mut indices = Vec::with_capacity(n);
+                for (i, (footprint, &rows)) in s.footprints.iter().zip(&s.rows).enumerate() {
+                    let (mip, slice) = s.part(i);
+                    let row_pitch = footprint.Footprint.RowPitch;
+                    let depth_pitch = row_pitch.saturating_mul(rows);
+                    subjobs.push(crate::gpu_detile::SubresourceJob {
+                        mip,
+                        slice,
+                        dst_offset: footprint.Offset,
+                        row_pitch,
+                        depth_pitch,
+                        zero: false,
+                    });
+                    indices.push(i);
+                }
+                // SAFETY: live staging upload buffer.
+                let src_va = unsafe { s.buffer.GetGPUVirtualAddress() } + s.base;
+                let need_aliasing = crate::pool::on()
+                    && !s
+                        .gpu_detile_aliased
+                        .swap(true, std::sync::atomic::Ordering::AcqRel);
+                per_job_subjobs.push(subjobs);
+                per_job_indices.push(indices);
+                per_job_meta.push((src_va, need_aliasing));
+            }
+            let items: Vec<crate::gpu_detile::BatchItem<'_>> = detile_jobs
+                .iter()
+                .enumerate()
+                .map(|(idx, job)| {
+                    let s = &job.staging;
+                    let (src_va, need_aliasing) = per_job_meta[idx];
+                    crate::gpu_detile::BatchItem {
+                        layout: &s.layout,
+                        src_gpu_va: src_va,
+                        src_len: s.read as u64,
+                        dst_texture: &job.copy.texture,
+                        sub_offset: s.first - s.level0,
+                        footprints: &s.footprints,
+                        jobs: &per_job_subjobs[idx],
+                        indices: &per_job_indices[idx],
+                        linear_bytes: s.linear_bytes,
+                        need_aliasing,
+                    }
+                })
+                .collect();
+            if let Some(fence_val) = crate::gpu_detile::execute_compute_batch(host, &items, false) {
+                compute_fence = fence_val;
+            } else {
+                tracing::warn!(
+                    count = detile_jobs.len(),
+                    "uploads ahead: batched compute gpu_detile submission failed"
+                );
+            }
+        }
+
+        if !copy_jobs.is_empty() {
+            // SAFETY: this worker's allocator and list, whose last submission has
+            // run; the jobs hold what the list names until after the wait.
+            unsafe {
+                self.allocator.Reset()?;
+                self.list.Reset(&self.allocator, None)?;
+                for job in &copy_jobs {
+                    job.record(&self.list);
+                }
+                self.list.Close()?;
+                self.queue.ExecuteCommandLists(&[Some(self.list.cast()?)]);
+                self.queue.Signal(&self.fence, value)?;
+                // (Without an event: this waits.)
+                self.fence
+                    .SetEventOnCompletion(value, windows::Win32::Foundation::HANDLE::default())?;
+            }
+        }
+
+        if compute_fence > 0
+            && let Some(host) = crate::host::host()
+            && !crate::gpu_detile::wait_compute_fence(host, compute_fence)
+        {
+            tracing::warn!(compute_fence, "uploads ahead: compute gpu_detile fence wait failed");
         }
         Ok(())
     }

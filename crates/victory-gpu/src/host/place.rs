@@ -497,11 +497,55 @@ impl HostList {
         Some(between)
     }
 
-    /// A buffer on the card for this recording alone.
+    /// A device-local scratch buffer for this recording alone. Uses
+    /// `internal_uav_buffer` (non-bindless, skipping `MakeResident`/`mapped`
+    /// stalls) and reuses idle power-of-two buffers up to 8 MiB once no list
+    /// holds a reference (`references == 1`, decayed back to `COMMON`).
     fn between(&self, host: &Host, len: u64) -> Option<ID3D12Resource> {
-        let buffer = host.uav_buffer(len.next_multiple_of(1 << 16))?;
+        const MAX_POOLED_LEN: u64 = 8 << 20;
+        const MAX_POOLED_COUNT: usize = 8;
+        const MAX_POOLED_BYTES: u64 = 16 << 20;
+        struct ScratchPool(Vec<(u64, ID3D12Resource)>);
+        // SAFETY: D3D12 resources are free-threaded.
+        unsafe impl Send for ScratchPool {}
+        static POOL: Mutex<ScratchPool> = Mutex::new(ScratchPool(Vec::new()));
+
+        let aligned = len.next_multiple_of(1 << 16).max(1 << 16);
+        if aligned > MAX_POOLED_LEN {
+            let buffer = host.internal_uav_buffer(aligned)?;
+            name(&buffer, || "bytes between copies".into());
+            self.keep(&buffer);
+            return Some(buffer);
+        }
+        let class = aligned.checked_next_power_of_two().unwrap_or(aligned);
+        {
+            let pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((_, existing)) = pool
+                .0
+                .iter()
+                .find(|(size, buf)| *size == class && crate::host::references(buf) == 1)
+            {
+                let buffer = existing.clone();
+                self.keep(&buffer);
+                return Some(buffer);
+            }
+        }
+        let buffer = host.internal_uav_buffer(class)?;
         name(&buffer, || "bytes between copies".into());
         self.keep(&buffer);
+        {
+            let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+            let mut total: u64 = pool.0.iter().map(|(s, _)| *s).sum();
+            while (pool.0.len() >= MAX_POOLED_COUNT || total.saturating_add(class) > MAX_POOLED_BYTES)
+                && let Some(pos) = pool.0.iter().position(|(_, buf)| crate::host::references(buf) == 1)
+            {
+                let (removed_size, _) = pool.0.swap_remove(pos);
+                total = total.saturating_sub(removed_size);
+            }
+            if pool.0.len() < MAX_POOLED_COUNT && total.saturating_add(class) <= MAX_POOLED_BYTES {
+                pool.0.push((class, buffer.clone()));
+            }
+        }
         Some(buffer)
     }
 }

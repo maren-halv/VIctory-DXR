@@ -54,9 +54,9 @@
 //! every other texture is made as before. Off unless
 //! `VICTORY_LEVELS_ON_DEMAND=1`.
 
-use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 
 use windows::Win32::Graphics::Direct3D12::*;
 
@@ -91,6 +91,33 @@ pub(crate) static BLANK: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 /// to the pool, `[3]` bytes returned to the pool.
 pub(crate) static RECLAIMED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
+/// Tier-2 pressure-driven top-mip demotion / re-promotion metrics (`ARCH-01`):
+/// `[0]` textures demoted (Phase 2 committed), `[1]` top-mip levels demoted,
+/// `[2]` VRAM bytes reclaimed by demotion, `[3]` re-promotions triggered.
+pub(crate) static DEMOTED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Default local VRAM threshold (%) above which idle large tiled textures begin
+/// fence-gated top-mip demotion (`VICTORY_TILES_DEMOTE_VRAM_PERCENT`).
+const DEFAULT_DEMOTE_VRAM_PERCENT: u64 = 72;
+/// Severe VRAM pressure threshold (%) permitting deeper (up to 2 top-mip) demotion
+/// after a shorter idle grace period (still never clamping active close-up textures!).
+const SEVERE_DEMOTE_VRAM_PERCENT: u64 = 85;
+/// Comfort band (%) below which demoted textures proactively re-promote.
+const REPROMOTE_VRAM_PERCENT: u64 = 68;
+/// Idle grace period for moderate pressure (15 seconds + 60 frames) so active
+/// close-up Series X textures are NEVER clamped (`ARCH-01`, Spec-Trap #7).
+const DEMOTE_IDLE_MODERATE_MS: u64 = 15_000;
+const DEMOTE_IDLE_MODERATE_FRAMES: u64 = 60;
+/// Idle grace period for severe pressure (5 seconds + 30 frames).
+const DEMOTE_IDLE_SEVERE_MS: u64 = 5_000;
+const DEMOTE_IDLE_SEVERE_FRAMES: u64 = 30;
+/// Submissions / frames required after descriptor rewrite (`levels_changed`)
+/// before Phase 2 issues `UpdateTileMappings(..., NULL)`.
+const DEMOTE_FENCE_LAG: u64 = 2;
+const DEMOTE_FRAME_LAG: u64 = 2;
+/// Maximum demotion/re-promotion actions per 1-Hz sweep tick.
+const DEMOTE_PER_SWEEP: usize = 16;
+
 fn parse_reclaim(value: Option<&str>) -> bool {
     value.is_none_or(|v| v.trim() != "0")
 }
@@ -101,6 +128,121 @@ fn parse_reclaim(value: Option<&str>) -> bool {
 pub(crate) fn reclaim_wanted() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| parse_reclaim(std::env::var("VICTORY_TILES_RECLAIM").ok().as_deref()))
+}
+
+fn parse_demote_wanted(value: Option<&str>) -> bool {
+    value.is_none_or(|v| v.trim() != "0")
+}
+
+/// Whether idle large Tier-2 tiled textures demote top mips under VRAM/host
+/// memory pressure (`VICTORY_TILES_DEMOTE`, enabled by default when
+/// `VICTORY_LEVELS_ON_DEMAND=1`; set `0` to opt out).
+pub(crate) fn demote_wanted() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| parse_demote_wanted(std::env::var("VICTORY_TILES_DEMOTE").ok().as_deref()))
+}
+
+fn parse_demote_vram_percent(value: Option<&str>) -> u64 {
+    value
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map_or(DEFAULT_DEMOTE_VRAM_PERCENT, |p| p.clamp(50, 95))
+}
+
+fn demote_vram_percent() -> u64 {
+    static PCT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *PCT.get_or_init(|| {
+        parse_demote_vram_percent(std::env::var("VICTORY_TILES_DEMOTE_VRAM_PERCENT").ok().as_deref())
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DemotionPressure {
+    /// Below pressure threshold (`can_repromote` true when below comfort band).
+    None { can_repromote: bool },
+    /// `VRAM > 72%` or `residency::pressured()`: demote 1 top mip on idle (`>= 15s`) textures.
+    Moderate { vram_pct: u64 },
+    /// `VRAM >= 85%`: demote up to 2 top mips on idle (`>= 5s`) textures.
+    Severe { vram_pct: u64 },
+}
+
+fn evaluate_demotion_pressure(
+    memory: Option<[u64; 4]>,
+    empty_pool_bytes: u64,
+    host_pressured: bool,
+    threshold_pct: u64,
+) -> DemotionPressure {
+    let vram_pct = match memory {
+        Some([budget, used, ..]) if budget > 0 => {
+            let used_net = used.saturating_sub(empty_pool_bytes);
+            used_net.saturating_mul(100) / budget
+        }
+        _ => 0,
+    };
+    let severe_pct = threshold_pct.max(SEVERE_DEMOTE_VRAM_PERCENT);
+    if vram_pct >= severe_pct {
+        DemotionPressure::Severe { vram_pct }
+    } else if vram_pct > threshold_pct || host_pressured {
+        DemotionPressure::Moderate { vram_pct }
+    } else {
+        let repromote_pct = threshold_pct.saturating_sub(4).min(REPROMOTE_VRAM_PERCENT);
+        DemotionPressure::None {
+            can_repromote: !host_pressured && vram_pct < repromote_pct,
+        }
+    }
+}
+
+/// Pure policy deciding whether an idle tiled texture should demote its top mips
+/// and which `target_shown` mip level it should clamp to.
+///
+/// Strictly enforces:
+/// - Never demotes active/recent textures (`!is_idle`) — preserving full Series X fidelity.
+/// - Never demotes small textures (`full_bytes < floor_bytes`) or single-standard-mip textures.
+/// - Never demotes any level written by the host GPU (`card` bits).
+/// - Always leaves at least one backed mip level `>= target_shown` so the texture never goes black.
+#[allow(clippy::too_many_arguments)]
+fn choose_demote_target(
+    pressure: DemotionPressure,
+    full_bytes: u64,
+    floor_bytes: u64,
+    standard_levels: u32,
+    levels: u32,
+    current_shown: u32,
+    backed: u32,
+    card: u32,
+    is_idle: bool,
+) -> Option<u32> {
+    let max_demote = match pressure {
+        DemotionPressure::None { .. } => return None,
+        DemotionPressure::Moderate { .. } => 1u32,
+        DemotionPressure::Severe { .. } => 2u32,
+    };
+    if !is_idle || full_bytes < floor_bytes || standard_levels < 2 || current_shown >= levels {
+        return None;
+    }
+    // Cap target at `standard_levels` so packed mip-tail stays intact and visible.
+    let target = current_shown
+        .saturating_add(max_demote)
+        .min(standard_levels)
+        .min(levels.saturating_sub(1));
+    if target <= current_shown || target >= 32 {
+        return None;
+    }
+    let below_mask = (1u32 << target) - 1;
+    // Never demote any card-written level.
+    if card & below_mask != 0 {
+        return None;
+    }
+    // Must actually reclaim at least one currently-backed top mip.
+    if backed & below_mask == 0 {
+        return None;
+    }
+    // Must retain at least one backed level at or below `target` (never blank!).
+    let every = if levels >= 32 { u32::MAX } else { (1u32 << levels) - 1 };
+    let remaining = backed & every & !below_mask;
+    if remaining == 0 {
+        return None;
+    }
+    Some(target)
 }
 
 /// `VICTORY_TILES_SMALL_WHEN_FULL_MB` (0, off, by default): while the card
@@ -161,13 +303,11 @@ pub(crate) fn wanted() -> bool {
 fn parse_floor(value: Option<&str>) -> u64 {
     value
         .and_then(|v| v.trim().parse::<u64>().ok())
-        .map_or(1 << 20, |kb| kb.max(64).saturating_mul(1024))
+        .map_or(512 << 10, |kb| kb.max(64).saturating_mul(1024))
 }
 
-/// The bytes from which a texture is made this way: a megabyte, or
-/// `VICTORY_LEVELS_MIN_KB`. (The accounting of run 189: the levels not
-/// held are 1.9 MB a copy on some 1,600 copies; a 512x512 texture has six
-/// tiles at most, and most of the calls for nothing.)
+/// The bytes from which a texture is made this way: 512 KiB (`ARCH-01`
+/// 256-512 KiB Tier-2 threshold), or `VICTORY_LEVELS_MIN_KB` (min 64 KiB).
 pub(crate) fn floor() -> u64 {
     static BYTES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *BYTES.get_or_init(|| parse_floor(std::env::var("VICTORY_LEVELS_MIN_KB").ok().as_deref()))
@@ -444,6 +584,15 @@ impl Given {
     }
 }
 
+/// Pending Phase-2 tile unmapping awaiting GPU fence & frame completion so no
+/// in-flight draw can sample tiles that are about to be unmapped with `NULL`.
+#[derive(Clone, Copy, Debug)]
+struct PendingDemotion {
+    target_shown: u32,
+    fence_gate: u64,
+    frame_gate: u64,
+}
+
 /// A host texture made without memory, and the tiles its levels have been
 /// given.
 pub(crate) struct Tiled {
@@ -470,6 +619,12 @@ pub(crate) struct Tiled {
     /// The levels a recorded list of the card's own writes has already
     /// written with zeros first ([`Tiled::claim`]).
     claimed: AtomicU32,
+    /// Last moment (`crate::host::moment()`) a draw/upload touched this texture.
+    last_used: AtomicU64,
+    /// Minimum mip level allowed while demoted under VRAM pressure (`0` = full res).
+    demote_floor: AtomicU32,
+    /// Phase-1 -> Phase-2 fence-gated top-mip unmapping state.
+    pending_demotion: Mutex<Option<PendingDemotion>>,
 }
 
 impl Tiled {
@@ -539,6 +694,9 @@ impl Tiled {
             held: AtomicU32::new(0),
             card: AtomicU32::new(0),
             claimed: AtomicU32::new(0),
+            last_used: AtomicU64::new(crate::host::moment()),
+            demote_floor: AtomicU32::new(0),
+            pending_demotion: Mutex::new(None),
         })
     }
 
@@ -1018,7 +1176,14 @@ impl Tiled {
         } else {
             self.backed.load(Ordering::Relaxed)
         };
-        let visible = named & backed & self.every_level();
+        let raw_visible = named & backed & self.every_level();
+        let floor = self.demote_floor.load(Ordering::Acquire);
+        let visible = if floor > 0 && floor < 32 {
+            let masked = raw_visible & !((1u32 << floor) - 1);
+            if masked != 0 { masked } else { raw_visible }
+        } else {
+            raw_visible
+        };
         let shown = if visible == 0 { u32::MAX } else { visible.trailing_zeros() };
         let old = self.shown.swap(shown, Ordering::Relaxed);
         // (Under `given`'s lock: one thread at a time moves a texture in or
@@ -1063,6 +1228,434 @@ impl Tiled {
     pub(crate) fn given_bytes(&self) -> u64 {
         let given = self.given.lock().unwrap_or_else(|e| e.into_inner());
         given.total_tiles() * TILE
+    }
+
+    /// Records that this tiled texture was actively used at `moment`.
+    pub(crate) fn touch(&self, moment: u64) {
+        self.last_used.store(moment, Ordering::Relaxed);
+    }
+
+    /// Last moment (`crate::host::moment()`) this texture was touched.
+    pub(crate) fn last_used(&self) -> u64 {
+        self.last_used.load(Ordering::Relaxed)
+    }
+
+    /// Current top-mip demotion floor (`0` means full resolution).
+    pub(crate) fn demote_floor(&self) -> u32 {
+        self.demote_floor.load(Ordering::Acquire)
+    }
+
+    /// Phase 1 of fence-gated top-mip demotion: clamps `first_shown()` to
+    /// `target_shown` FIRST so the caller rewrites live GPU SRV descriptors
+    /// (`MostDetailedMip = new_shown`) and records `(fence_gate, frame_gate)`.
+    /// Does NOT unmap any tiles yet — [`Self::commit_demotion_on`] performs
+    /// `UpdateTileMappings(..., NULL)` strictly after the GPU fence completes.
+    pub(crate) fn begin_demotion(&self, target_shown: u32, fence_gate: u64, frame_gate: u64) -> bool {
+        if target_shown == 0 || target_shown >= self.levels || target_shown >= 32 {
+            return false;
+        }
+        let _given = self.given.lock().unwrap_or_else(|e| e.into_inner());
+        let backed = self.backed.load(Ordering::Acquire);
+        let card = self.card.load(Ordering::Relaxed);
+        let held = self.held.load(Ordering::Relaxed);
+        let named = held | card;
+        let below_mask = (1u32 << target_shown) - 1;
+        if card & below_mask != 0 || backed & below_mask == 0 {
+            return false;
+        }
+        let visible_after = named & backed & self.every_level() & !below_mask;
+        if visible_after == 0 {
+            return false;
+        }
+        let new_shown = visible_after.trailing_zeros();
+        let old_shown = self.shown.load(Ordering::Relaxed);
+        if old_shown != u32::MAX && new_shown <= old_shown {
+            return false;
+        }
+        self.demote_floor.store(target_shown, Ordering::Release);
+        self.shown.store(new_shown, Ordering::Release);
+        if old_shown == u32::MAX {
+            BLANK[0].fetch_sub(1, Ordering::Relaxed);
+            BLANK[1].fetch_sub(self.full, Ordering::Relaxed);
+        }
+        *self.pending_demotion.lock().unwrap_or_else(|e| e.into_inner()) = Some(PendingDemotion {
+            target_shown,
+            fence_gate,
+            frame_gate,
+        });
+        true
+    }
+
+    /// Phase 2 of fence-gated top-mip demotion: unmaps top mips `< target_shown`
+    /// via `UpdateTileMappings(..., D3D12_TILE_RANGE_FLAG_NULL)` ONLY after
+    /// `finished_fence >= fence_gate && current_frame >= frame_gate` (proving
+    /// all prior draws that could read the old `MostDetailedMip` descriptor have
+    /// completed on the GPU). Returns `(levels_unmapped, bytes, RetiredTiles)`.
+    pub(crate) fn commit_demotion_on(
+        &self,
+        queue: &ID3D12CommandQueue,
+        texture: &ID3D12Resource,
+        finished_fence: u64,
+        current_frame: u64,
+    ) -> Option<(u32, u64, RetiredTiles)> {
+        let pending = {
+            let mut slot = self.pending_demotion.lock().unwrap_or_else(|e| e.into_inner());
+            let p = (*slot)?;
+            if self.demote_floor.load(Ordering::Acquire) < p.target_shown {
+                *slot = None;
+                return None;
+            }
+            if finished_fence < p.fence_gate || current_frame < p.frame_gate {
+                return None;
+            }
+            slot.take()?
+        };
+
+        let mut given = self.given.lock().unwrap_or_else(|e| e.into_inner());
+        // Re-check under `given` lock in case `promote()` or `card_wrote()` raced.
+        if self.demote_floor.load(Ordering::Acquire) < pending.target_shown {
+            return None;
+        }
+        let card = self.card.load(Ordering::Relaxed);
+        let first_packed = self.standard.len() as u32;
+        let limit = pending.target_shown.min(first_packed);
+        let mut unmap: Vec<(u32, u32, usize)> = Vec::new();
+        for level in 0..limit {
+            if card & (1 << level) != 0 {
+                continue;
+            }
+            if given.levels[level as usize].is_some() {
+                unmap.push((level, self.standard[level as usize], level as usize));
+            }
+        }
+        if unmap.is_empty() {
+            return None;
+        }
+
+        let n = unmap.len();
+        let began = std::time::Instant::now();
+        if n <= STACK_RANGES {
+            let mut coords = [D3D12_TILED_RESOURCE_COORDINATE::default(); STACK_RANGES];
+            let mut sizes = [D3D12_TILE_REGION_SIZE::default(); STACK_RANGES];
+            let flags = [D3D12_TILE_RANGE_FLAG_NULL; STACK_RANGES];
+            let mut counts = [0u32; STACK_RANGES];
+            for (i, &(subresource, tiles, _)) in unmap.iter().enumerate() {
+                coords[i] = D3D12_TILED_RESOURCE_COORDINATE {
+                    X: 0,
+                    Y: 0,
+                    Z: 0,
+                    Subresource: subresource,
+                };
+                sizes[i] = D3D12_TILE_REGION_SIZE {
+                    NumTiles: tiles,
+                    ..Default::default()
+                };
+                counts[i] = tiles;
+            }
+            // SAFETY: live reserved texture; descriptor views already clamped and
+            // prior GPU submissions completed (`finished_fence >= fence_gate`).
+            unsafe {
+                queue.UpdateTileMappings(
+                    texture,
+                    n as u32,
+                    Some(coords.as_ptr()),
+                    Some(sizes.as_ptr()),
+                    None::<&ID3D12Heap>,
+                    n as u32,
+                    Some(flags.as_ptr()),
+                    None,
+                    Some(counts.as_ptr()),
+                    D3D12_TILE_MAPPING_FLAG_NONE,
+                );
+            }
+        } else {
+            let coords: Vec<D3D12_TILED_RESOURCE_COORDINATE> = unmap
+                .iter()
+                .map(|&(subresource, _, _)| D3D12_TILED_RESOURCE_COORDINATE {
+                    X: 0,
+                    Y: 0,
+                    Z: 0,
+                    Subresource: subresource,
+                })
+                .collect();
+            let sizes: Vec<D3D12_TILE_REGION_SIZE> = unmap
+                .iter()
+                .map(|&(_, tiles, _)| D3D12_TILE_REGION_SIZE {
+                    NumTiles: tiles,
+                    ..Default::default()
+                })
+                .collect();
+            let flags = vec![D3D12_TILE_RANGE_FLAG_NULL; n];
+            let counts: Vec<u32> = unmap.iter().map(|&(_, tiles, _)| tiles).collect();
+            // SAFETY: same as above, heap-allocated for >16 regions.
+            unsafe {
+                queue.UpdateTileMappings(
+                    texture,
+                    n as u32,
+                    Some(coords.as_ptr()),
+                    Some(sizes.as_ptr()),
+                    None::<&ID3D12Heap>,
+                    n as u32,
+                    Some(flags.as_ptr()),
+                    None,
+                    Some(counts.as_ptr()),
+                    D3D12_TILE_MAPPING_FLAG_NONE,
+                );
+            }
+        }
+        STATS[6].fetch_add(1, Ordering::Relaxed);
+        STATS[7].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+
+        let mut retired_runs = Vec::new();
+        let mut reclaimed_bytes = 0u64;
+        let mut reclaimed_bits = 0u32;
+        for &(_, _, level) in &unmap {
+            if level < 32 {
+                reclaimed_bits |= 1 << level;
+            }
+            if let Some(runs) = given.levels[level].take() {
+                for &(heap_index, start, count) in &runs {
+                    retired_runs.push((heap_index, start, count));
+                    reclaimed_bytes += u64::from(count) * TILE;
+                }
+            }
+        }
+        if reclaimed_bits != 0 {
+            self.unclaim(reclaimed_bits);
+        }
+        self.sync_backed(&given);
+        RECLAIMED[0].fetch_add(n as u64, Ordering::Relaxed);
+        RECLAIMED[1].fetch_add(reclaimed_bytes, Ordering::Relaxed);
+        DEMOTED[0].fetch_add(1, Ordering::Relaxed);
+        DEMOTED[1].fetch_add(n as u64, Ordering::Relaxed);
+        DEMOTED[2].fetch_add(reclaimed_bytes, Ordering::Relaxed);
+        (!retired_runs.is_empty()).then(|| (n as u32, reclaimed_bytes, RetiredTiles::new(retired_runs, reclaimed_bytes)))
+    }
+
+    /// Re-promotes a demoted texture back to full resolution (`demote_floor = 0`),
+    /// cancelling any uncommitted Phase-1 demotion. Returns `true` if the texture
+    /// was demoted and needs its top mips restored/re-uploaded.
+    pub(crate) fn promote(&self) -> bool {
+        let prev = self.demote_floor.swap(0, Ordering::AcqRel);
+        if prev == 0 {
+            return false;
+        }
+        *self.pending_demotion.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        let _given = self.given.lock().unwrap_or_else(|e| e.into_inner());
+        let backed = self.backed.load(Ordering::Acquire);
+        let named = self.held.load(Ordering::Relaxed) | self.card.load(Ordering::Relaxed);
+        let visible = named & backed & self.every_level();
+        if visible != 0 {
+            let restored = visible.trailing_zeros();
+            self.shown.store(restored, Ordering::Release);
+        }
+        DEMOTED[3].fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    fn has_pending_demotion(&self) -> bool {
+        self.pending_demotion
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+    }
+}
+
+struct DemotionCandidate {
+    copy: Weak<crate::resource::HostTexture>,
+    memory: u64,
+    resource_key: usize,
+}
+
+// SAFETY: `Weak<HostTexture>` is `Send` (fields of `HostTexture` are `Send + Sync`).
+unsafe impl Send for DemotionCandidate {}
+
+static DEMOTION_CANDIDATES: Mutex<Option<HashMap<u64, DemotionCandidate>>> = Mutex::new(None);
+
+/// Registers a live Tier-2 tiled texture as a weak candidate for pressure-driven
+/// idle top-mip demotion (`Weak` ensures zero impact on texture eviction).
+pub(crate) fn register_candidate(
+    serial: u64,
+    copy: &Arc<crate::resource::HostTexture>,
+    memory: u64,
+    resource_key: usize,
+) {
+    if !demote_wanted() || copy.tiled.is_none() {
+        return;
+    }
+    let mut guard = DEMOTION_CANDIDATES.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(HashMap::new);
+    map.entry(serial).or_insert_with(|| DemotionCandidate {
+        copy: Arc::downgrade(copy),
+        memory,
+        resource_key,
+    });
+}
+
+/// Periodic 1-Hz sweep (invoked from `texture::let_go_idle`) that:
+/// 1. Commits Phase-2 fence-gated tile unmapping for textures whose descriptor
+///    rewrite (`MostDetailedMip = target_shown`) has cleared the GPU fence.
+/// 2. Under VRAM pressure (`VRAM > 72%` or `residency::pressured()`), initiates
+///    Phase-1 top-mip demotion on idle large (`>= floor()`) tiled textures.
+/// 3. Below comfort band (`VRAM < 68%` and not host-pressured), proactively
+///    re-promotes previously demoted textures back to full Series X resolution.
+pub(crate) fn sweep_demotions() {
+    if !wanted() || !demote_wanted() {
+        return;
+    }
+    let Some(host) = host() else {
+        return;
+    };
+    let live: Vec<(Arc<crate::resource::HostTexture>, u64, usize)> = {
+        let mut guard = DEMOTION_CANDIDATES.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(map) = guard.as_mut() else {
+            return;
+        };
+        if map.is_empty() {
+            return;
+        }
+        let mut out = Vec::with_capacity(map.len());
+        map.retain(|_, c| {
+            if let Some(copy) = c.copy.upgrade() {
+                out.push((copy, c.memory, c.resource_key));
+                true
+            } else {
+                false
+            }
+        });
+        out
+    };
+    if live.is_empty() {
+        return;
+    }
+
+    let (started, finished) = crate::host::submissions();
+    let current_frame = crate::frame::current();
+
+    // Phase 2: commit fence-gated unmappings whose descriptor clamps have cleared the GPU.
+    let mut committed_tex = 0u64;
+    let mut committed_levels = 0u64;
+    let mut committed_bytes = 0u64;
+    for (copy, _, _) in &live {
+        let Some(tiled) = copy.tiled.as_ref() else {
+            continue;
+        };
+        if !tiled.has_pending_demotion() {
+            continue;
+        }
+        if let Some((levels, bytes, retired)) =
+            tiled.commit_demotion_on(host.queue(), &copy.texture, finished, current_frame)
+        {
+            crate::host::retire(retired);
+            committed_tex += 1;
+            committed_levels += u64::from(levels);
+            committed_bytes += bytes;
+        }
+    }
+
+    let memory = host.video_memory();
+    let pressure = evaluate_demotion_pressure(
+        memory,
+        crate::pool::empty_block_bytes(),
+        crate::residency::pressured(),
+        demote_vram_percent(),
+    );
+
+    // Phase 1 or Proactive Re-Promotion.
+    let mut begun_tex = 0usize;
+    let mut repromoted_tex = 0usize;
+    match pressure {
+        DemotionPressure::Moderate { vram_pct } | DemotionPressure::Severe { vram_pct } => {
+            let (idle_ms, idle_frames) = if matches!(pressure, DemotionPressure::Severe { .. }) {
+                (DEMOTE_IDLE_SEVERE_MS, DEMOTE_IDLE_SEVERE_FRAMES)
+            } else {
+                (DEMOTE_IDLE_MODERATE_MS, DEMOTE_IDLE_MODERATE_FRAMES)
+            };
+            let min_bytes = floor();
+            let fence_gate = started.saturating_add(DEMOTE_FENCE_LAG);
+            let frame_gate = current_frame.saturating_add(DEMOTE_FRAME_LAG);
+            for (copy, mem_va, res_key) in &live {
+                if begun_tex >= DEMOTE_PER_SWEEP {
+                    break;
+                }
+                if crate::texture::host_wrote(*res_key) {
+                    continue;
+                }
+                let Some(tiled) = copy.tiled.as_ref() else {
+                    continue;
+                };
+                if tiled.has_pending_demotion() {
+                    continue;
+                }
+                let is_idle = crate::host::long_ago(tiled.last_used(), idle_ms, idle_frames);
+                let Some(current_shown) = tiled.first_shown() else {
+                    continue;
+                };
+                let Some(target) = choose_demote_target(
+                    pressure,
+                    tiled.full,
+                    min_bytes,
+                    tiled.standard.len() as u32,
+                    tiled.levels,
+                    current_shown,
+                    tiled.backed.load(Ordering::Acquire),
+                    tiled.card.load(Ordering::Relaxed),
+                    is_idle,
+                ) else {
+                    continue;
+                };
+                if tiled.begin_demotion(target, fence_gate, frame_gate) {
+                    // Rewrite live SRV descriptors to `MostDetailedMip = target`
+                    // BEFORE Phase 2 unmaps tiles after `fence_gate` completes.
+                    crate::descriptor::host::levels_changed(*mem_va);
+                    begun_tex += 1;
+                }
+            }
+            if committed_tex > 0 || begun_tex > 0 {
+                tracing::info!(
+                    vram_pct,
+                    demoted_committed = committed_tex,
+                    levels_unmapped = committed_levels,
+                    reclaimed_mib = format_args!("{:.2}", committed_bytes as f64 / (1024.0 * 1024.0)),
+                    pending_fence_gate = begun_tex,
+                    total_reclaimed_mib = DEMOTED[2].load(Ordering::Relaxed) >> 20,
+                    "tier-2 tiled mip-tail demotion sweep"
+                );
+            }
+        }
+        DemotionPressure::None { can_repromote } => {
+            if committed_tex > 0 {
+                tracing::info!(
+                    demoted_committed = committed_tex,
+                    levels_unmapped = committed_levels,
+                    reclaimed_mib = format_args!("{:.2}", committed_bytes as f64 / (1024.0 * 1024.0)),
+                    total_reclaimed_mib = DEMOTED[2].load(Ordering::Relaxed) >> 20,
+                    "tier-2 tiled mip-tail demotion committed"
+                );
+            }
+            if can_repromote {
+                for (copy, mem_va, _) in &live {
+                    if repromoted_tex >= DEMOTE_PER_SWEEP {
+                        break;
+                    }
+                    let Some(tiled) = copy.tiled.as_ref() else {
+                        continue;
+                    };
+                    if tiled.promote() {
+                        crate::descriptor::host::levels_waiting(*mem_va);
+                        crate::descriptor::host::levels_changed(*mem_va);
+                        repromoted_tex += 1;
+                    }
+                }
+                if repromoted_tex > 0 {
+                    tracing::info!(
+                        repromoted = repromoted_tex,
+                        total_repromotions = DEMOTED[3].load(Ordering::Relaxed),
+                        "tier-2 tiled textures re-promoted to full mip resolution"
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -1174,14 +1767,22 @@ pub(crate) fn status() {
         blank[2],
     );
     let reclaimed: [u64; 4] = std::array::from_fn(|i| RECLAIMED[i].load(Ordering::Relaxed));
+    let demoted: [u64; 4] = std::array::from_fn(|i| DEMOTED[i].load(Ordering::Relaxed));
     tracing::info!(
         "tile reclamation (VICTORY_TILES_RECLAIM={}): {} levels reclaimed, {} MB unmapped total, \
-         {} MB awaiting GPU fence, {} MB returned to pool",
+         {} MB awaiting GPU fence, {} MB returned to pool; \
+         tier-2 mip demotion (VICTORY_TILES_DEMOTE={}, threshold={}%): {} textures / {} levels demoted ({} MB reclaimed), {} re-promotions",
         if reclaim_wanted() { 1 } else { 0 },
         reclaimed[0],
         reclaimed[1] >> 20,
         reclaimed[2] >> 20,
         reclaimed[3] >> 20,
+        if demote_wanted() { 1 } else { 0 },
+        demote_vram_percent(),
+        demoted[0],
+        demoted[1],
+        demoted[2] >> 20,
+        demoted[3],
     );
 }
 
@@ -2179,7 +2780,7 @@ void look() {
 
     #[test]
     fn floor_saturates_instead_of_wrapping() {
-        assert_eq!(parse_floor(None), 1 << 20);
+        assert_eq!(parse_floor(None), 512 << 10);
         assert_eq!(parse_floor(Some("0")), 64 << 10);
         assert_eq!(parse_floor(Some("2048")), 2048 << 10);
         assert_eq!(parse_floor(Some(&(1u64 << 54).to_string())), u64::MAX);
@@ -2277,6 +2878,9 @@ void look() {
             held: AtomicU32::new(0),
             card: AtomicU32::new(0),
             claimed: AtomicU32::new(0),
+            last_used: AtomicU64::new(0),
+            demote_floor: AtomicU32::new(0),
+            pending_demotion: Mutex::new(None),
         };
         assert_eq!(tiled.claim(1 << 0), 1 << 0);
         let changed = tiled.card_wrote_on(host.queue(), &host.device, &tex, 1 << 0);
@@ -2291,5 +2895,141 @@ void look() {
         assert!(!changed && waiting);
         assert!(!tiled.has_tiles(0));
         assert_eq!(tiled.given_bytes(), 0);
+    }
+
+    #[test]
+    fn demotion_pressure_and_target_thresholds() {
+        let budget = 10_000u64 << 20;
+        // 70% used, no empty pool blocks, not host pressured -> None { can_repromote: false } (>= 68%)
+        assert_eq!(
+            evaluate_demotion_pressure(Some([budget, 7_000 << 20, 0, 0]), 0, false, 72),
+            DemotionPressure::None { can_repromote: false }
+        );
+        // 65% used -> None { can_repromote: true } (< 68%)
+        assert_eq!(
+            evaluate_demotion_pressure(Some([budget, 6_500 << 20, 0, 0]), 0, false, 72),
+            DemotionPressure::None { can_repromote: true }
+        );
+        // 75% gross minus 10% empty pool blocks = 65% net -> does NOT falsely demote!
+        assert_eq!(
+            evaluate_demotion_pressure(Some([budget, 7_500 << 20, 0, 0]), 1_000 << 20, false, 72),
+            DemotionPressure::None { can_repromote: true }
+        );
+        // 74% net -> Moderate
+        assert_eq!(
+            evaluate_demotion_pressure(Some([budget, 7_400 << 20, 0, 0]), 0, false, 72),
+            DemotionPressure::Moderate { vram_pct: 74 }
+        );
+        // 50% VRAM but host `residency::pressured()` -> Moderate
+        assert_eq!(
+            evaluate_demotion_pressure(Some([budget, 5_000 << 20, 0, 0]), 0, true, 72),
+            DemotionPressure::Moderate { vram_pct: 50 }
+        );
+        // 86% net -> Severe
+        assert_eq!(
+            evaluate_demotion_pressure(Some([budget, 8_600 << 20, 0, 0]), 0, false, 72),
+            DemotionPressure::Severe { vram_pct: 86 }
+        );
+
+        let all_11 = (1u32 << 11) - 1;
+        let mod_p = DemotionPressure::Moderate { vram_pct: 75 };
+        let sev_p = DemotionPressure::Severe { vram_pct: 88 };
+
+        // Active close-up texture (`is_idle = false`) MUST NEVER be clamped (Spec-Trap #7)!
+        assert_eq!(choose_demote_target(mod_p, 1 << 20, 512 << 10, 4, 11, 0, all_11, 0, false), None);
+        assert_eq!(choose_demote_target(sev_p, 1 << 20, 512 << 10, 4, 11, 0, all_11, 0, false), None);
+
+        // Below 512 KiB floor -> never demoted.
+        assert_eq!(choose_demote_target(mod_p, 256 << 10, 512 << 10, 4, 11, 0, all_11, 0, true), None);
+
+        // Card-written mip 0 -> never demoted.
+        assert_eq!(choose_demote_target(mod_p, 1 << 20, 512 << 10, 4, 11, 0, all_11, 1 << 0, true), None);
+
+        // Only mip 0 backed (no fallback mip below it) -> never blanked!
+        assert_eq!(choose_demote_target(mod_p, 1 << 20, 512 << 10, 4, 11, 0, 1 << 0, 0, true), None);
+
+        // Idle large texture under Moderate -> demotes 1 top mip (0 -> 1).
+        assert_eq!(choose_demote_target(mod_p, 1 << 20, 512 << 10, 4, 11, 0, all_11, 0, true), Some(1));
+        // Under Severe -> demotes up to 2 top mips (0 -> 2).
+        assert_eq!(choose_demote_target(sev_p, 1 << 20, 512 << 10, 4, 11, 0, all_11, 0, true), Some(2));
+    }
+
+    #[test]
+    fn fence_gated_top_mip_demotion_and_repromotion_on_warp() {
+        let _pool_guard = TestPoolGuard::acquire();
+        let Some(mut rig) = Rig::new() else {
+            eprintln!("no adapter with tiled resources of tier 2, or no debug layer; skipped");
+            return;
+        };
+        rig.step = "tier-2 fence-gated top-mip demotion and re-promotion";
+        let desc = Rig::desc(DXGI_FORMAT_BC7_UNORM, SIDE, LEVELS, true);
+        let layout = rig.footprints(&desc);
+        let (texture, tiled) = rig.reserved(&desc);
+        assert!(tiled.standard.len() >= 2);
+
+        // 1) Allocate all mips and upload distinct byte per mip.
+        let (changed, missing, _) =
+            tiled.uploaded_on_reclaim(&rig.queue, &rig.device, &texture, from_level(0), true, true);
+        rig.check("initial full allocation");
+        assert!(changed && !missing && tiled.whole());
+        assert_eq!(tiled.first_shown(), Some(0));
+        let upload = rig.filled(&layout, |level| (level as u8 + 1) * 19);
+        let read = rig.round_trip(&texture, &layout, Some(&upload));
+        assert!(all(&read[0], 19));
+        assert!(all(&read[1], 38));
+
+        // 2) Phase 1: begin_demotion clamps first_shown() FIRST without unmapping tiles yet!
+        assert!(tiled.begin_demotion(1, 10, 20));
+        assert_eq!(tiled.first_shown(), Some(1), "descriptor clamp must advance immediately");
+        assert_eq!(tiled.demote_floor(), 1);
+        assert!(tiled.has_tiles(0), "tiles MUST remain mapped before GPU fence completes");
+
+        // 3) Phase 2 BEFORE fence/frame gate -> MUST NOT unmap!
+        assert!(tiled.commit_demotion_on(&rig.queue, &texture, 9, 20).is_none());
+        assert!(tiled.commit_demotion_on(&rig.queue, &texture, 10, 19).is_none());
+        assert!(tiled.has_tiles(0), "level 0 must stay mapped until fence & frame gates pass");
+        let still_mapped = rig.round_trip(&texture, &layout, None);
+        assert!(all(&still_mapped[0], 19), "in-flight draws still read valid mip 0 before fence");
+
+        // 4) Phase 2 AFTER fence & frame gate -> unmaps mip 0 cleanly and returns RetiredTiles.
+        let expected_bytes = u64::from(tiled.standard[0]) * TILE;
+        let (levels_unmapped, bytes, retired) = tiled
+            .commit_demotion_on(&rig.queue, &texture, 10, 20)
+            .expect("commit_demotion_on must unmap once fence & frame gates pass");
+        rig.check("Phase-2 NULL UpdateTileMappings");
+        assert_eq!(levels_unmapped, 1);
+        assert_eq!(bytes, expected_bytes);
+        assert!(!tiled.has_tiles(0));
+        assert!(tiled.has_tiles(1));
+        assert_eq!(tiled.first_shown(), Some(1));
+
+        let after_demote = rig.round_trip(&texture, &layout, None);
+        assert!(all(&after_demote[0], 0), "demoted mip 0 must read zeros");
+        assert!(all(&after_demote[1], 38), "retained mip 1 must keep data");
+
+        // Wait for GPU work before returning tiles to pool.
+        rig.run(|_| {});
+        drop(retired);
+
+        // 5) Re-promote -> demote_floor clears, next upload re-maps and restores mip 0!
+        assert!(tiled.promote());
+        assert_eq!(tiled.demote_floor(), 0);
+        assert!(!tiled.promote(), "second promote is a no-op");
+        let (changed, missing, _) =
+            tiled.uploaded_on_reclaim(&rig.queue, &rig.device, &texture, from_level(0), true, true);
+        rig.check("re-promoted full allocation");
+        assert!(changed && !missing && tiled.whole());
+        assert_eq!(tiled.first_shown(), Some(0));
+        let restored = rig.round_trip(&texture, &layout, Some(&upload));
+        assert!(all(&restored[0], 19), "re-promoted mip 0 must read restored bytes");
+
+        // 6) Cancel uncommitted Phase-1 demotion if texture becomes active before fence gate!
+        assert!(tiled.begin_demotion(1, 50, 60));
+        assert_eq!(tiled.first_shown(), Some(1));
+        assert!(tiled.promote());
+        assert_eq!(tiled.first_shown(), Some(0), "cancelling pending demotion restores mip 0 immediately");
+        assert!(tiled.commit_demotion_on(&rig.queue, &texture, 100, 100).is_none());
+        assert!(tiled.has_tiles(0), "cancelled demotion must leave mip 0 tiles intact");
+        rig.check("end of fence-gated demotion test");
     }
 }

@@ -138,7 +138,7 @@ unsafe extern "system-unwind" fn shift(to: *mut u8, from: *const u8, n: usize) -
 unsafe fn copied(to: *mut u8, from: *const u8, n: usize, real: usize) -> *mut u8 {
     // SAFETY: the host's function, noted by `import` before the title ran.
     let real: Copy = unsafe { std::mem::transmute(real) };
-    if n == 0 || !crate::watch::guards_any(to as usize, n) || !copies_on() || overlap(to as usize, from as usize, n) {
+    if n == 0 || !copies_on() || !crate::watch::guards_any(to as usize, n) || overlap(to as usize, from as usize, n) {
         // SAFETY: by the caller.
         return unsafe { real(to, from, n) };
     }
@@ -157,7 +157,7 @@ unsafe fn copied(to: *mut u8, from: *const u8, n: usize, real: usize) -> *mut u8
 unsafe extern "system-unwind" fn set(to: *mut u8, byte: i32, n: usize) -> *mut u8 {
     // SAFETY: as in `copied`.
     let real: Set = unsafe { std::mem::transmute(REAL[2].load(Relaxed)) };
-    if n == 0 || !crate::watch::guards_any(to as usize, n) || !copies_on() {
+    if n == 0 || !copies_on() || !crate::watch::guards_any(to as usize, n) {
         // SAFETY: the title's, as it asked for it.
         return unsafe { real(to, byte, n) };
     }

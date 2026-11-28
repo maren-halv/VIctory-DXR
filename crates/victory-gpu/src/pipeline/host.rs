@@ -36,6 +36,13 @@ pub(crate) struct GraphicsState {
     pub(super) samples: DXGI_SAMPLE_DESC,
 }
 
+// SAFETY: `GraphicsState` is immutable once interned into `Arc<GraphicsState>`;
+// `inputs[i].SemanticName` points into the heap buffer owned by `names[i]`,
+// which stays at a stable address for the lifetime of `GraphicsState`.
+unsafe impl Send for GraphicsState {}
+// SAFETY: as above.
+unsafe impl Sync for GraphicsState {}
+
 impl Default for GraphicsState {
     fn default() -> Self {
         let target = D3D12_RENDER_TARGET_BLEND_DESC {
@@ -152,6 +159,135 @@ fn host_blend(blend: &D3D12_BLEND_DESC, targets: &D3D12_RT_FORMAT_ARRAY) -> D3D1
 }
 
 impl GraphicsState {
+    /// Content hash over every semantic field of `GraphicsState` for interning.
+    fn content_hash(&self) -> [u8; 32] {
+        let mut h = blake3::Hasher::new();
+        let put = |h: &mut blake3::Hasher, v: u32| {
+            h.update(&v.to_le_bytes());
+        };
+        put(&mut h, self.blend.AlphaToCoverageEnable.0 as u32);
+        put(&mut h, self.blend.IndependentBlendEnable.0 as u32);
+        for t in &self.blend.RenderTarget {
+            put(&mut h, t.BlendEnable.0 as u32);
+            put(&mut h, t.LogicOpEnable.0 as u32);
+            put(&mut h, t.SrcBlend.0 as u32);
+            put(&mut h, t.DestBlend.0 as u32);
+            put(&mut h, t.BlendOp.0 as u32);
+            put(&mut h, t.SrcBlendAlpha.0 as u32);
+            put(&mut h, t.DestBlendAlpha.0 as u32);
+            put(&mut h, t.BlendOpAlpha.0 as u32);
+            put(&mut h, t.LogicOp.0 as u32);
+            put(&mut h, u32::from(t.RenderTargetWriteMask));
+        }
+        put(&mut h, self.sample_mask);
+        put(&mut h, self.rasterizer.FillMode.0 as u32);
+        put(&mut h, self.rasterizer.CullMode.0 as u32);
+        put(&mut h, self.rasterizer.FrontCounterClockwise.0 as u32);
+        put(&mut h, self.rasterizer.DepthBias as u32);
+        put(&mut h, self.rasterizer.DepthBiasClamp.to_bits());
+        put(&mut h, self.rasterizer.SlopeScaledDepthBias.to_bits());
+        put(&mut h, self.rasterizer.DepthClipEnable.0 as u32);
+        put(&mut h, self.rasterizer.MultisampleEnable.0 as u32);
+        put(&mut h, self.rasterizer.AntialiasedLineEnable.0 as u32);
+        put(&mut h, self.rasterizer.ForcedSampleCount);
+        put(&mut h, self.rasterizer.ConservativeRaster.0 as u32);
+        put(&mut h, self.depth.DepthEnable.0 as u32);
+        put(&mut h, self.depth.DepthWriteMask.0 as u32);
+        put(&mut h, self.depth.DepthFunc.0 as u32);
+        put(&mut h, self.depth.StencilEnable.0 as u32);
+        put(&mut h, u32::from(self.depth.StencilReadMask));
+        put(&mut h, u32::from(self.depth.StencilWriteMask));
+        for face in [&self.depth.FrontFace, &self.depth.BackFace] {
+            put(&mut h, face.StencilFailOp.0 as u32);
+            put(&mut h, face.StencilDepthFailOp.0 as u32);
+            put(&mut h, face.StencilPassOp.0 as u32);
+            put(&mut h, face.StencilFunc.0 as u32);
+        }
+        put(&mut h, u32::from(self.depth_bounds));
+        put(&mut h, self.strip_cut.0 as u32);
+        put(&mut h, self.topology.0 as u32);
+        put(&mut h, self.targets.NumRenderTargets);
+        for f in &self.targets.RTFormats {
+            put(&mut h, f.0 as u32);
+        }
+        put(&mut h, self.depth_format.0 as u32);
+        put(&mut h, self.samples.Count);
+        put(&mut h, self.samples.Quality);
+        put(&mut h, self.inputs.len() as u32);
+        for (e, name) in self.inputs.iter().zip(&self.names) {
+            let nb = name.as_bytes();
+            put(&mut h, nb.len() as u32);
+            h.update(nb);
+            put(&mut h, e.SemanticIndex);
+            put(&mut h, e.Format.0 as u32);
+            put(&mut h, e.InputSlot);
+            put(&mut h, e.AlignedByteOffset);
+            put(&mut h, e.InputSlotClass.0 as u32);
+            put(&mut h, e.InstanceDataStepRate);
+        }
+        *h.finalize().as_bytes()
+    }
+
+    fn same_as(&self, other: &GraphicsState) -> bool {
+        self.blend == other.blend
+            && self.sample_mask == other.sample_mask
+            && self.rasterizer.FillMode == other.rasterizer.FillMode
+            && self.rasterizer.CullMode == other.rasterizer.CullMode
+            && self.rasterizer.FrontCounterClockwise == other.rasterizer.FrontCounterClockwise
+            && self.rasterizer.DepthBias == other.rasterizer.DepthBias
+            && self.rasterizer.DepthBiasClamp.to_bits() == other.rasterizer.DepthBiasClamp.to_bits()
+            && self.rasterizer.SlopeScaledDepthBias.to_bits()
+                == other.rasterizer.SlopeScaledDepthBias.to_bits()
+            && self.rasterizer.DepthClipEnable == other.rasterizer.DepthClipEnable
+            && self.rasterizer.MultisampleEnable == other.rasterizer.MultisampleEnable
+            && self.rasterizer.AntialiasedLineEnable == other.rasterizer.AntialiasedLineEnable
+            && self.rasterizer.ForcedSampleCount == other.rasterizer.ForcedSampleCount
+            && self.rasterizer.ConservativeRaster == other.rasterizer.ConservativeRaster
+            && self.depth == other.depth
+            && self.depth_bounds == other.depth_bounds
+            && self.strip_cut == other.strip_cut
+            && self.topology == other.topology
+            && self.targets == other.targets
+            && self.depth_format == other.depth_format
+            && self.samples == other.samples
+            && self.names == other.names
+            && self.inputs.len() == other.inputs.len()
+            && self.inputs.iter().zip(&other.inputs).all(|(a, b)| {
+                a.SemanticIndex == b.SemanticIndex
+                    && a.Format == b.Format
+                    && a.InputSlot == b.InputSlot
+                    && a.AlignedByteOffset == b.AlignedByteOffset
+                    && a.InputSlotClass == b.InputSlotClass
+                    && a.InstanceDataStepRate == b.InstanceDataStepRate
+            })
+    }
+
+    /// Interns `self` into a process-wide deduplicated table so the ~80,830
+    /// graphics pipelines share their ~1,511 unique `GraphicsState`s instead of
+    /// allocating a separate `Box<GraphicsState>` per pipeline.
+    pub(crate) fn intern(self) -> Arc<GraphicsState> {
+        static INTERNED: OnceLock<RwLock<HashMap<[u8; 32], Vec<Arc<GraphicsState>>>>> =
+            OnceLock::new();
+        let table = INTERNED.get_or_init(|| RwLock::new(HashMap::new()));
+        let key = self.content_hash();
+        {
+            let guard = table.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(bucket) = guard.get(&key)
+                && let Some(hit) = bucket.iter().find(|existing| existing.same_as(&self))
+            {
+                return hit.clone();
+            }
+        }
+        let mut guard = table.write().unwrap_or_else(|e| e.into_inner());
+        let bucket = guard.entry(key).or_default();
+        if let Some(hit) = bucket.iter().find(|existing| existing.same_as(&self)) {
+            return hit.clone();
+        }
+        let arc = Arc::new(self);
+        bucket.push(arc.clone());
+        arc
+    }
+
     /// Whether the draws are a pass over the screen: no vertex input, no
     /// depth or stencil, a target. Such passes fill tables once; their shaders
     /// are few. (After Belobug/VIctory-Belobug-AMD 18e57db8.)
@@ -543,8 +679,13 @@ impl HostPipeline {
         if mesh.is_some() && !host()?.mesh_shaders() {
             return refuse("the host GPU has no mesh shaders (or no shader model 6.6)", shaders);
         }
+        // Transiently materialize `.dxil` bytecode for each stage; dropped
+        // immediately when `HostPipeline::new` returns so zero `.dxil` bytes
+        // stay resident in RAM.
+        let mut stage_dxils: Vec<Vec<u8>> = Vec::with_capacity(stages.len());
         for (s, _) in &stages {
-            s.translated()?;
+            let (_, dxil) = s.translate_with_dxil()?;
+            stage_dxils.push(dxil);
         }
         let host = host()?;
 
@@ -695,11 +836,11 @@ impl HostPipeline {
             }
         };
         let code = |i: usize| {
-            stages.get(i).and_then(|(s, _)| s.translated()).map_or(
+            stage_dxils.get(i).map_or(
                 D3D12_SHADER_BYTECODE::default(),
-                |t| D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: t.host.dxil.as_ptr().cast(),
-                    BytecodeLength: t.host.dxil.len(),
+                |dxil| D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: dxil.as_ptr().cast(),
+                    BytecodeLength: dxil.len(),
                 },
             )
         };
@@ -823,9 +964,9 @@ impl HostPipeline {
         // fall back on what `draw` does for rectangles.
         let mut rect_gs = None;
         if g.topology.0 == RECTANGLES {
-            let ps = stages.get(1).and_then(|(s, _)| s.translated());
-            let vs = &stages[0].0.translated()?.host.dxil;
-            match victory_shader::emit::rect_list_gs(vs, ps.map(|t| &t.host.dxil[..])) {
+            let vs = stage_dxils.first().map(Vec::as_slice)?;
+            let ps = stage_dxils.get(1).map(Vec::as_slice);
+            match victory_shader::emit::rect_list_gs(vs, ps) {
                 Ok(gs) => rect_gs = Some(gs),
                 Err(e) => tracing::warn!(error = %e, ?shaders, "no rectangle geometry stage"),
             }
@@ -1988,5 +2129,43 @@ mod tests {
         let (root_c, blob_c) = root_signature(&host.device, &params, &[], false).unwrap();
         assert_ne!(root_a.as_raw(), root_c.as_raw());
         assert_ne!(&*blob_a, &*blob_c);
+    }
+
+    #[test]
+    fn graphics_state_interning_deduplicates_identical_and_separates_distinct() {
+        let make = |mask: u32, bounds: bool, names: &[&str]| {
+            let mut g = GraphicsState {
+                sample_mask: mask,
+                depth_bounds: bounds,
+                ..Default::default()
+            };
+            g.targets.NumRenderTargets = 1;
+            g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+            g.names = names.iter().map(|n| CString::new(*n).unwrap()).collect();
+            g.inputs = g
+                .names
+                .iter()
+                .enumerate()
+                .map(|(i, n)| D3D12_INPUT_ELEMENT_DESC {
+                    SemanticName: PCSTR(n.as_ptr().cast()),
+                    SemanticIndex: i as u32,
+                    Format: DXGI_FORMAT_R32G32B32_FLOAT,
+                    InputSlot: 0,
+                    AlignedByteOffset: D3D12_APPEND_ALIGNED_ELEMENT,
+                    InputSlotClass: D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+                    InstanceDataStepRate: 0,
+                })
+                .collect();
+            g
+        };
+        let a1 = make(0xCAFE_0001, true, &["POSITION", "NORMAL"]).intern();
+        let a2 = make(0xCAFE_0001, true, &["POSITION", "NORMAL"]).intern();
+        let b = make(0xCAFE_0002, true, &["POSITION", "NORMAL"]).intern();
+        let c = make(0xCAFE_0001, false, &["POSITION", "NORMAL"]).intern();
+        let d = make(0xCAFE_0001, true, &["POSITION", "TEXCOORD"]).intern();
+        assert!(Arc::ptr_eq(&a1, &a2), "identical GraphicsStates must share one Arc");
+        assert!(!Arc::ptr_eq(&a1, &b));
+        assert!(!Arc::ptr_eq(&a1, &c));
+        assert!(!Arc::ptr_eq(&a1, &d));
     }
 }

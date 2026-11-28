@@ -284,7 +284,10 @@ impl<W: Work> Lane<W> {
                 }
                 (state.asked, state.next)
             };
-            self.look(limit);
+            // `CPU-09`: head selection respects `limit` so `drain()` advances
+            // `state.served` promptly, while coalescing dynamically picks up
+            // newly arrived same-queue submissions while the GPU is busy.
+            while self.step(limit, true) {}
             let mut state = self.lock();
             state.served = state.served.max(asked);
             drop(state);
@@ -294,7 +297,7 @@ impl<W: Work> Lane<W> {
 
     /// Does what is free to run of the entries before number `limit`.
     pub(super) fn look(&self, limit: u64) {
-        while self.step(limit) {}
+        while self.step(limit, false) {}
     }
 
     /// The parts of `entry`, which stands for them, in place `at`.
@@ -310,7 +313,7 @@ impl<W: Work> Lane<W> {
 
     /// Does one entry: the oldest that is the first of its queue and free to
     /// run. Whether there was one. Only one thread calls this.
-    fn step(&self, limit: u64) -> bool {
+    fn step(&self, limit: u64, join_beyond_limit: bool) -> bool {
         // Each queue's first entry, oldest first.
         let mut heads: Vec<(u64, usize, Option<W::Ask>, bool)> = Vec::new();
         // Whether one of them stands for others not known yet.
@@ -383,10 +386,11 @@ impl<W: Work> Lane<W> {
         }
         // What follows it in its queue, if that can go with it. (Nobody else
         // takes anything out, and what comes in goes to the end.)
+        let join_limit = if join_beyond_limit { u64::MAX } else { limit };
         while runs > 0 && !forced {
             let next = {
                 let mut state = self.lock();
-                let at = state.items.iter().position(|e| e.queue == entry.queue && e.number < limit);
+                let at = state.items.iter().position(|e| e.queue == entry.queue && e.number < join_limit);
                 at.and_then(|at| Some((at, state.items.remove(at)?)))
             };
             let Some((at, next)) = next else {
@@ -451,8 +455,16 @@ enum Job {
     /// the parts of it are known when they are.
     Lists(usize, Recordings),
     /// Parts taken along with a submission ([`crate::host::joins`]): where they
-    /// begin in the order, and the signals given behind them.
-    Joined(usize, Vec<crate::list::Detached>, Vec<usize>, Vec<usize>, Vec<(usize, u64)>),
+    /// begin in the order, the signals given behind them, and incremental
+    /// sorted title-memory write ranges for O(next) [`crate::host::joinable_with`].
+    Joined(
+        usize,
+        Vec<crate::list::Detached>,
+        Vec<usize>,
+        Vec<usize>,
+        Vec<(usize, u64)>,
+        Vec<(usize, usize)>,
+    ),
     /// A signal of the queue's.
     Signal(usize, u64),
     /// A frame is shown: the base texture (and optional overlay plane) and the states their lists leave them in.
@@ -557,16 +569,20 @@ impl Work for Job {
 
     fn take_along(&mut self, next: Job) -> Result<bool, Job> {
         let (most, most_lists) = crate::host::joins();
-        if most < 2 {
+        // `CPU-09`: never delay the first kick to a cold/idle GPU by coalescing.
+        if most < 2 || !crate::host::flying() {
             return Err(next);
         }
         // Nothing but waits and signals that a submission may follow.
-        let (count, lists, signals) = match self {
-            Job::Run(_, lists, order) => (1, (&*lists, &*order), &[][..]),
-            Job::Joined(_, lists, order, parts, signals) => (1 + parts.len(), (&*lists, &*order), &signals[..]),
+        let (count, lists, signals, cached_written) = match self {
+            Job::Run(_, lists, order) => (1, (&*lists, &*order), &[][..], None),
+            Job::Joined(_, lists, order, parts, signals, written) => {
+                (1 + parts.len(), (&*lists, &*order), &signals[..], Some(written.as_slice()))
+            }
             _ => return Err(next),
         };
         let hosts = || lists.1.iter().map(|&i| lists.0[i].host());
+        let mut init_written: Option<Vec<(usize, usize)>> = None;
         match &next {
             Job::Value(wait) => {
                 let met = wait.met()
@@ -587,16 +603,42 @@ impl Work for Job {
             Job::Signal(..) => {}
             Job::Run(_, more, order) => {
                 let runs: Vec<&crate::host::HostList> = order.iter().map(|&i| more[i].host()).collect();
-                if count >= most || lists.1.len() + runs.len() > most_lists || !crate::host::joinable(hosts(), &runs) {
+                if count >= most || lists.1.len() + runs.len() > most_lists {
+                    return Err(next);
+                }
+                let ok = match cached_written {
+                    Some(written) => crate::host::joinable_with(written, &runs),
+                    None => {
+                        let ahead: Vec<&crate::host::HostList> = hosts().collect();
+                        let mut written = Vec::new();
+                        crate::host::collect_written_ranges(&ahead, &mut written);
+                        let ok = crate::host::joinable_with(&written, &runs);
+                        if ok {
+                            init_written = Some(written);
+                        }
+                        ok
+                    }
+                };
+                if !ok {
                     return Err(next);
                 }
             }
             Job::Joined(..) | Job::Present(..) | Job::Lists(..) => return Err(next),
         }
         let taken = std::mem::replace(self, Job::Wait(0, 0));
-        let (queue, mut lists, mut order, mut parts, mut signals) = match taken {
-            Job::Run(queue, lists, order) => (queue, lists, order, Vec::new(), Vec::new()),
-            Job::Joined(queue, lists, order, parts, signals) => (queue, lists, order, parts, signals),
+        let (queue, mut lists, mut order, mut parts, mut signals, mut written) = match taken {
+            Job::Run(queue, lists, order) => {
+                let written = init_written.unwrap_or_else(|| {
+                    let ahead: Vec<&crate::host::HostList> = order.iter().map(|&i| lists[i].host()).collect();
+                    let mut w = Vec::new();
+                    crate::host::collect_written_ranges(&ahead, &mut w);
+                    w
+                });
+                (queue, lists, order, Vec::new(), Vec::new(), written)
+            }
+            Job::Joined(queue, lists, order, parts, signals, written) => {
+                (queue, lists, order, parts, signals, written)
+            }
             other => {
                 *self = other;
                 return Err(next);
@@ -605,6 +647,8 @@ impl Work for Job {
         let run = matches!(next, Job::Run(..));
         match next {
             Job::Run(_, more, then) => {
+                let added: Vec<&crate::host::HostList> = then.iter().map(|&i| more[i].host()).collect();
+                crate::host::collect_written_ranges(&added, &mut written);
                 parts.push(order.len());
                 order.extend(then.into_iter().map(|i| i + lists.len()));
                 lists.extend(more);
@@ -613,7 +657,7 @@ impl Work for Job {
             Job::Signal(fence, value) => signals.push((fence, value)),
             _ => {}
         }
-        *self = Job::Joined(queue, lists, order, parts, signals);
+        *self = Job::Joined(queue, lists, order, parts, signals, written);
         Ok(run)
     }
 
@@ -646,7 +690,7 @@ impl Work for Job {
                 }
                 QUEUED.fetch_sub(1, Relaxed);
             }
-            Job::Joined(queue, lists, order, parts, signals) => {
+            Job::Joined(queue, lists, order, parts, signals, _) => {
                 let _ = queue;
                 #[cfg(feature = "diagnostics")]
                 crate::capture::op(queue, || {

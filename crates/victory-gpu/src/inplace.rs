@@ -283,6 +283,8 @@ pub fn title_memory_freeing(at: usize, len: usize) {
     crate::inplace_sections::bump_generation();
     // Renderer port 1's regions there: no longer what the title shows.
     crate::port::forget(at, len);
+    // Evict & unpin non-placed loose windows wholly inside freed/remapped guest VA.
+    let _ = crate::shadow::loose_unmapped(at as u64, len as u64);
     if STATS[0].load(Ordering::Relaxed) + STATS[2].load(Ordering::Relaxed) == 0 {
         return;
     }

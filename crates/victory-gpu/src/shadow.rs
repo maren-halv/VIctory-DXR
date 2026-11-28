@@ -80,6 +80,14 @@ pub(crate) struct Shadow {
     /// outside buffers nothing asked for in a while, and nothing holds, is
     /// let go ([`let_go_idle`]).
     used: AtomicU64,
+    /// Last frame number this loose window was touched (for BAR hot-tier promotion).
+    touch_frame: AtomicU64,
+    /// Number of distinct frames this loose window has been touched (`ARCH-05`).
+    touch_frames: AtomicU64,
+    /// Cumulative bytes copied into this loose window (`ARCH-05`).
+    copied_bytes: AtomicU64,
+    /// L0 `shared_buffer` bytes accounted in [`L0_SHADOW_BYTES`] (`0` for card/BAR/placed).
+    l0_bytes: u64,
     /// The lowest and highest title address asked for in the copy (a
     /// window is 4 MiB whatever was asked: measured for the memory line).
     #[cfg(feature = "diagnostics")]
@@ -114,6 +122,12 @@ pub(crate) struct Shadow {
     /// Adaptive GPU-only copyback state (`VICTORY_GPU_ONLY_COPYBACK`):
     /// `0` observing, `1` promoted (skip `gpu_writes`), `2` demoted (sticky).
     gpu_only_state: AtomicU8,
+    /// `true` strictly while Mode-1 `PAGE_NOACCESS` hardware tripwire is armed on
+    /// `[start, start + len)` (proving zero title CPU reads/writes without VEH fault).
+    tripwire_armed: std::sync::atomic::AtomicBool,
+    /// For an in-place (`port 1`) shadow: whether any non-placed shadowed copy
+    /// overlaps this range so in-place GPU writes invalidate `watch` for it.
+    in_place_overlap: std::sync::atomic::AtomicBool,
 }
 
 /// Ownership state for an in-place [`Shadow`]. Field order ensures `heap`
@@ -126,33 +140,148 @@ struct InPlace {
     pinned: u64,
 }
 
-/// Demand-paged, 64 KiB-aligned private CPU memory backing `Card::staging`
-/// when `VICTORY_SEND_OWN=1` (zero DXGI `SHR` and zero D3D12 residency cost).
+/// Total bytes currently committed across all demand-committed [`CpuStaging`]
+/// allocations (for memory accounting / diagnostics).
+static CPU_STAGING_COMMITTED_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Total L0 `shared_buffer` bytes live across all non-placed/non-card/non-BAR shadows.
+static L0_SHADOW_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Subset of [`L0_SHADOW_BYTES`] belonging to `window == true` loose windows.
+static L0_LOOSE_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Demand-committed, 64 KiB-aligned private CPU memory backing `Card::staging`
+/// when `VICTORY_SEND_OWN=1` (`ARCH-05`): reserves address space up front via
+/// `MEM_RESERVE` and commits 64 KiB (`PIECE`) pages strictly on demand when
+/// written or merged, freeing ~450–600 MB of pure CPU RAM on untouched regions.
 struct CpuStaging {
     ptr: *mut u8,
+    len: usize,
+    /// Per-64 KiB piece committed bitmap (`1` = `MEM_COMMIT` completed).
+    committed: Box<[AtomicU64]>,
+    /// Serializes `VirtualAlloc(MEM_COMMIT)` calls for this buffer.
+    commit_lock: Mutex<()>,
+    /// Committed bytes in this buffer (decremented from global counter on drop).
+    committed_bytes: AtomicU64,
 }
 
-// SAFETY: plain virtual memory owned solely by `Card`; freed only on drop.
+// SAFETY: plain virtual memory owned solely by `Card`; pieces transition
+// monotonically from reserved -> committed and are freed only on drop.
 unsafe impl Send for CpuStaging {}
 unsafe impl Sync for CpuStaging {}
 
 impl CpuStaging {
     fn alloc(size: u64) -> Option<(Self, *mut u8)> {
-        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
-        let len = usize::try_from(size).ok()?;
-        // SAFETY: OS allocates zero-initialized 64 KiB-aligned private memory.
-        let ptr = unsafe { VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as *mut u8;
+        use windows_sys::Win32::System::Memory::{MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        let len = usize::try_from(size).ok()?.checked_next_multiple_of(PIECE)?;
+        if len == 0 {
+            return None;
+        }
+        // SAFETY: OS reserves 64 KiB-aligned private virtual address space with zero commit.
+        let ptr = unsafe { VirtualAlloc(std::ptr::null(), len, MEM_RESERVE, PAGE_READWRITE) } as *mut u8;
         if ptr.is_null() {
             return None;
         }
-        Some((Self { ptr }, ptr))
+        let pieces = len / PIECE;
+        let committed = (0..pieces.div_ceil(64)).map(|_| AtomicU64::new(0)).collect();
+        Some((
+            Self {
+                ptr,
+                len,
+                committed,
+                commit_lock: Mutex::new(()),
+                committed_bytes: AtomicU64::new(0),
+            },
+            ptr,
+        ))
+    }
+
+    #[inline]
+    fn is_piece_committed(&self, piece: usize) -> bool {
+        self.committed
+            .get(piece / 64)
+            .is_some_and(|w| (w.load(Ordering::Acquire) >> (piece % 64)) & 1 != 0)
+    }
+
+    /// Commits every 64 KiB piece intersecting `[from, to)` on demand so reads
+    /// and writes never fault on reserved-only pages. Lock-free fast path once
+    /// the pieces are committed.
+    fn ensure_committed(&self, from: usize, to: usize) -> bool {
+        let to = to.min(self.len);
+        if from >= to {
+            return true;
+        }
+        let first = from / PIECE;
+        let last = (to - 1) / PIECE;
+        let w0 = first / 64;
+        let w1 = last / 64;
+        // Fast path: check committed bitmap with Acquire ordering.
+        if w0 == w1 {
+            let count = last - first + 1;
+            let mask = if count == 64 { u64::MAX } else { ((1u64 << count) - 1) << (first % 64) };
+            if self.committed[w0].load(Ordering::Acquire) & mask == mask {
+                return true;
+            }
+        } else {
+            let mut all = true;
+            for w in w0..=w1 {
+                let lo = if w == w0 { first % 64 } else { 0 };
+                let hi = if w == w1 { last % 64 } else { 63 };
+                let count = hi - lo + 1;
+                let mask = if count == 64 { u64::MAX } else { ((1u64 << count) - 1) << lo };
+                if self.committed[w].load(Ordering::Acquire) & mask != mask {
+                    all = false;
+                    break;
+                }
+            }
+            if all {
+                return true;
+            }
+        }
+        self.commit_slow(first, last)
+    }
+
+    #[cold]
+    fn commit_slow(&self, first: usize, last: usize) -> bool {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, PAGE_READWRITE, VirtualAlloc};
+        let _guard = self.commit_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut p = first;
+        while p <= last {
+            if self.is_piece_committed(p) {
+                p += 1;
+                continue;
+            }
+            let run_start = p;
+            p += 1;
+            while p <= last && !self.is_piece_committed(p) {
+                p += 1;
+            }
+            let run_pieces = p - run_start;
+            let byte_off = run_start * PIECE;
+            let byte_len = run_pieces * PIECE;
+            // SAFETY: `[byte_off, byte_off + byte_len)` lies within our `MEM_RESERVE` region.
+            let ok = unsafe {
+                VirtualAlloc(self.ptr.add(byte_off).cast(), byte_len, MEM_COMMIT, PAGE_READWRITE)
+            };
+            if ok.is_null() {
+                return false;
+            }
+            for piece in run_start..p {
+                self.committed[piece / 64].fetch_or(1u64 << (piece % 64), Ordering::Release);
+            }
+            self.committed_bytes.fetch_add(byte_len as u64, Ordering::Relaxed);
+            CPU_STAGING_COMMITTED_BYTES.fetch_add(byte_len as u64, Ordering::Relaxed);
+        }
+        true
     }
 }
 
 impl Drop for CpuStaging {
     fn drop(&mut self) {
         use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
-        // SAFETY: `self.ptr` came from `VirtualAlloc(..., MEM_RESERVE | MEM_COMMIT, ...)`.
+        let committed = *self.committed_bytes.get_mut();
+        if committed > 0 {
+            CPU_STAGING_COMMITTED_BYTES.fetch_sub(committed, Ordering::Relaxed);
+        }
+        // SAFETY: `self.ptr` came from `VirtualAlloc(..., MEM_RESERVE, ...)`.
         unsafe {
             VirtualFree(self.ptr.cast(), 0, MEM_RELEASE);
         }
@@ -246,10 +375,15 @@ const GPU_ONLY_DEMOTED: u8 = 2;
 const GPU_ONLY_WARMUP_FRAMES: u64 = 60;
 const GPU_ONLY_MIN_FETCHED_PIECES: u64 = 16;
 const GPU_ONLY_MAX_RESETS: u32 = 4;
+/// Boot-time population grace window (frames `< 600`): initial CPU uploads
+/// during world boot reset observation without consuming `GPU_ONLY_MAX_RESETS`
+/// so Mode-1 pure-GPU buffers can promote cleanly once steady-state begins (`ARCH-05`).
+const GPU_ONLY_BOOT_GRACE_FRAME: u64 = 600;
 
-/// `VICTORY_GPU_ONLY_COPYBACK`: `0` (default/off); `1` promote `>= min_mb`
-/// card buffers with 0 CPU uploads during warmup; `2` also promote `>= min_mb`
-/// card buffers whose CPU-uploaded and GPU-fetched 64 KiB pieces are disjoint.
+/// `VICTORY_GPU_ONLY_COPYBACK`: `1` (default ON with Mode-1 `PAGE_NOACCESS`
+/// hardware tripwire) promotes `>= min_mb` card buffers with 0 CPU uploads
+/// during warmup; `0` disables; `2` also promotes `>= min_mb` card buffers
+/// whose CPU-uploaded and GPU-fetched 64 KiB pieces are disjoint.
 pub(crate) fn gpu_only_mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| {
@@ -257,10 +391,19 @@ pub(crate) fn gpu_only_mode() -> u8 {
             return 0;
         }
         match std::env::var("VICTORY_GPU_ONLY_COPYBACK").as_deref().map(str::trim) {
-            Ok("1") => 1,
+            Ok("0") => 0,
             Ok("2") => 2,
-            _ => 0,
+            _ => 1,
         }
+    })
+}
+
+/// `VICTORY_GPU_ONLY_TRIPWIRE`: default ON (`true`) when `gpu_only_mode() == 1`
+/// (unless set to `0`), always OFF for Mode 0 and Mode 2 (`ARCH-06`).
+pub(crate) fn gpu_only_tripwire_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        gpu_only_mode() == 1 && std::env::var_os("VICTORY_GPU_ONLY_TRIPWIRE").is_none_or(|v| v != "0")
     })
 }
 
@@ -313,6 +456,9 @@ struct GpuOnlyTracker {
     fetched_pieces: u64,
     up_bits: Vec<u64>,
     fetched_bits: Vec<u64>,
+    /// Dynamic per-64-KiB-piece bitset updated from both warmup GPU fetches AND
+    /// post-promotion declared GPU write ranges (`ARCH-06`: never frozen at frame +60).
+    gpu_dirty_bits: Vec<u64>,
     resets: u32,
 }
 
@@ -329,19 +475,48 @@ impl GpuOnlyTracker {
         bits.get(piece / 64).is_some_and(|&w| (w >> (piece % 64)) & 1 != 0)
     }
 
-    fn reset_window(&mut self) -> bool {
-        self.resets += 1;
+    fn clear_window(&mut self) {
         // Start the next warmup window on the first GPU fetch after the reset.
         self.window_start_frame = 0;
         self.fetched_pieces = 0;
         self.up_bits.iter_mut().for_each(|w| *w = 0);
         self.fetched_bits.iter_mut().for_each(|w| *w = 0);
+        self.gpu_dirty_bits.iter_mut().for_each(|w| *w = 0);
+    }
+
+    fn reset_window(&mut self) -> bool {
+        self.resets += 1;
+        self.clear_window();
         self.resets > GPU_ONLY_MAX_RESETS
     }
 
-    /// Records CPU-uploaded piece indices `[first_piece, last_piece)` at `frame`.
-    /// Returns `true` if the buffer should be sticky-demoted.
+    /// Dynamically records declared GPU write piece indices `[first_piece, last_piece)`
+    /// even after promotion so newly written GPU pieces are never silently overwritten
+    /// by a later CPU upload (`ARCH-06`).
+    fn note_declared_write(&mut self, first_piece: usize, last_piece: usize) {
+        for p in first_piece..last_piece {
+            Self::set_bit(&mut self.gpu_dirty_bits, p);
+        }
+    }
+
+    /// Records CPU-uploaded piece indices `[first_piece, last_piece)` (post-boot steady state).
+    #[cfg(test)]
     fn note_upload(&mut self, mode: u8, promoted: bool, first_piece: usize, last_piece: usize) -> bool {
+        self.note_upload_at(mode, promoted, GPU_ONLY_BOOT_GRACE_FRAME, first_piece, last_piece)
+    }
+
+    /// Records CPU-uploaded piece indices `[first_piece, last_piece)` at `frame`.
+    /// Returns `true` if the buffer should be sticky-demoted. During boot frames
+    /// (`frame < GPU_ONLY_BOOT_GRACE_FRAME`), unpromoted observation resets do not
+    /// burn `GPU_ONLY_MAX_RESETS` so steady-state Mode-1 promotion still succeeds (`ARCH-05`).
+    fn note_upload_at(
+        &mut self,
+        mode: u8,
+        promoted: bool,
+        frame: u64,
+        first_piece: usize,
+        last_piece: usize,
+    ) -> bool {
         if first_piece >= last_piece {
             return false;
         }
@@ -349,12 +524,18 @@ impl GpuOnlyTracker {
             if promoted {
                 return true;
             }
-            return self.reset_window();
+            // In Mode 1, unpromoted uploads (including world-load/streaming setup well past
+            // frame 600) simply restart the 60-frame quiet observation window without sticky-
+            // banning the buffer. Once promoted, any CPU upload or tripwire read sticky-demotes.
+            let _ = frame;
+            self.clear_window();
+            return false;
         }
-        // Mode 2 (disjoint): demote/reset only if any uploaded piece overlaps a GPU-fetched piece.
+        // Mode 2 (disjoint): demote/reset if any uploaded piece overlaps a GPU-fetched
+        // OR post-promotion declared GPU-dirty piece.
         let mut overlaps = false;
         for p in first_piece..last_piece {
-            if Self::has_bit(&self.fetched_bits, p) {
+            if Self::has_bit(&self.fetched_bits, p) || Self::has_bit(&self.gpu_dirty_bits, p) {
                 overlaps = true;
                 break;
             }
@@ -365,6 +546,10 @@ impl GpuOnlyTracker {
         if overlaps {
             if promoted {
                 return true;
+            }
+            if frame < GPU_ONLY_BOOT_GRACE_FRAME {
+                self.clear_window();
+                return false;
             }
             return self.reset_window();
         }
@@ -384,6 +569,7 @@ impl GpuOnlyTracker {
                 return (false, self.reset_window());
             }
             Self::set_bit(&mut self.fetched_bits, p);
+            Self::set_bit(&mut self.gpu_dirty_bits, p);
         }
         self.fetched_pieces += pieces.len() as u64;
         let ready = self.fetched_pieces >= GPU_ONLY_MIN_FETCHED_PIECES
@@ -437,7 +623,7 @@ fn has_overlapping_shadow(start: u64, len: u64, self_id: u64) -> bool {
             }
         }
     }
-    false
+    crate::port::overlaps(start, len)
 }
 
 /// Fast-path bounds `[min_start, max_end]` for `GPU_ONLY_WATCHED` (`max_end == 0`
@@ -546,6 +732,27 @@ fn demote_overlapping_gpu_only(start: u64, len: u64, skip_id: u64, reason: &'sta
     });
 }
 
+/// Called by `watch.rs` after disarming a Mode-1 `PAGE_NOACCESS` tripwire on
+/// shadow `id`: permanently demotes the buffer and logs the triggering address
+/// and RIP once.
+pub(crate) fn tripwire_demote(id: u64, fault_addr: usize, access: usize, rip: usize, reason: &'static str) {
+    let target = {
+        let watched = GPU_ONLY_WATCHED.read().unwrap_or_else(|e| e.into_inner());
+        watched
+            .iter()
+            .find(|&&(_, _, s_id, _)| s_id == id)
+            .and_then(|(_, _, _, w)| w.upgrade())
+    };
+    if let Some(shadow) = target {
+        shadow.demote_gpu_only_inner(reason, Some((fault_addr, access, rip)));
+        let mut watched = GPU_ONLY_WATCHED.write().unwrap_or_else(|e| e.into_inner());
+        watched.retain(|(_, _, _, w)| {
+            w.upgrade()
+                .is_some_and(|s| s.gpu_only_state.load(Ordering::Relaxed) != GPU_ONLY_DEMOTED)
+        });
+    }
+}
+
 /// Periodic diagnostic summary for `VICTORY_GPU_ONLY_COPYBACK`.
 pub(crate) fn gpu_only_log(frames: f64) {
     let mode = gpu_only_mode();
@@ -557,10 +764,12 @@ pub(crate) fn gpu_only_log(frames: f64) {
     let demoted = GPU_ONLY_STATS[2].load(Ordering::Relaxed);
     let skipped = GPU_ONLY_STATS[3].swap(0, Ordering::Relaxed) as f64 / frames.max(1.0);
     let skipped_mb = GPU_ONLY_STATS[4].swap(0, Ordering::Relaxed) as f64 / 1e6 / frames.max(1.0);
+    let (armed, tripped) = crate::watch::tripwire_stats();
     tracing::info!(
-        "gpu-only card copyback (VICTORY_GPU_ONLY_COPYBACK={mode}, min={} MB): {promoted} buffers promoted ({promoted_mb} MB), \
-         {demoted} demoted; skipped {skipped:.1} gpu_writes/f ({skipped_mb:.1} MB/f)",
+        "gpu-only card copyback (VICTORY_GPU_ONLY_COPYBACK={mode}, min={} MB, tripwire={}): {promoted} buffers promoted ({promoted_mb} MB), \
+         {demoted} demoted (tripwire armed={armed}, tripped={tripped}); skipped {skipped:.1} gpu_writes/f ({skipped_mb:.1} MB/f)",
         gpu_only_min_bytes() >> 20,
+        if gpu_only_tripwire_on() { "on" } else { "off" },
     );
 }
 
@@ -766,12 +975,36 @@ fn card_room_kept_on() -> bool {
 /// buffers, so no room is kept for them any more.
 static CARD_REFUSED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+/// Timestamp (`crate::host::coarse_ms`) when the most recent card buffer was
+/// allocated, so [`card_room_kept`] decays cleanly to 0 after world-load settle.
+static CARD_LAST_ADDED_MS: AtomicU64 = AtomicU64::new(0);
+
+const CARD_SETTLE_DECAY_START_MS: u64 = 5_000;
+const CARD_SETTLE_DECAY_END_MS: u64 = 10_000;
+
 /// Pure calculation for [`card_room_kept`]: caps the reservation at `SEEN`
 /// (800 MiB, covering the ~738–762 MiB world-load buffer burst with headroom
 /// without locking ~286 MiB of phantom VRAM once buffers settle).
 fn card_room_kept_for(limit: u64, live: u64, refused: u64) -> u64 {
     const SEEN: u64 = 800 << 20;
     limit.min(SEEN).saturating_sub(live.saturating_add(refused))
+}
+
+/// Applies post-world-settle decay to [`card_room_kept_for`]: holds full reserve
+/// before any card buffer exists or within `5 s` of the last allocation, decays
+/// linearly over `5..10 s`, and releases to `0` at `>= 10 s` so phantom headroom
+/// is never permanently locked (`ARCH-01` / `ARCH-06`).
+fn card_room_kept_decayed(limit: u64, live: u64, refused: u64, elapsed_ms: u64) -> u64 {
+    let base = card_room_kept_for(limit, live, refused);
+    if base == 0 || live == 0 || elapsed_ms <= CARD_SETTLE_DECAY_START_MS {
+        return base;
+    }
+    if elapsed_ms >= CARD_SETTLE_DECAY_END_MS {
+        return 0;
+    }
+    let remaining = CARD_SETTLE_DECAY_END_MS - elapsed_ms;
+    let span = CARD_SETTLE_DECAY_END_MS - CARD_SETTLE_DECAY_START_MS;
+    base.saturating_mul(remaining) / span
 }
 
 /// The bytes of the card's memory the texture queue leaves free for card
@@ -781,10 +1014,18 @@ pub(crate) fn card_room_kept() -> u64 {
     if !card_room_kept_on() || !cards() {
         return 0;
     }
-    card_room_kept_for(
+    let live = CARD_BYTES[0].load(Ordering::Relaxed);
+    let last_added = CARD_LAST_ADDED_MS.load(Ordering::Relaxed);
+    let elapsed_ms = if live > 0 && last_added != 0 {
+        crate::host::coarse_ms().saturating_sub(last_added)
+    } else {
+        0
+    };
+    card_room_kept_decayed(
         card_limits().1,
-        CARD_BYTES[0].load(Ordering::Relaxed),
+        live,
         CARD_REFUSED[1].load(Ordering::Relaxed),
+        elapsed_ms,
     )
 }
 
@@ -940,6 +1181,7 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
     }
     let (buffer, _) = host.shared_buffer(size)?;
     CARD_BYTES[0].fetch_add(size, Ordering::Relaxed);
+    CARD_LAST_ADDED_MS.store(crate::host::coarse_ms().max(1), Ordering::Relaxed);
     Some(buffer)
 }
 
@@ -1031,7 +1273,9 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
         return None;
     }
     let buffer = host.uav_buffer(size);
-    if buffer.is_none() {
+    if buffer.is_some() {
+        CARD_LAST_ADDED_MS.store(crate::host::coarse_ms().max(1), Ordering::Relaxed);
+    } else {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
     }
     buffer
@@ -1082,21 +1326,41 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
     Some(buffer)
 }
 
-/// The most bytes of windows outside buffers that lie in the card's memory
-/// and are filled by the CPU through the bus (`VICTORY_WINDOWS_BAR_MB`; 0, the
-/// default, none): one buffer (`D3D12_HEAP_TYPE_GPU_UPLOAD`), no CPU's side, no
-/// copy to send and no list of changes, unlike [`window_card_most`]. The CPU
-/// only writes them, as no shader is declared to write a window; if one were,
-/// its snapshot and compare would read through the bus, right but slow. In a
-/// captured frame the lists take 26 ms of the card instead of 29, the frame 32
-/// instead of 36; filling them costs the CPU what it did.
-///
-/// Windows go there while a fifth of the card's budget is free, as with
-/// [`window_room_for`], which this comes before.
+/// Default demand-tiered BAR hot-window budget in MiB (`640 MiB`, replacing
+/// greedy `4096 MiB` BAR flooding while keeping the full ~3 ms/f GPU read win
+/// on hot streaming windows; `ARCH-05`). Override with `VICTORY_WINDOWS_BAR_MB`
+/// (`0` disables BAR promotion).
+const DEFAULT_WINDOW_BAR_MB: u64 = 640;
+/// Minimum distinct frames touched before an L0 loose window promotes to BAR.
+const BAR_PROMOTE_FRAMES: u64 = 6;
+/// Minimum bytes copied before an L0 loose window promotes to BAR (clamped to window size).
+const BAR_PROMOTE_MIN_BYTES: u64 = 256 << 10;
+/// Cold BAR window idle demotion/eviction threshold (4 seconds).
+const BAR_IDLE_MS: u64 = 4_000;
+/// Local VRAM ceilings for BAR tier hysteresis: promote below `80%`, demote above `82%`.
+const BAR_PROMOTE_VRAM_PCT: u64 = 80;
+const BAR_DEMOTE_VRAM_PCT: u64 = 82;
+
+fn resolve_window_bar_mb(env: Option<&str>) -> u64 {
+    env.and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_WINDOW_BAR_MB)
+}
+
+#[inline]
+fn bar_should_promote(touch_frames: u64, copied_bytes: u64, window_len: u64) -> bool {
+    touch_frames >= BAR_PROMOTE_FRAMES && copied_bytes >= window_len.min(BAR_PROMOTE_MIN_BYTES)
+}
+
+/// The most bytes of hot loose windows promoted into BAR (`D3D12_HEAP_TYPE_GPU_UPLOAD`)
+/// memory (`VICTORY_WINDOWS_BAR_MB`; default `640` MiB, `0` disables BAR).
+/// Fresh loose windows always allocate in L0 first and promote here only once hot
+/// (`>= 6` frames touched and `>= 256 KiB` copied), with direct CPU `Map()` intact
+/// (never `CreateReservedResource`, Spec-Trap #1).
 fn window_mapped_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_WINDOWS_BAR_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) << 20
+        let env = std::env::var("VICTORY_WINDOWS_BAR_MB").ok();
+        resolve_window_bar_mb(env.as_deref()).saturating_mul(1 << 20)
     })
 }
 
@@ -1111,6 +1375,36 @@ pub(crate) fn card_live_bytes() -> u64 {
     CARD_BYTES[0].load(Ordering::Relaxed)
 }
 
+/// Total live L0 (`shared_buffer`) shadow bytes (buffers + loose windows + exact views).
+#[allow(dead_code)]
+pub(crate) fn l0_shadow_bytes() -> u64 {
+    L0_SHADOW_BYTES.load(Ordering::Relaxed)
+}
+
+/// Live L0 (`shared_buffer`) bytes held by `window == true` loose windows.
+#[allow(dead_code)]
+pub(crate) fn l0_loose_bytes() -> u64 {
+    L0_LOOSE_BYTES.load(Ordering::Relaxed)
+}
+
+/// Committed CPU RAM bytes across all demand-committed [`CpuStaging`] buffers.
+#[allow(dead_code)]
+pub(crate) fn cpu_staging_committed_bytes() -> u64 {
+    CPU_STAGING_COMMITTED_BYTES.load(Ordering::Relaxed)
+}
+
+/// `(l0_total_bytes, l0_loose_bytes, bar_window_bytes, cpu_staging_committed_bytes)`
+/// accessor for `host.rs` `memory summary:`.
+#[allow(dead_code)]
+pub(crate) fn memory_tier_info() -> (u64, u64, u64, u64) {
+    (
+        L0_SHADOW_BYTES.load(Ordering::Relaxed),
+        L0_LOOSE_BYTES.load(Ordering::Relaxed),
+        WINDOW_MAPPED_BYTES.load(Ordering::Relaxed),
+        CPU_STAGING_COMMITTED_BYTES.load(Ordering::Relaxed),
+    )
+}
+
 /// A buffer for a window of `size` bytes in card memory the CPU maps, if it is
 /// to be there ([`window_mapped_most`]).
 fn window_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
@@ -1120,11 +1414,11 @@ fn window_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
     }
     let host = host()?;
     if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 100 * 88
+        && used.saturating_add(size) > (budget / 100).saturating_mul(BAR_PROMOTE_VRAM_PCT)
     {
         return None;
     }
-    if WINDOW_MAPPED_BYTES.fetch_add(size, Ordering::Relaxed) + size > most {
+    if WINDOW_MAPPED_BYTES.fetch_add(size, Ordering::Relaxed).saturating_add(size) > most {
         WINDOW_MAPPED_BYTES.fetch_sub(size, Ordering::Relaxed);
         return None;
     }
@@ -1300,7 +1594,10 @@ pub(crate) fn stale_pages(most: usize, say: &mut dyn FnMut(&Shadow, usize, usize
                 continue;
             }
             done += hi - lo;
-            // SAFETY: inside the mapping; nothing is in the air and the
+            if !shadow.ensure_staging_committed(lo - start, hi - start) {
+                continue;
+            }
+            // SAFETY: inside the mapping (committed above); nothing is in the air and the
             // submission lock is held.
             let held = unsafe { std::slice::from_raw_parts(shadow.data.add(lo - start).cast_const(), hi - lo) };
             if held == title {
@@ -1518,6 +1815,11 @@ mod card_tests {
         assert!(!t.note_upload(2, true, 0, 4));
         // Post-promotion upload overlapping a GPU-fetched piece demotes immediately.
         assert!(t.note_upload(2, true, 10, 11));
+        // Dynamic `gpu_dirty_bits`: post-promotion declared GPU write on a brand-new
+        // piece (40..44) catches a later CPU upload overlapping piece 42!
+        t.note_declared_write(40, 44);
+        assert!(!t.note_upload(2, true, 0, 4));
+        assert!(t.note_upload(2, true, 42, 43));
     }
 
     /// The offsets the compare's shader takes for a piece (`CARD_COMPARE`
@@ -2005,7 +2307,7 @@ fn snapshots_kept() -> usize {
 /// the largest, and of those the largest one and the next ones up to `KEPT`
 /// bytes in all.
 fn give_back(v: Vec<u8>) {
-    const KEPT: usize = 512 << 20;
+    const KEPT: usize = 64 << 20;
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
@@ -3531,10 +3833,17 @@ impl Drop for Shadow {
             KEPT_BYTES.fetch_sub(self.len, Ordering::Relaxed);
         }
         let window = self.window;
+        if self.l0_bytes > 0 {
+            L0_SHADOW_BYTES.fetch_sub(self.l0_bytes, Ordering::Relaxed);
+            if window {
+                L0_LOOSE_BYTES.fetch_sub(self.l0_bytes, Ordering::Relaxed);
+            }
+        }
         if self.mapped {
             WINDOW_MAPPED_BYTES.fetch_sub(self.len, Ordering::Relaxed);
         }
         if self.gpu_only_state.load(Ordering::Relaxed) == GPU_ONLY_PROMOTED {
+            crate::watch::tripwire_disarm_id(self.id);
             GPU_ONLY_STATS[0].fetch_sub(1, Ordering::Relaxed);
             GPU_ONLY_STATS[1].fetch_sub(self.len, Ordering::Relaxed);
         }
@@ -3880,7 +4189,7 @@ pub(crate) fn window_use() -> [u64; 8] {
 }
 
 /// Resolves `VICTORY_WINDOW_BUDGET_MB`: explicit `0` disables the budget cap,
-/// a positive integer overrides it, and unset defaults to 1280 MiB.
+/// a positive integer overrides it, and unset defaults to 512 MiB (`ARCH-05`).
 fn resolve_window_budget_mb(env: Option<&str>, limited_ram: bool) -> Option<u64> {
     if let Some(raw) = env {
         if let Ok(v) = raw.trim().parse::<u64>() {
@@ -3888,7 +4197,7 @@ fn resolve_window_budget_mb(env: Option<&str>, limited_ram: bool) -> Option<u64>
         }
     }
     let _ = limited_ram;
-    Some(1280)
+    Some(512)
 }
 
 /// Optional byte cap for loose title-window copies, in bytes. `VICTORY_WINDOW_BUDGET_MB=0`
@@ -3932,22 +4241,15 @@ fn window_victims(entries: &[(u64, u64, usize)], keep: u64) -> Vec<usize> {
 static WINDOW_BAND: std::sync::Mutex<crate::host::RamBand> =
     std::sync::Mutex::new(crate::host::RamBand::Calm);
 
-/// Lets go of the copies of windows outside buffers that nothing names any
-/// more. They were never freed, and the world's streaming keeps asking for
-/// new ones: 648 windows (2.8 GB) when the cutscene began, 974 (4.3 GB)
-/// eight minutes later (run 24). A window goes when
-/// - only the table of windows holds its copy: no list not yet reset reads
-///   or writes it, no pass over the heap keeps its range, no submission is
-///   comparing it;
-/// - only the copy holds its host buffer: no descriptor slot views it (a
-///   slot keeps the buffer it views, `HostHeap::kept`), so no draw can read
-///   it through a slot made earlier;
-/// - nothing asked for it for `IDLE_MS` and `IDLE_FRAMES` frames.
-///
-/// The next read of that memory makes a new copy and copies the window
-/// again. Called before a submission starts, by the thread that submits.
+/// Lets go of idle loose windows, unpins idle `HostHeap::kept` title slots
+/// (Null-Before-Retire), demotes cold/VRAM-pressured BAR windows back to L0,
+/// and promotes hot L0 windows (`>= 6` frames touched and `>= 256 KiB` copied)
+/// into the bounded BAR tier (`ARCH-05`).
 pub(crate) fn let_go_idle() {
     const IDLE_FRAMES: u64 = 4;
+    const MAX_PROMOTE_PER_SWEEP: usize = 4;
+    const MAX_DEMOTE_PER_SWEEP: usize = 8;
+
     let budget = window_budget();
     let mut idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
     let mut keep = u64::MAX;
@@ -3956,50 +4258,111 @@ pub(crate) fn let_go_idle() {
             let mut band = WINDOW_BAND.lock().unwrap_or_else(|e| e.into_inner());
             *band = crate::host::ram_band(*band, working, private, free, commit, total, limit);
             match *band {
-                crate::host::RamBand::Calm => {}
-                crate::host::RamBand::Watch => {
-                    idle_ms = idle_ms.min(10_000);
+                crate::host::RamBand::Calm => {
+                    idle_ms = idle_ms.min(4_000);
                     keep = bytes;
                 }
-                crate::host::RamBand::High => {
+                crate::host::RamBand::Watch => {
                     idle_ms = idle_ms.min(2_000);
+                    keep = (bytes * 3) / 4;
+                }
+                crate::host::RamBand::High => {
+                    idle_ms = idle_ms.min(1_000);
                     keep = bytes / 2;
                 }
             }
+        } else {
+            idle_ms = idle_ms.min(4_000);
+            keep = bytes;
         }
     }
-    let gone: Vec<Arc<Shadow>> = {
+    let l0_over_budget = keep != u64::MAX && L0_LOOSE_BYTES.load(Ordering::Relaxed) > keep;
+    let l0_idle_ms = if l0_over_budget { idle_ms.min(500) } else { idle_ms };
+    let bar_idle_ms = idle_ms.min(BAR_IDLE_MS);
+    let vram_info = host().and_then(|h| h.video_memory());
+    let vram_pct = vram_info.map_or(0, |[vbudget, vused, ..]| {
+        if vbudget == 0 {
+            0
+        } else {
+            vused.saturating_mul(100) / vbudget
+        }
+    });
+    let vram_over_82 = vram_pct > BAR_DEMOTE_VRAM_PCT;
+
+    let mut gone: Vec<Arc<Shadow>> = {
         // Held from the look to the removal: `loose` hands a copy out
         // under the same lock, so none is handed out in between.
         let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
         if map.is_empty() {
             return;
         }
-        let mut eligible: Vec<(u64, (u64, u64), usize, u64)> = Vec::new();
+        let mut eligible: Vec<(u64, (u64, u64), usize, u64, bool)> = Vec::new();
         let mut active_seen = std::collections::HashSet::new();
         let mut active_bytes = 0u64;
+        let mut bar_candidates: Vec<(u64, (u64, u64), Arc<Shadow>)> = Vec::new();
         for (&key, s) in map.iter() {
             let id = Arc::as_ptr(s) as usize;
-            let is_idle = Arc::strong_count(s) == 1
-                && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
-                && crate::host::references(&s.buffer) == 1;
-            if is_idle {
-                eligible.push((s.used.load(Ordering::Relaxed), key, id, s.len));
-            } else if active_seen.insert(id) {
+            let used = s.used.load(Ordering::Relaxed);
+            let eff_idle = if s.mapped { bar_idle_ms } else { l0_idle_ms };
+            let strong = Arc::strong_count(s);
+            let aged = crate::host::long_ago(used, eff_idle, IDLE_FRAMES);
+            // Only evict loose windows held by NO list (`strong == 1`) AND NO live
+            // descriptor slot (`refs == 1`). Never speculatively null live mapped
+            // bindless title-heap slots (`loose_unmapped` handles freed VAs).
+            if strong == 1 && aged && crate::host::references(&s.buffer) == 1 {
+                eligible.push((used, key, id, s.len, s.mapped));
+                continue;
+            }
+            if s.mapped && vram_over_82 && strong == 1 && crate::host::references(&s.buffer) == 1 {
+                bar_candidates.push((used, key, s.clone()));
+            }
+            if active_seen.insert(id) {
                 active_bytes = active_bytes.saturating_add(s.len);
             }
         }
-        eligible.sort_unstable_by_key(|&(used, _, _, _)| used);
-        let victims = if keep == u64::MAX {
-            (0..eligible.len()).collect()
+        eligible.sort_unstable_by_key(|&(used, _, _, _, _)| used);
+        let mut gone: Vec<Arc<Shadow>> = Vec::new();
+        if keep == u64::MAX {
+            for (_, key, _, _, _) in &eligible {
+                if let Some(s) = map.remove(key) {
+                    gone.push(s);
+                }
+            }
         } else {
-            let entries: Vec<(u64, u64, usize)> = eligible
+            // Cold unreferenced BAR windows idle > 4s are evicted immediately.
+            let mut l0_eligible = Vec::new();
+            for entry in eligible {
+                if entry.4 {
+                    if let Some(s) = map.remove(&entry.1) {
+                        gone.push(s);
+                    }
+                } else {
+                    l0_eligible.push(entry);
+                }
+            }
+            let entries: Vec<(u64, u64, usize)> = l0_eligible
                 .iter()
-                .map(|&(used, _, id, len)| (used, len, id))
+                .map(|&(used, _, id, len, _)| (used, len, id))
                 .collect();
-            window_victims(&entries, keep.saturating_sub(active_bytes))
-        };
-        let gone: Vec<Arc<Shadow>> = victims.into_iter().filter_map(|i| map.remove(&eligible[i].1)).collect();
+            let victims = window_victims(&entries, keep.saturating_sub(active_bytes));
+            for i in victims {
+                if let Some(s) = map.remove(&l0_eligible[i].1) {
+                    gone.push(s);
+                }
+            }
+        }
+        // Under VRAM > 82%, evict coldest unreferenced BAR windows cleanly.
+        if vram_over_82 && !bar_candidates.is_empty() {
+            bar_candidates.sort_unstable_by_key(|&(used, _, _)| used);
+            for (_, key, s) in bar_candidates.into_iter().take(MAX_DEMOTE_PER_SWEEP) {
+                if Arc::strong_count(&s) == 2 && crate::host::references(&s.buffer) == 1 {
+                    drop(s);
+                    if let Some(removed) = map.remove(&key) {
+                        gone.push(removed);
+                    }
+                }
+            }
+        }
         if !gone.is_empty() {
             for shadow in &gone {
                 shadow.dead.store(true, Ordering::Release);
@@ -4014,12 +4377,85 @@ pub(crate) fn let_go_idle() {
             format!("sweep: {went} host copies of windows of title memory let go ({} KiB), held by no list and no slot", bytes >> 10)
         });
     }
-    for shadow in gone {
+    for shadow in gone.drain(..) {
         LET_GO[0].fetch_add(1, Ordering::Relaxed);
         LET_GO[1].fetch_add(shadow.len, Ordering::Relaxed);
-        // Nothing runs now and nothing names it: freed at once unless a
-        // submission is running after all.
-        crate::host::retire(shadow);
+        if shadow.mapped {
+            let vram = shadow.len;
+            crate::host::retire_vram(shadow, vram);
+        } else {
+            crate::host::retire(shadow);
+        }
+    }
+    // Promote hot unreferenced L0 windows (`refs == 1`, zero live bindless slots)
+    // into BAR while VRAM < 80% and BAR budget has headroom; never null live slots.
+    let bar_cap = window_mapped_most();
+    if bar_cap > 0
+        && !vram_over_82
+        && vram_pct < BAR_PROMOTE_VRAM_PCT
+        && WINDOW_MAPPED_BYTES.load(Ordering::Relaxed) < bar_cap
+    {
+        let mut promote: Vec<(u64, (u64, u64), Arc<Shadow>)> = {
+            let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+            map.iter()
+                .filter_map(|(&key, s)| {
+                    if !s.window || s.mapped || s.card.is_some() || s.place.is_some() {
+                        return None;
+                    }
+                    if crate::host::references(&s.buffer) != 1 {
+                        return None;
+                    }
+                    let touches = s.touch_frames.load(Ordering::Relaxed);
+                    let copied = s.copied_bytes.load(Ordering::Relaxed);
+                    if !bar_should_promote(touches, copied, s.len) {
+                        return None;
+                    }
+                    if crate::host::long_ago(s.used.load(Ordering::Relaxed), 2_000, IDLE_FRAMES) {
+                        return None;
+                    }
+                    Some((copied, key, s.clone()))
+                })
+                .collect()
+        };
+        if !promote.is_empty() {
+            promote.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+            for (_, key, old) in promote.into_iter().take(MAX_PROMOTE_PER_SWEEP) {
+                if crate::host::references(&old.buffer) != 1 {
+                    continue;
+                }
+                let (start, len) = key;
+                let Some((buffer, data)) = window_mapped_for(len) else {
+                    break;
+                };
+                crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x} mapped on the card"));
+                // SAFETY: live D3D12 BAR buffer just created.
+                let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+                let mut promoted = Shadow::new(buffer, data, gpu, start, len);
+                promoted.window = true;
+                promoted.mapped = true;
+                promoted.used.store(old.used.load(Ordering::Relaxed), Ordering::Relaxed);
+                promoted.touch_frame.store(old.touch_frame.load(Ordering::Relaxed), Ordering::Relaxed);
+                promoted.touch_frames.store(old.touch_frames.load(Ordering::Relaxed), Ordering::Relaxed);
+                promoted.copied_bytes.store(old.copied_bytes.load(Ordering::Relaxed), Ordering::Relaxed);
+                let promoted = Arc::new(promoted);
+                let swapped = {
+                    let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+                    if map.get(&key).is_some_and(|cur| Arc::ptr_eq(cur, &old))
+                        && crate::host::references(&old.buffer) == 1
+                    {
+                        map.insert(key, promoted);
+                        old.dead.store(true, Ordering::Release);
+                        bump_shadow_epoch();
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if swapped {
+                    crate::host::retire(old);
+                }
+            }
+        }
     }
 }
 
@@ -4112,6 +4548,24 @@ impl Shadow {
         self.id
     }
 
+    /// Whether this shadow is a loose window of title memory outside buffer objects.
+    #[inline]
+    pub(crate) fn is_window(&self) -> bool {
+        self.window
+    }
+
+    /// Ensures the demand-committed [`CpuStaging`] pages covering offsets
+    /// `[from, to)` are committed before reading or writing `self.data` (`ARCH-05`).
+    #[inline]
+    pub(crate) fn ensure_staging_committed(&self, from: usize, to: usize) -> bool {
+        if let Some(card) = &self.card
+            && let CardStaging::Cpu(cpu) = &card.staging
+        {
+            return cpu.ensure_committed(from, to);
+        }
+        true
+    }
+
     /// Whether it is no copy but title memory in place (`crate::inplace`).
     pub(crate) fn in_place(&self) -> bool {
         self.place.is_some()
@@ -4190,6 +4644,10 @@ impl Shadow {
             merging: RwLock::default(),
             kept: Mutex::default(),
             used: AtomicU64::new(crate::host::moment()),
+            touch_frame: AtomicU64::new(0),
+            touch_frames: AtomicU64::new(0),
+            copied_bytes: AtomicU64::new(0),
+            l0_bytes: 0,
             #[cfg(feature = "diagnostics")]
             asked: [AtomicU64::new(u64::MAX), AtomicU64::new(0)],
             #[cfg(feature = "diagnostics")]
@@ -4206,6 +4664,8 @@ impl Shadow {
             mapped: false,
             place: None,
             gpu_only_state: AtomicU8::new(GPU_ONLY_OBSERVING),
+            tripwire_armed: std::sync::atomic::AtomicBool::new(false),
+            in_place_overlap: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -4232,21 +4692,29 @@ impl Shadow {
     /// before the submission (a copy per declared range and submission);
     /// a GPU-side dirty mask would save that if big ranges make it slow.
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        let len = len.min(self.left(address));
         // In place the shaders write title memory itself: no snapshot, no
-        // compare, nothing to copy back, and no wait on its account.
-        // shortcut: another host copy of the same bytes (a title buffer
-        // inside this one with a copy of its own, a texture in it) is not
-        // told: the card's writes are not seen by write watching.
+        // compare, nothing to copy back, and no wait on its account. Notify
+        // overlapping GPU-only buffers, textures, and any overlapping shadowed
+        // copies so they never hold stale bytes (`ARCH-06 #4`).
         if self.place.is_some() {
+            if len > 0 {
+                demote_overlapping_gpu_only(address, len, self.id, "overlapping in-place gpu write");
+                if self.in_place_overlap.load(Ordering::Relaxed) {
+                    crate::descriptor::host::remapped(address as usize, len as usize);
+                    crate::watch::wrote(address as usize, len as usize);
+                }
+            }
             return;
         }
         self.written.store(true, Ordering::Relaxed);
-        let len = len.min(self.left(address));
         if self.gpu_only_skip() {
             GPU_ONLY_STATS[3].fetch_add(1, Ordering::Relaxed);
             GPU_ONLY_STATS[4].fetch_add(len, Ordering::Relaxed);
-            return;
         }
+        // Always defer `Step::GpuWrite` even for promoted buffers so `batch.flush_one()`,
+        // lightweight `self.pending`/`self.flights`, and dynamic `gpu_dirty_bits` remain
+        // coherent; `card_span()` skips `CARD_COMPARE` while promoted (`ARCH-06`).
         list.defer_gpu_write(self, address as usize, len as usize);
     }
 
@@ -4261,6 +4729,21 @@ impl Shadow {
     pub(crate) fn writing(&self, address: usize, len: usize) {
         if self.place.is_some() {
             return;
+        }
+        // Dynamically track declared GPU write pieces even after GPU-only promotion
+        // so later CPU uploads overlapping newly written GPU pieces cleanly demote (`ARCH-06`).
+        if let Some(card) = &self.card
+            && gpu_only_mode() > 0
+            && self.gpu_only_state.load(Ordering::Acquire) == GPU_ONLY_PROMOTED
+        {
+            let (from, to) = self.inside(address, len);
+            if from < to {
+                let pieces = self.pieces(from, to);
+                card.gpu_only
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .note_declared_write(pieces.start, pieces.end);
+            }
         }
         let range = (address, address + len);
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
@@ -4684,6 +5167,9 @@ impl Shadow {
     /// (`crate::host::late`): the ranges are those of flights in the air,
     /// which are then settled before this refresh.
     pub(crate) fn stale_under_writes(&self, address: usize, len: usize) -> bool {
+        if self.gpu_only_tripwired() {
+            return false;
+        }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to || self.pending_count.load(Ordering::Acquire) == 0 {
@@ -4728,6 +5214,9 @@ impl Shadow {
     /// cannot say what was written, a snapshot is missing, or `runs_left`
     /// ran out. Pages done before that stay done.
     pub(crate) fn merge_under_writes(&self, address: usize, len: usize, runs_left: &mut usize) -> bool {
+        if self.gpu_only_tripwired() {
+            return false;
+        }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to || self.pending_count.load(Ordering::Acquire) == 0 {
@@ -4990,7 +5479,10 @@ impl Shadow {
             let _compared = Compared(t);
             MERGED[0].fetch_add(1, Ordering::Relaxed);
             let at = lo - self.start as usize;
-            // SAFETY: the caller's.
+            if self.card.is_some() && !self.ensure_staging_committed(at, at + n) {
+                return Ok(None);
+            }
+            // SAFETY: the caller's (committed above if backed by `CpuStaging`).
             let held = unsafe { std::slice::from_raw_parts_mut(held.add(at), n) };
             if self.card.is_some() {
                 // Whole words go up as pairs, all of them in one
@@ -5116,7 +5608,7 @@ impl Shadow {
     /// Same as [`Shadow::nothing_new`], reusing a [`crate::watch::JournalScan`]
     /// so consecutive spans in the same journal shard avoid SRWLock RMW churn.
     pub(crate) fn nothing_new_with_scan(&self, scan: &mut crate::watch::JournalScan<'_>, address: usize, len: usize) -> bool {
-        if self.place.is_some() {
+        if self.place.is_some() || self.gpu_only_tripwired() {
             return true;
         }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
@@ -5192,6 +5684,9 @@ impl Shadow {
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
+        if self.gpu_only_tripwired() {
+            return 0;
+        }
         let watched = self.watched.load(Ordering::Relaxed);
         if watched != NOT_WATCHED {
             if matches!(watched, 1 | GUARDED)
@@ -5207,6 +5702,9 @@ impl Shadow {
                     }
                 }
                 let copied = self.copy_stale(from, to, now, &written);
+                if self.window && copied > 0 {
+                    self.copied_bytes.fetch_add(copied as u64, Ordering::Relaxed);
+                }
                 self.refresh_check(from, to);
                 #[cfg(feature = "diagnostics")]
                 {
@@ -5222,10 +5720,13 @@ impl Shadow {
         crate::copystat::add(crate::copystat::C::WholeBytes, (to - from) as u64);
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
-        self.copy(from, to);
+        let copied = self.copy(from, to);
+        if self.window && copied > 0 {
+            self.copied_bytes.fetch_add(copied as u64, Ordering::Relaxed);
+        }
         #[cfg(feature = "diagnostics")]
         crate::copystat::whole(from, to - from, started.elapsed().as_micros() as u64);
-        to - from
+        copied
     }
 
     /// Fast path for [`Shadow::update_free`] when the journal already covers
@@ -5238,22 +5739,24 @@ impl Shadow {
         let last = (to - 1) / PAGE;
         let whole_bounds = (first * PAGE).max(start) >= from && ((last + 1) * PAGE).min(end) <= to;
         // Acquire `JOURNAL.read()` before `self.copied.lock()` to match
-        // `nothing_new`'s lock order, and drop `j` before `parts_written`.
-        let (mut copied, now, stale, ranged) = {
-            let j = crate::watch::journal_read();
-            let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-            let ranged = if crate::watch::light() { Self::ranged_in(&copied.1, from, to) } else { 0 };
-            if ranged != 0 && !whole_bounds {
-                return None;
-            }
-            let (now, stale) = crate::watch::stale_pages_in_journal(&j, from, to, base, &copied.0)?;
-            (copied, now, stale, ranged)
-        };
+        // `nothing_new`'s lock order, and pass `j` into `copy_stale_pages` so
+        // `parts_written_with_journal` never re-acquires `JOURNAL.read()` under
+        // `self.copied` (which would ABBA-deadlock with a waiting `JOURNAL.write()`).
+        let j = crate::watch::journal_read();
+        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        let ranged = if crate::watch::light() { Self::ranged_in(&copied.1, from, to) } else { 0 };
+        if ranged != 0 && !whole_bounds {
+            return None;
+        }
+        let (now, stale) = crate::watch::stale_pages_in_journal(&j, from, to, base, &copied.0)?;
+        let bytes = self.copy_stale_pages(&mut copied, Some(j), from, to, now, ranged, &stale);
+        drop(copied);
+        if self.window && bytes > 0 {
+            self.copied_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+        }
         if watched != GUARDED && crate::watch::guarded(from, to) {
             self.watched.store(GUARDED, Ordering::Relaxed);
         }
-        let bytes = self.copy_stale_pages(&mut copied, from, to, now, ranged, &stale);
-        drop(copied);
         self.refresh_check(from, to);
         #[cfg(feature = "diagnostics")]
         {
@@ -5287,9 +5790,11 @@ impl Shadow {
         let mut at = from;
         while at < to {
             let n = SAMPLE.min(to - at);
-            if crate::host::read_into(at as *const u8, &mut title[..n]) {
+            if crate::host::read_into(at as *const u8, &mut title[..n])
+                && self.ensure_staging_committed(at - start, at - start + n)
+            {
                 // SAFETY: `[from, to)` lies inside the buffer (`update`),
-                // so these bytes are inside the copy's mapping.
+                // committed above if backed by `CpuStaging`.
                 let copy = unsafe { std::slice::from_raw_parts(self.data.add(at - start).cast_const(), n) };
                 let mut map = DIFFERING.lock().unwrap_or_else(|e| e.into_inner());
                 let map = map.get_or_insert_with(Default::default);
@@ -5325,7 +5830,14 @@ impl Shadow {
     /// (`written`: last writes by page, in page order; `now`: this
     /// asking), whole pages within the buffer.
     fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
+        if self.gpu_only_tripwired() {
+            return 0;
+        }
         let base = self.start as usize / PAGE;
+        // Acquire `JOURNAL.read()` before `self.copied.lock()` whenever dirty-4K
+        // narrowing/accounting is active so lock order matches `nothing_new`.
+        let j = (crate::watch::dirty4k_narrow() || crate::watch::dirty4k_kept())
+            .then(crate::watch::journal_read);
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();
         // Pages the range holds in part are never noted in `copied`, and
@@ -5349,6 +5861,15 @@ impl Shadow {
             };
             let at = &mut copied.0[page - base];
             let taken = (*at).max(ranged);
+            if taken == 0 && self.gpu_only_tripwired() && self.gpu_only_page_is_gpu_dirty(page - base) {
+                if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
+                    *at = now;
+                }
+                if let Some((first, known)) = run.take() {
+                    runs.push(((first * PAGE).max(from), (page * PAGE).min(to), known));
+                }
+                continue;
+            }
             if taken == 0 || write > taken {
                 // A page only partly in the range is copied in part: it
                 // stays stale for the rest.
@@ -5375,7 +5896,7 @@ impl Shadow {
         if let Some((first, known)) = run {
             runs.push(((first * PAGE).max(from), ((last + 1) * PAGE).min(to), known));
         }
-        self.finish_copy_stale(&mut copied, from, to, now, runs, &again_at)
+        self.finish_copy_stale(&mut copied, j, from, to, now, runs, &again_at)
     }
 
     /// Builds stale runs directly from `stale` `(page, copied_at)` pairs found
@@ -5383,12 +5904,16 @@ impl Shadow {
     fn copy_stale_pages(
         &self,
         copied: &mut (Vec<u64>, [(usize, usize, u64); 2]),
+        j: Option<crate::watch::JournalRead>,
         from: usize,
         to: usize,
         now: u64,
         ranged: u64,
         stale: &[(usize, u64)],
     ) -> usize {
+        if self.gpu_only_tripwired() {
+            return 0;
+        }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let base = start / PAGE;
         let mut runs: Vec<(usize, usize, bool)> = Vec::new();
@@ -5396,6 +5921,15 @@ impl Shadow {
         let mut run: Option<(usize, usize, bool)> = None;
         for &(page, at) in stale {
             let taken = at.max(ranged);
+            if taken == 0 && self.gpu_only_tripwired() && self.gpu_only_page_is_gpu_dirty(page - base) {
+                if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
+                    copied.0[page - base] = now;
+                }
+                if let Some((first, next, known)) = run.take() {
+                    runs.push(((first * PAGE).max(from), (next * PAGE).min(to), known));
+                }
+                continue;
+            }
             if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
                 copied.0[page - base] = now;
             }
@@ -5419,7 +5953,7 @@ impl Shadow {
         if let Some((first, next, known)) = run {
             runs.push(((first * PAGE).max(from), (next * PAGE).min(to), known));
         }
-        self.finish_copy_stale(copied, from, to, now, runs, &again_at)
+        self.finish_copy_stale(copied, j, from, to, now, runs, &again_at)
     }
 
     /// Narrows `runs` by 4 KiB dirty parts, copies them into the shadow, and
@@ -5427,6 +5961,7 @@ impl Shadow {
     fn finish_copy_stale(
         &self,
         copied: &mut (Vec<u64>, [(usize, usize, u64); 2]),
+        j: Option<crate::watch::JournalRead>,
         from: usize,
         to: usize,
         now: u64,
@@ -5436,7 +5971,11 @@ impl Shadow {
         let narrow = crate::watch::dirty4k_narrow();
         let kept = crate::watch::dirty4k_kept();
         let runs = if !again_at.is_empty() && (narrow || kept) {
-            let parts = crate::watch::parts_written(again_at);
+            let parts = match j.as_ref() {
+                Some(j) => crate::watch::parts_written_with_journal(j, again_at),
+                None => crate::watch::parts_written(again_at),
+            };
+            drop(j);
             if kept {
                 for &bits in &parts {
                     let found = (bits != u16::MAX).then_some(bits);
@@ -5445,6 +5984,7 @@ impl Shadow {
             }
             if narrow { by_parts(runs, again_at, &parts) } else { runs }
         } else {
+            drop(j);
             runs
         };
         let bytes = self.take_all(runs);
@@ -5646,12 +6186,15 @@ impl Shadow {
                 title.resize(to - from, 0);
                 // (Pages that are not there read as zeros.)
                 crate::host::copy_mapped(title.as_mut_ptr(), from as *const u8, to - from, false);
+                if !self.ensure_staging_committed(from - start, to - start) {
+                    continue;
+                }
                 let mut at = from;
                 while at < to {
                     let next = ((at / KERNEL_PAGE + 1) * KERNEL_PAGE).min(to);
                     let title = &title[at - from..next - from];
-                    // SAFETY: inside the mapping of the copy's CPU side, which
-                    // nothing else reads or writes there: no shader's range
+                    // SAFETY: inside the mapping of the copy's CPU side (committed above),
+                    // which nothing else reads or writes there: no shader's range
                     // holds it, and the parts of a refresh lie apart.
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at - start), next - at) };
                     if title == held {
@@ -5687,6 +6230,9 @@ impl Shadow {
         };
         let whole = !known && card.before.get().is_none();
         let start = self.start as usize;
+        if !self.ensure_staging_committed(from - start, to - start) {
+            return 0;
+        }
         let mut all_dirty: Vec<(usize, usize)> = Vec::new();
         TITLE.with_borrow_mut(|title| {
             title.resize(PAGE, 0);
@@ -5736,7 +6282,11 @@ impl Shadow {
         if from >= to {
             return 0;
         }
-        // SAFETY: inside the mapping (`from` and `to` are within the buffer).
+        if !self.ensure_staging_committed(from - start, to - start) {
+            return 0;
+        }
+        // SAFETY: inside the mapping (`from` and `to` are within the buffer,
+        // committed above if backed by `CpuStaging`).
         let at = unsafe { self.data.add(from - start) };
         if self.card.is_some() && crate::host::upcheck::on() {
             for_pieces_of(from - start, to - start, |a, b| {
@@ -5826,9 +6376,11 @@ impl Shadow {
         let bytes = &bytes[self.start as usize + from - address..][..to - from];
         let _merging = self.merging.write().unwrap_or_else(|e| e.into_inner());
         if self.card.is_some() {
-            // SAFETY: inside the mapping of the CPU's side, in a range no
-            // refresh writes; the lock keeps the landing out.
-            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.data.add(from), bytes.len()) };
+            if self.ensure_staging_committed(from, to) {
+                // SAFETY: inside the mapping of the CPU's side (committed above),
+                // in a range no refresh writes; the lock keeps the landing out.
+                unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.data.add(from), bytes.len()) };
+            }
         } else if let Some(snapshot) = self.before.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
             // SAFETY: the snapshot's allocation holds the copy's length.
             unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), snapshot.as_mut_ptr().add(from), bytes.len()) };
@@ -5842,11 +6394,30 @@ impl Shadow {
     }
 
     /// Diagnostics: of a copy in the card's memory, what its CPU side holds
-    /// at offsets `[at, at + len)` (cut to the copy).
+    /// at offsets `[at, at + len)` (cut to the copy). Uncommitted demand-paged
+    /// [`CpuStaging`] pieces read as zeros without forcing OS commit.
     pub(crate) fn card_held(&self, at: usize, len: usize) -> Vec<u8> {
         let to = (at + len).min(self.len as usize);
-        if self.card.is_none() || at >= to {
+        let Some(card) = &self.card else {
             return Vec::new();
+        };
+        if at >= to {
+            return Vec::new();
+        }
+        if let CardStaging::Cpu(cpu) = &card.staging {
+            let mut out = vec![0u8; to - at];
+            let mut pos = at;
+            while pos < to {
+                let piece = pos / PIECE;
+                let end = ((piece + 1) * PIECE).min(to);
+                if cpu.is_piece_committed(piece) {
+                    // SAFETY: piece is committed within `self.data`.
+                    let src = unsafe { std::slice::from_raw_parts(self.data.add(pos).cast_const(), end - pos) };
+                    out[pos - at..end - at].copy_from_slice(src);
+                }
+                pos = end;
+            }
+            return out;
         }
         // SAFETY: inside the mapping; the caller holds the submission lock,
         // under which it is written but for what is being landed.
@@ -5946,21 +6517,97 @@ impl Shadow {
         gpu_only_mode() > 0 && self.gpu_only_state.load(Ordering::Acquire) == GPU_ONLY_PROMOTED
     }
 
+    /// `true` strictly while Mode-1 promoted with an active `PAGE_NOACCESS` hardware
+    /// tripwire (guaranteeing zero silent title CPU reads or writes).
+    #[inline]
+    fn gpu_only_tripwired(&self) -> bool {
+        self.tripwire_armed.load(Ordering::Acquire) && self.gpu_only_skip()
+    }
+
+    fn gpu_only_page_is_gpu_dirty(&self, piece: usize) -> bool {
+        self.card.as_ref().is_some_and(|card| {
+            let tracker = card.gpu_only.lock().unwrap_or_else(|e| e.into_inner());
+            GpuOnlyTracker::has_bit(&tracker.gpu_dirty_bits, piece)
+        })
+    }
+
+    /// Populates any untouched (`taken == 0`) non-GPU-dirty pages into `self.data`
+    /// and marks all pages stamped in `self.copied` right before arming a Mode-1
+    /// `PAGE_NOACCESS` hardware tripwire.
+    fn seal_unfetched_pages_for_tripwire(&self, card: &Card) {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let base = start / PAGE;
+        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        let stamp = copied
+            .0
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            .max(copied.1[0].2)
+            .max(copied.1[1].2)
+            .max(1);
+        let ranged_all = Self::ranged_in(&copied.1, start, end);
+        let mut runs: Vec<(usize, usize, bool)> = Vec::new();
+        let mut run_start: Option<usize> = None;
+        {
+            let tracker = card.gpu_only.lock().unwrap_or_else(|e| e.into_inner());
+            for (idx, slot) in copied.0.iter_mut().enumerate() {
+                let taken = (*slot).max(ranged_all);
+                if taken == 0 {
+                    *slot = stamp;
+                    if !GpuOnlyTracker::has_bit(&tracker.gpu_dirty_bits, idx) {
+                        run_start.get_or_insert(base + idx);
+                    } else if let Some(first) = run_start.take() {
+                        runs.push(((first * PAGE).max(start), ((base + idx) * PAGE).min(end), false));
+                    }
+                } else if let Some(first) = run_start.take() {
+                    runs.push(((first * PAGE).max(start), ((base + idx) * PAGE).min(end), false));
+                }
+            }
+        }
+        if let Some(first) = run_start {
+            let last_end = ((base + copied.0.len()) * PAGE).min(end);
+            runs.push(((first * PAGE).max(start), last_end, false));
+        }
+        if !runs.is_empty() {
+            let _ = self.take_all(runs);
+        }
+    }
+
     /// Permanently demotes this buffer out of GPU-only copyback elision and
     /// marks its `Card::before` hashes stale so the next compare is exact.
     pub(crate) fn demote_gpu_only(&self, reason: &'static str) {
+        self.demote_gpu_only_inner(reason, None);
+    }
+
+    fn demote_gpu_only_inner(&self, reason: &'static str, tripwire_fault: Option<(usize, usize, usize)>) {
+        self.tripwire_armed.store(false, Ordering::Release);
         let prev = self.gpu_only_state.swap(GPU_ONLY_DEMOTED, Ordering::AcqRel);
         if prev == GPU_ONLY_PROMOTED {
+            crate::watch::tripwire_disarm_id(self.id);
             GPU_ONLY_STATS[0].fetch_sub(1, Ordering::Relaxed);
             GPU_ONLY_STATS[1].fetch_sub(self.len, Ordering::Relaxed);
             GPU_ONLY_STATS[2].fetch_add(1, Ordering::Relaxed);
             self.card_mark_all_hash_stale();
-            tracing::info!(
-                start = format_args!("{:#x}", self.start),
-                len = self.len,
-                reason,
-                "gpu-only card buffer demoted back to normal copyback (VICTORY_GPU_ONLY_COPYBACK)"
-            );
+            if let Some((fault_addr, access, rip)) = tripwire_fault {
+                tracing::warn!(
+                    start = format_args!("{:#x}", self.start),
+                    len = self.len,
+                    fault = format_args!("{fault_addr:#x}"),
+                    access = if access == 0 { "read" } else { "write" },
+                    rip = format_args!("{rip:#x}"),
+                    reason,
+                    "gpu-only Mode-1 tripwire triggered: restored PAGE_READWRITE and demoted buffer back to normal copyback"
+                );
+            } else {
+                tracing::info!(
+                    start = format_args!("{:#x}", self.start),
+                    len = self.len,
+                    reason,
+                    "gpu-only card buffer demoted back to normal copyback (VICTORY_GPU_ONLY_COPYBACK)"
+                );
+            }
         }
     }
 
@@ -5978,6 +6625,7 @@ impl Shadow {
             return;
         };
         let promoted = state == GPU_ONLY_PROMOTED;
+        let frame = crate::frame::current();
         let demote = {
             let mut tracker = card.gpu_only.lock().unwrap_or_else(|e| e.into_inner());
             let mut hit = false;
@@ -5986,7 +6634,7 @@ impl Shadow {
                     continue;
                 }
                 let pieces = self.pieces(a, b);
-                if tracker.note_upload(mode, promoted, pieces.start, pieces.end) {
+                if tracker.note_upload_at(mode, promoted, frame, pieces.start, pieces.end) {
                     hit = true;
                     break;
                 }
@@ -6031,6 +6679,11 @@ impl Shadow {
                 self.demote_gpu_only("overlapping host copy");
                 return;
             }
+            // Hold `self.merging.write()` -> `self.before.lock()` (matching `land_back`
+            // lock order) while transitioning to `PROMOTED` + arming `PAGE_NOACCESS`
+            // so no concurrent `land_card` or `card_merge_relay` can be mid-`safecopy`.
+            let _merging = self.merging.write().unwrap_or_else(|e| e.into_inner());
+            let _side = self.before.lock().unwrap_or_else(|e| e.into_inner());
             if self
                 .gpu_only_state
                 .compare_exchange(GPU_ONLY_OBSERVING, GPU_ONLY_PROMOTED, Ordering::AcqRel, Ordering::Acquire)
@@ -6038,12 +6691,42 @@ impl Shadow {
             {
                 // Preserve GPU-written bytes if the CPU ever writes another dword in the same page.
                 self.keep_stores();
+                // Seed dynamic `gpu_dirty_bits` from any currently in-flight declared ranges.
+                if self.pending_count.load(Ordering::Acquire) != 0 {
+                    let in_flight: Vec<(usize, usize)> =
+                        self.pending.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    let mut tracker = card.gpu_only.lock().unwrap_or_else(|e| e.into_inner());
+                    for (a, e) in in_flight {
+                        let (from, to) = self.inside(a, e.saturating_sub(a));
+                        if from < to {
+                            let pieces = self.pieces(from, to);
+                            tracker.note_declared_write(pieces.start, pieces.end);
+                        }
+                    }
+                }
+                // Snapshot any untouched (`copied == 0`), non-GPU-dirty pages ONCE
+                // while `PAGE_READWRITE` is still active so post-promotion refreshes
+                // never touch guest memory and self-trigger the `PAGE_NOACCESS` tripwire.
+                if mode == 1 && gpu_only_tripwire_on() {
+                    self.seal_unfetched_pages_for_tripwire(card);
+                }
+                let tripwire_armed = if mode == 1 && gpu_only_tripwire_on() {
+                    crate::watch::tripwire_arm(self.id, self.start as usize, self.len as usize)
+                } else {
+                    false
+                };
+                if tripwire_armed {
+                    self.tripwire_armed.store(true, Ordering::Release);
+                }
+                drop(_side);
+                drop(_merging);
                 GPU_ONLY_STATS[0].fetch_add(1, Ordering::Relaxed);
                 GPU_ONLY_STATS[1].fetch_add(self.len, Ordering::Relaxed);
                 tracing::info!(
                     start = format_args!("{:#x}", self.start),
                     len = self.len,
                     mode,
+                    tripwire = tripwire_armed,
                     "gpu-only card buffer promoted: skipping compare/fetch/merge copyback (VICTORY_GPU_ONLY_COPYBACK)"
                 );
             }
@@ -6095,8 +6778,12 @@ impl Shadow {
     }
 
     /// The declared range `[address, end)` as the compare on the card
-    /// takes it; `None` if none of it lies in the copy.
+    /// takes it; `None` if none of it lies in the copy or copyback is elided
+    /// for a promoted GPU-only buffer (`ARCH-06`).
     pub(crate) fn card_span(&self, address: usize, end: usize) -> Option<CardSpan> {
+        if self.gpu_only_skip() {
+            return None;
+        }
         let (from, to) = self.inside(address, end.saturating_sub(address));
         (from < to).then(|| card_span_of(self.start as usize, from, to))
     }
@@ -6186,11 +6873,17 @@ impl Shadow {
     /// sends it up before the next submission. `title` is scratch memory.
     /// Returns the bytes written to title memory.
     pub(crate) fn card_merge(&self, at: usize, gpu: &[u8], title: &mut Vec<u8>) -> usize {
+        if self.gpu_only_skip() {
+            return 0;
+        }
         let start = self.start as usize;
         if self.card.is_none() || at + gpu.len() > self.len as usize {
             return 0;
         }
-        // SAFETY: inside the mapping (checked above); only the submitting
+        if !self.ensure_staging_committed(at, at + gpu.len()) {
+            return 0;
+        }
+        // SAFETY: inside the mapping (checked & committed above); only the submitting
         // thread writes it.
         let old = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) };
         let Some(first) = first_difference(gpu, old) else {
@@ -6202,6 +6895,7 @@ impl Shadow {
         title.clear();
         title.resize(n, 0);
         let mut written = 0;
+        let mut card_differs = 0u8;
         if crate::host::read_into((start + at) as *const u8, title) {
             // The stretch as read: what the card did not change is the
             // title's, and may have been written again since.
@@ -6213,19 +6907,29 @@ impl Shadow {
                 let wrote = if *g != *o { 0xffu8 } else { 0 };
                 let merged = (*t & !wrote) | (*g & wrote);
                 differs |= merged ^ *t;
+                card_differs |= merged ^ *g;
                 *t = merged;
                 *o = merged;
             }
             if differs != 0 {
                 written = put_changed(start + at, &was, title);
+                if written > 0 {
+                    // Prevent `take_landed` from echoing our own landing back up (`CPU-01`).
+                    self.note_landing(at, at + n);
+                }
             }
         } else {
             // Title memory is not mapped there: the copy keeps what the
             // card wrote, as before.
             old.copy_from_slice(gpu);
         }
-        // The card's side and its "before" take the result.
-        self.card_changed(at, at + n);
+        if card_differs != 0 {
+            // Title CPU modified bytes beside GPU writes: upload merged bytes to card.
+            self.card_changed(at, at + n);
+        } else {
+            // Card already holds `gpu`; only re-hash `Card::before` without 2x self-echo (`CPU-01`).
+            self.card_mark_hash_stale(&[(at, at + n)]);
+        }
         written
     }
 
@@ -6248,6 +6952,9 @@ impl Shadow {
     /// `title` is scratch memory. Returns the bytes written to title
     /// memory.
     pub(crate) fn card_merge_relay(&self, at: usize, gpu: &[u8], fetched_after: u64, title: &mut Vec<u8>) -> usize {
+        if self.gpu_only_skip() {
+            return 0;
+        }
         let start = self.start as usize;
         let Some(card) = &self.card else {
             return 0;
@@ -6256,7 +6963,13 @@ impl Shadow {
             return 0;
         }
         let _side = self.before.lock().unwrap_or_else(|e| e.into_inner());
-        // SAFETY: inside the mapping (checked above). The offsets are in a
+        if self.gpu_only_skip() {
+            return 0;
+        }
+        if !self.ensure_staging_committed(at, at + gpu.len()) {
+            return 0;
+        }
+        // SAFETY: inside the mapping (checked & committed above). The offsets are in a
         // range declared and not done with, which no refresh writes; what
         // does write it (the title's bytes put in under shader writes)
         // holds the lock held here.
@@ -6348,12 +7061,18 @@ impl Shadow {
     /// The third of each piece is the address of its bytes, which stay as
     /// they are during the call.
     pub(crate) unsafe fn land_card(&self, pieces: &[(usize, usize, usize)], fetched_after: u64, notes: &mut crate::land::Notes) -> u64 {
+        if self.gpu_only_skip() {
+            return 0;
+        }
         let Some(card) = &self.card else {
             return 0;
         };
         let waiting = std::time::Instant::now();
         let _merging = self.merging.read().unwrap_or_else(|e| e.into_inner());
         crate::land::spent(crate::land::stat::LOCK, waiting);
+        if self.gpu_only_skip() {
+            return 0;
+        }
         let (from, to) = pieces.iter().fold((usize::MAX, 0), |(a, b), p| (a.min(p.0), b.max(p.1)));
         let skip: Vec<(usize, usize)> = {
             let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
@@ -6365,6 +7084,9 @@ impl Shadow {
         let mut put = 0;
         for &(lo, hi, now) in pieces {
             if lo >= hi || hi > self.len as usize {
+                continue;
+            }
+            if !self.ensure_staging_committed(lo, hi) {
                 continue;
             }
             let near: Vec<(usize, usize)> = skip.iter().copied().filter(|&(a, b)| a < hi && b > lo).collect();
@@ -6722,6 +7444,12 @@ fn note_loose_hit(shadow: &Shadow, address: u64, end: u64, unsized_ask: bool) {
     if shadow.used.load(Ordering::Relaxed) != now {
         shadow.used.store(now, Ordering::Relaxed);
     }
+    let frame = crate::frame::current();
+    if shadow.touch_frame.load(Ordering::Relaxed) != frame
+        && shadow.touch_frame.swap(frame, Ordering::Relaxed) != frame
+    {
+        shadow.touch_frames.fetch_add(1, Ordering::Relaxed);
+    }
     #[cfg(feature = "diagnostics")]
     {
         if shadow.asked[0].load(Ordering::Relaxed) > address {
@@ -6852,12 +7580,118 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    let mut map = buffers_mut();
-    if let Some(entry) = map.remove(&(start, resource)) {
-        if let Some(shadow) = entry.shadow {
-            shadow.dead.store(true, Ordering::Release);
+    let removed = {
+        let mut map = buffers_mut();
+        if let Some(entry) = map.remove(&(start, resource)) {
+            if let Some(shadow) = &entry.shadow {
+                shadow.dead.store(true, Ordering::Release);
+            }
+            bump_shadow_epoch();
+            entry.shadow
+        } else {
+            None
         }
-        bump_shadow_epoch();
+    };
+    if let Some(shadow) = removed {
+        crate::watch::tripwire_disarm_id(shadow.id);
+        if crate::dxr::enabled() {
+            crate::dxr::evict_range(shadow.start, shadow.len);
+        }
+    }
+}
+
+/// Invalidates `copied` / `ranged_seq` on non-placed shadows overlapping
+/// `[start, start + len)` when a `port 1` in-place shadow is created, marks
+/// `in_place_overlap` so future in-place GPU writes notify `watch::wrote`, and
+/// notifies descriptor textures (`ARCH-06 #4`).
+fn on_placed_shadow_created(placed: &Shadow) {
+    let (start, len, self_id) = (placed.start, placed.len, placed.id);
+    let Some(end) = start.checked_add(len).filter(|&e| e > start) else {
+        return;
+    };
+    demote_overlapping_gpu_only(start, len, self_id, "overlapping in-place shadow");
+    crate::descriptor::host::remapped(start as usize, len as usize);
+    let mut overlapping: Vec<Arc<Shadow>> = Vec::new();
+    {
+        let map = buffers_read();
+        for (_, entry) in map.range(..=(start, usize::MAX)).rev().take(64) {
+            if entry.end > start
+                && let Some(s) = &entry.shadow
+                && s.id != self_id
+                && s.place.is_none()
+            {
+                overlapping.push(s.clone());
+            }
+        }
+        for (_, entry) in map.range((start.saturating_add(1), 0)..(end, 0)) {
+            if let Some(s) = &entry.shadow
+                && s.id != self_id
+                && s.place.is_none()
+            {
+                overlapping.push(s.clone());
+            }
+        }
+    }
+    {
+        let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+        let span = LOOSE_MAX_LEN.load(Ordering::Relaxed);
+        for (&(w_start, w_len), s) in loose.range((start.saturating_sub(span), 0)..(end, 0)) {
+            if w_start.saturating_add(w_len) > start && s.id != self_id && s.place.is_none() {
+                overlapping.push(s.clone());
+            }
+        }
+    }
+    {
+        let exact = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+        if !exact.1.is_empty() {
+            const EXACT_MOST: u64 = 64 << 20;
+            for (&(ex_start, ex_len), (s, _)) in exact.1.range((start.saturating_sub(EXACT_MOST), 0)..(end, 0)) {
+                if ex_start.saturating_add(ex_len) > start && s.id != self_id && s.place.is_none() {
+                    overlapping.push(s.clone());
+                }
+            }
+        }
+    }
+    if !overlapping.is_empty() {
+        placed.in_place_overlap.store(true, Ordering::Relaxed);
+        for s in overlapping {
+            let mut copied = s.copied.lock().unwrap_or_else(|e| e.into_inner());
+            copied.0.fill(0);
+            copied.1 = [(0, 0, 0); 2];
+            s.ranged_seq.store(0, Ordering::Release);
+        }
+    }
+}
+
+/// If a newly created non-placed shadow overlaps an existing `port 1` in-place
+/// region, mark overlapping placed shadows so their future GPU writes notify `watch::wrote`.
+fn note_shadow_overlapping_in_place(start: u64, len: u64, self_id: u64) {
+    if !crate::port::overlaps(start, len) {
+        return;
+    }
+    let Some(end) = start.checked_add(len) else {
+        return;
+    };
+    {
+        let map = buffers_read();
+        for (_, entry) in map.range(..(end, 0)).rev().take(256) {
+            if entry.end > start
+                && let Some(s) = &entry.shadow
+                && s.id != self_id
+                && s.place.is_some()
+            {
+                s.in_place_overlap.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+    {
+        let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+        let span = LOOSE_MAX_LEN.load(Ordering::Relaxed);
+        for (&(w_start, w_len), s) in loose.range((start.saturating_sub(span), 0)..(end, 0)) {
+            if w_start.saturating_add(w_len) > start && s.id != self_id && s.place.is_some() {
+                s.in_place_overlap.store(true, Ordering::Relaxed);
+            }
+        }
     }
 }
 
@@ -6940,6 +7774,62 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     let n = gone.len() as u64;
     for shadow in gone {
         crate::host::retire(shadow);
+    }
+    n
+}
+
+/// Evicts and unpins any non-placed loose shadow windows whose guest memory
+/// lies completely inside `[at, at + len)` when the title unmaps/decommits/remaps
+/// that VA range (`inplace::title_memory_freeing`). Uses Null-Before-Retire
+/// (`unpin_idle_window_slots`, Spec-Trap #16) strictly on freed guest VAs so live
+/// bindless descriptors are never nulled.
+pub(crate) fn loose_unmapped(at: u64, len: u64) -> u64 {
+    use windows::core::Interface;
+    if len == 0 {
+        return 0;
+    }
+    let end = at.saturating_add(len);
+    let has_any = {
+        let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+        map.range((at, 0)..(end, 0))
+            .any(|(key, s)| s.place.is_none() && key.0 >= at && key.0.saturating_add(key.1) <= end)
+    };
+    if !has_any {
+        return 0;
+    }
+    let gone: Vec<Arc<Shadow>> = {
+        let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+        let keys: Vec<(u64, u64)> = map
+            .range((at, 0)..(end, 0))
+            .filter(|(key, s)| s.place.is_none() && key.0 >= at && key.0.saturating_add(key.1) <= end)
+            .map(|(key, _)| *key)
+            .collect();
+        let removed: Vec<Arc<Shadow>> = keys.into_iter().filter_map(|k| map.remove(&k)).collect();
+        if !removed.is_empty() {
+            for s in &removed {
+                s.dead.store(true, Ordering::Release);
+            }
+            bump_shadow_epoch();
+        }
+        removed
+    };
+    if gone.is_empty() {
+        return 0;
+    }
+    let mut raws: Vec<usize> = gone.iter().map(|s| s.buffer.as_raw() as usize).collect();
+    raws.sort_unstable();
+    raws.dedup();
+    let _ = crate::descriptor::host::unpin_idle_window_slots(&raws);
+    let n = gone.len() as u64;
+    for shadow in gone {
+        LET_GO[0].fetch_add(1, Ordering::Relaxed);
+        LET_GO[1].fetch_add(shadow.len, Ordering::Relaxed);
+        if shadow.mapped {
+            let vram = shadow.len;
+            crate::host::retire_vram(shadow, vram);
+        } else {
+            crate::host::retire(shadow);
+        }
     }
     n
 }
@@ -7211,19 +8101,25 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // are read too often to stay in the PC's.
         let big = cards() && (size >= card_limits().0 || card_all());
         if let Some(placed) = crate::port::place_for_buffer(key.0, len, big) {
-            entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
+            let shadow = Arc::new(Shadow::placed(placed, key.0, len, false));
+            entry.shadow = Some(shadow.clone());
             bump_shadow_epoch();
-            return entry.shadow.clone();
+            drop(map);
+            on_placed_shadow_created(&shadow);
+            return Some(shadow);
         }
         if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
-            entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
+            let shadow = Arc::new(Shadow::placed(placed, key.0, len, false));
+            entry.shadow = Some(shadow.clone());
             bump_shadow_epoch();
-            return entry.shadow.clone();
+            drop(map);
+            on_placed_shadow_created(&shadow);
+            return Some(shadow);
         }
         let host = host()?;
         // Allocate the card copy first so `VICTORY_SEND_OWN=1` can back the
         // CPU side with plain demand-paged memory instead of a D3D12 `SHR` buffer.
-        let (buffer, data, card) = match card_for(size) {
+        let (buffer, data, card, l0_bytes) = match card_for(size) {
             Some(on_card) => {
                 let Some((staging, data)) =
                     card_staging_for(host, size, || format!("title buffer {:#x}+{len:#x}", key.0))
@@ -7238,18 +8134,21 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     "a buffer's host copy is in the card's memory"
                 );
                 let card = Card::new(staging, size);
-                (on_card, data, Some(card))
+                (on_card, data, Some(card), 0)
             }
             None => {
                 // VRAM copy refused or ineligible: prefer in-place over a L0 `shared_buffer` copy.
                 if big && let Some(placed) = crate::port::place_for_buffer(key.0, len, false) {
-                    entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
+                    let shadow = Arc::new(Shadow::placed(placed, key.0, len, false));
+                    entry.shadow = Some(shadow.clone());
                     bump_shadow_epoch();
-                    return entry.shadow.clone();
+                    drop(map);
+                    on_placed_shadow_created(&shadow);
+                    return Some(shadow);
                 }
                 let (buffer, data) = host.shared_buffer(size)?;
                 crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
-                (buffer, data, None)
+                (buffer, data, None, size)
             }
         };
         // SAFETY: a live buffer.
@@ -7269,6 +8168,10 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         }
         let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
         shadow.card = card;
+        if l0_bytes > 0 {
+            shadow.l0_bytes = l0_bytes;
+            L0_SHADOW_BYTES.fetch_add(l0_bytes, Ordering::Relaxed);
+        }
         let shadow = Arc::new(shadow);
         let new_id = shadow.id;
         if shadow.card.is_some() {
@@ -7279,6 +8182,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         bump_shadow_epoch();
         drop(map);
         demote_overlapping_gpu_only(key.0, len, new_id, "overlapping buffer shadow");
+        note_shadow_overlapping_in_place(key.0, len, new_id);
         return Some(shadow);
     }
     entry.shadow.clone()
@@ -7292,18 +8196,12 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
 /// line says how much was ever asked for, and how much was ever copied);
 /// [`window`] cuts the windows of asks that give a length on a finer grid.
 const WINDOW: u64 = 4 << 20;
+/// Default loose-window grid in KiB (`256 KiB`, slashing unsized/sized zero
+/// slack by 50–65% while keeping direct CPU `Map()` intact; `ARCH-05`).
+const DEFAULT_WINDOW_KB: u64 = 256;
 
-/// The grid the windows of asks with a length are cut on, in bytes: 4 MiB
-/// unless `VICTORY_WINDOW_KB` names a smaller power of two (64 at least).
-/// A window is the PC's memory, all of it, however little of it is read:
-/// 803 windows held 3.3 GB in run 60's gameplay, and all that was ever
-/// asked for in them lay within 1.6 GB. On a grid of 1 MiB or 256 KiB a
-/// window ends nearer to what is read. An ask without a length keeps the
-/// 4 MiB grid whatever is set: a root view reads from its address to its
-/// window's end, and mesh streams bound that way reach megabytes.
-/// shortcut: the default stays 4 MiB until a run with the memory line's
-/// window counts has shown what the finer grids give; the same memory
-/// asked for with different ranges then lies in more than one window.
+/// The grid the windows of asks with a length are cut on, in bytes: `256 KiB`
+/// by default unless `VICTORY_WINDOW_KB` names a power of two from 64 to 4096.
 fn window() -> u64 {
     static GRID: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *GRID.get_or_init(|| {
@@ -7313,11 +8211,11 @@ fn window() -> u64 {
 }
 
 /// The window grid in bytes for a setting in KiB: a power of two from
-/// 64 KiB to 4 MiB, 4 MiB for anything else.
+/// 64 KiB to 4 MiB, `256 KiB` (`DEFAULT_WINDOW_KB`) for unset/invalid values.
 fn grid(kb: Option<u64>) -> u64 {
     match kb {
         Some(kb) if kb.is_power_of_two() && (64..=4096).contains(&kb) => kb << 10,
-        _ => WINDOW,
+        _ => DEFAULT_WINDOW_KB << 10,
     }
 }
 
@@ -7328,25 +8226,12 @@ fn window_of(address: u64, end: u64, grid: u64) -> (u64, u64) {
     (start, end.next_multiple_of(grid) - start)
 }
 
-/// Whether the window of an ask without a length begins at the ask instead
-/// of at the 4 MiB line below it. Such an ask (a root view) reads from its
-/// address to the end of its 4 MiB cell; what lies below the lowest
-/// address ever asked for in the cell is memory the host zeroed and nothing
-/// reads (513 of run 65's 782 windows were asked for that way, 2,052 MB;
-/// of all windows' 3,236 MB, 1,988 MB were ever copied). With this on, the
-/// window is the cell's tail from the ask's step on ([`TAIL_STEP`]); an ask
-/// lower in the cell later makes a longer tail, which every ask from then
-/// on takes, and the shorter one goes when nothing holds it any more.
-/// shortcut: off unless `VICTORY_WINDOW_TAILS=1`. A longer tail is another
-/// host buffer than the shorter one: what was bound to the shorter stays
-/// right only because every list brings up to date the copy it bound
-/// (`draw.rs` keeps a root view's copy with its slot). It pays only
-/// together with `VICTORY_WINDOW_KB` below 4096: on the 4 MiB grid an ask
-/// with a length in the same cell makes the whole cell's window, and the
-/// tail is that.
+/// Whether the window of an ask without a length begins at the ask's
+/// `TAIL_STEP` (`256 KiB`) instead of at the 4 MiB cell boundary. Default ON
+/// (`VICTORY_WINDOW_TAILS=0` disables; `ARCH-05`).
 fn tails() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOW_TAILS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOW_TAILS").is_none_or(|v| v != "0"))
 }
 
 /// Tails begin on multiples of this. A longer tail is a new host buffer,
@@ -7367,11 +8252,20 @@ fn tail_of(address: u64, end: u64) -> (u64, u64) {
 
 /// Of `windows` (start, bytes), the one an ask of `[address, end)` that
 /// may take any window takes ([`find_any`]): the longest that holds the
-/// whole range.
+/// whole range, including windows starting in a prior grid cell (`CPU-33`).
 fn holder(windows: impl Iterator<Item = (u64, u64)>, address: u64, end: u64) -> Option<(u64, u64)> {
     windows
-        .filter(|&(start, bytes)| start <= address && start + bytes >= end)
+        .filter(|&(start, bytes)| start <= address && start.saturating_add(bytes) >= end)
         .max_by_key(|&(start, bytes)| (bytes, std::cmp::Reverse(start)))
+}
+
+/// Looks up the best covering loose window in `map` for `[address, end)`,
+/// scanning back by `max_len` so requests straddling 4 MiB or grid boundaries
+/// find cross-cell windows instead of allocating overlapping duplicates (`CPU-33`).
+fn holder_in<V>(map: &BTreeMap<(u64, u64), V>, address: u64, end: u64, max_len: u64) -> Option<(u64, u64)> {
+    let search_lo = address.saturating_sub(max_len);
+    let there = map.range((search_lo, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
+    holder(there, address, end)
 }
 
 /// Whether windows may be smaller than their 4 MiB cell (a finer grid, or
@@ -7486,26 +8380,37 @@ static LOOSE: std::sync::RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> = std::sync::
 fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
     let (cell, _) = window_of(address, end, WINDOW);
     let named = window_of(address, end, if unsized_ask { WINDOW } else { window() });
+    let use_tails = unsized_ask && tails();
+    let use_holder = any && fine() && !unsized_ask;
     // Under the lock, with the handing out: see `let_go_idle`.
     let note = |shadow: &Shadow| note_loose_hit(shadow, address, end, unsized_ask);
-    // The window is there already (nearly always): readers share the lock.
-    if !(unsized_ask && tails()) && !(any && fine() && !unsized_ask) {
+    // Always try `LOOSE.read()` first (including `fine()` / `tails()`, avoiding
+    // 6-thread `LOOSE.write()` lock convoys; `CPU-20` + `CPU-33`).
+    {
         let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
-        if let Some(shadow) = map.get(&named) {
+        let hit_key = if use_tails {
+            let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
+            longest_tail(there, address, end)
+        } else if use_holder {
+            holder_in(&map, address, end, LOOSE_MAX_LEN.load(Ordering::Relaxed))
+        } else {
+            Some(named)
+        };
+        if let Some(key) = hit_key
+            && let Some(shadow) = map.get(&key)
+        {
             note(shadow);
             return Some(shadow.clone());
         }
     }
     let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
-    let (start, len) = if unsized_ask && tails() {
+    let (start, len) = if use_tails {
         let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
         longest_tail(there, address, end).unwrap_or_else(|| tail_of(address, end))
-    } else if any && fine() && !unsized_ask {
-        // The windows that begin in the ask's cell at or below the ask (one
-        // that begins in a cell below and reaches this far is passed over:
-        // the ask then makes its own).
-        let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
-        holder(there, address, end).unwrap_or(named)
+    } else if use_holder {
+        // Cross-cell covering lookup (`CPU-33`): finds windows beginning in a
+        // prior cell that cover `[address, end)` instead of duplicating them.
+        holder_in(&map, address, end, LOOSE_MAX_LEN.load(Ordering::Relaxed)).unwrap_or(named)
     } else {
         named
     };
@@ -7521,27 +8426,15 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         LOOSE_MAX_LEN.fetch_max(len, Ordering::Relaxed);
         map.insert((start, len), shadow.clone());
         bump_shadow_epoch();
+        drop(map);
+        on_placed_shadow_created(&shadow);
         return Some(shadow);
     }
-    // One buffer in the card's memory, filled by the CPU through the bus.
-    if let Some((buffer, data)) = window_mapped_for(len) {
-        crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x} mapped on the card"));
-        // SAFETY: a live buffer.
-        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-        let mut shadow = Shadow::new(buffer, data, gpu, start, len);
-        shadow.window = true;
-        shadow.mapped = true;
-        let shadow = Arc::new(shadow);
-        note(&shadow);
-        LOOSE_MAX_LEN.fetch_max(len, Ordering::Relaxed);
-        map.insert((start, len), shadow.clone());
-        bump_shadow_epoch();
-        return Some(shadow);
-    }
+    // Allocate up to `VICTORY_WINDOWS_BAR_MB` (640 MiB, VRAM < 80%) directly in
+    // BAR at creation so hot windows get BAR bandwidth without ever swapping/nulling
+    // live bindless title-heap descriptors; overflow lands in L0 `shared_buffer`.
     let host = host()?;
-    // With room for windows on the card (`window_card_most`): shaders get a
-    // buffer there, and the CPU side uses plain memory when `VICTORY_SEND_OWN=1`.
-    let (buffer, data, card) = match window_card_for(len) {
+    let (buffer, data, card, mapped, l0_bytes) = match window_card_for(len) {
         Some(on_card) => {
             let Some((staging, data)) =
                 card_staging_for(host, len, || format!("title memory {start:#x}+{len:#x}"))
@@ -7551,21 +8444,26 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
             };
             crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
             let card = Card::new(staging, len);
-            (on_card, data, Some(card))
+            (on_card, data, Some(card), false, 0)
         }
         None => {
-            // BAR/VRAM window refused or disabled: prefer in-place over a L0 `shared_buffer` copy.
-            if let Some(placed) = crate::port::place_for_window(start, len, true) {
+            if let Some((buffer, data)) = window_mapped_for(len) {
+                crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x} mapped on the card"));
+                (buffer, data, None, true, 0)
+            } else if let Some(placed) = crate::port::place_for_window(start, len, true) {
                 let shadow = Arc::new(Shadow::placed(placed, start, len, true));
                 note(&shadow);
                 LOOSE_MAX_LEN.fetch_max(len, Ordering::Relaxed);
                 map.insert((start, len), shadow.clone());
                 bump_shadow_epoch();
+                drop(map);
+                on_placed_shadow_created(&shadow);
                 return Some(shadow);
+            } else {
+                let (buffer, data) = host.shared_buffer(len)?;
+                crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
+                (buffer, data, None, false, len)
             }
-            let (buffer, data) = host.shared_buffer(len)?;
-            crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
-            (buffer, data, None)
         }
     };
     // SAFETY: a live buffer.
@@ -7577,7 +8475,13 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     );
     let mut shadow = Shadow::new(buffer, data, gpu, start, len);
     shadow.window = true;
+    shadow.mapped = mapped;
     shadow.card = card;
+    if l0_bytes > 0 {
+        shadow.l0_bytes = l0_bytes;
+        L0_SHADOW_BYTES.fetch_add(l0_bytes, Ordering::Relaxed);
+        L0_LOOSE_BYTES.fetch_add(l0_bytes, Ordering::Relaxed);
+    }
     let shadow = Arc::new(shadow);
     if shadow.card.is_some() {
         push_carded(&shadow);
@@ -7589,6 +8493,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     bump_shadow_epoch();
     drop(map);
     demote_overlapping_gpu_only(start, len, new_id, "overlapping loose window");
+    note_shadow_overlapping_in_place(start, len, new_id);
     Some(shadow)
 }
 
@@ -7643,15 +8548,20 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
             Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now
         });
     }
-    let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
+    let exact_bytes = len.next_multiple_of(256);
+    let (buffer, data) = host()?.shared_buffer(exact_bytes)?;
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
+    let mut shadow = Shadow::new(buffer, data, gpu, address, len);
+    shadow.l0_bytes = exact_bytes;
+    L0_SHADOW_BYTES.fetch_add(exact_bytes, Ordering::Relaxed);
+    let shadow = Arc::new(shadow);
     let new_id = shadow.id;
     map.insert((address, len), (shadow.clone(), now));
     drop(guard);
     demote_overlapping_gpu_only(address, len, new_id, "overlapping exact view");
+    note_shadow_overlapping_in_place(address, len, new_id);
     EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
     OWN_MADE.fetch_add(1, Ordering::Relaxed);
     Some(shadow)
@@ -7709,11 +8619,11 @@ mod window_tests {
 
     #[test]
     fn window_budget_defaults_and_env_override() {
-        assert_eq!(resolve_window_budget_mb(None, true), Some(1280));
-        assert_eq!(resolve_window_budget_mb(None, false), Some(1280));
+        assert_eq!(resolve_window_budget_mb(None, true), Some(512));
+        assert_eq!(resolve_window_budget_mb(None, false), Some(512));
         assert_eq!(resolve_window_budget_mb(Some("0"), true), None);
         assert_eq!(resolve_window_budget_mb(Some(" 1024 "), true), Some(1024));
-        assert_eq!(resolve_window_budget_mb(Some("invalid"), true), Some(1280));
+        assert_eq!(resolve_window_budget_mb(Some("invalid"), true), Some(512));
     }
 
     #[test]
@@ -7859,18 +8769,124 @@ mod window_tests {
         assert_eq!(longest_tail(with_whole.into_iter(), ask, ask + 1), Some((cell, WINDOW)));
     }
 
-    /// The setting takes powers of two from 64 KiB to 4 MiB; anything else
-    /// leaves the grid as it was.
+    /// The setting takes powers of two from 64 KiB to 4 MiB; unset/invalid
+    /// defaults to 256 KiB (`ARCH-05`).
     #[test]
     fn the_grid_is_a_power_of_two_or_the_default() {
-        assert_eq!(grid(None), WINDOW);
+        let default = super::DEFAULT_WINDOW_KB << 10;
+        assert_eq!(default, 256 << 10);
+        assert_eq!(grid(None), default);
         assert_eq!(grid(Some(4096)), WINDOW);
         assert_eq!(grid(Some(1024)), 1 << 20);
         assert_eq!(grid(Some(256)), 256 << 10);
         assert_eq!(grid(Some(64)), 64 << 10);
         for bad in [0, 32, 100, 1000, 8192] {
-            assert_eq!(grid(Some(bad)), WINDOW, "{bad}");
+            assert_eq!(grid(Some(bad)), default, "{bad}");
         }
+    }
+
+    #[test]
+    fn cross_cell_holder_finds_straddling_windows_without_duplicates() {
+        use std::collections::BTreeMap;
+        let cell = 0xd_1200_0000u64;
+        // A 512 KiB window straddling the 4 MiB cell boundary `[cell - 256 KiB, cell + 256 KiB)`.
+        let straddle = (cell - (256 << 10), 512 << 10);
+        let mut map = BTreeMap::new();
+        map.insert(straddle, ());
+        map.insert((cell + (512 << 10), 256 << 10), ());
+        // An ask starting inside `cell` (`[cell + 4 KiB, cell + 64 KiB)`) MUST find `straddle`
+        // even though `straddle.0 < cell` (`CPU-33`).
+        let got = super::holder_in(&map, cell + 4096, cell + (64 << 10), WINDOW);
+        assert_eq!(got, Some(straddle));
+        // An ask past `straddle`'s end does not falsely match it.
+        assert_eq!(super::holder_in(&map, cell + (256 << 10), cell + (300 << 10), WINDOW), None);
+    }
+
+    #[test]
+    fn cpu_staging_demand_commits_only_touched_64k_pieces() {
+        use std::sync::atomic::Ordering;
+        let before_global = super::cpu_staging_committed_bytes();
+        let total_size = 16u64 << 20; // 16 MiB = 256 pieces
+        let (staging, ptr) = super::CpuStaging::alloc(total_size).expect("MEM_RESERVE");
+        assert_eq!(staging.committed_bytes.load(Ordering::Relaxed), 0);
+        assert!(!staging.is_piece_committed(0));
+        assert!(!staging.is_piece_committed(100));
+
+        // Commit only piece 3 and pieces 100..=101 (3 * 64 KiB = 192 KiB out of 16 MiB).
+        assert!(staging.ensure_committed(3 * super::PIECE + 128, 3 * super::PIECE + 512));
+        assert!(staging.ensure_committed(100 * super::PIECE + 4096, 102 * super::PIECE - 64));
+        assert!(staging.is_piece_committed(3));
+        assert!(staging.is_piece_committed(100));
+        assert!(staging.is_piece_committed(101));
+        assert!(!staging.is_piece_committed(0));
+        assert!(!staging.is_piece_committed(4));
+        assert!(!staging.is_piece_committed(102));
+        assert_eq!(staging.committed_bytes.load(Ordering::Relaxed), 3 * super::PIECE as u64);
+
+        // Verify committed pages are readable/writable with zero AV.
+        // SAFETY: pieces 3 and 100..=101 were committed above.
+        unsafe {
+            ptr.add(3 * super::PIECE + 128).write(0xA5);
+            ptr.add(101 * super::PIECE + 4096).write(0x5A);
+            assert_eq!(ptr.add(3 * super::PIECE + 128).read(), 0xA5);
+            assert_eq!(ptr.add(101 * super::PIECE + 4096).read(), 0x5A);
+        }
+
+        // Re-committing an already-committed range takes the fast path without double-counting.
+        assert!(staging.ensure_committed(3 * super::PIECE, 4 * super::PIECE));
+        assert_eq!(staging.committed_bytes.load(Ordering::Relaxed), 3 * super::PIECE as u64);
+        assert!(super::cpu_staging_committed_bytes() >= before_global + 3 * super::PIECE as u64);
+        drop(staging);
+        assert_eq!(super::cpu_staging_committed_bytes(), before_global);
+    }
+
+    #[test]
+    fn gpu_only_mode1_boot_grace_allows_post_boot_promotion() {
+        use super::{
+            GPU_ONLY_BOOT_GRACE_FRAME, GPU_ONLY_MAX_RESETS, GPU_ONLY_MIN_FETCHED_PIECES,
+            GPU_ONLY_WARMUP_FRAMES, GpuOnlyTracker,
+        };
+        let mut t = GpuOnlyTracker::default();
+        // 20 boot-time uploads (< frame 600) must NOT sticky-demote Mode-1 buffers (`ARCH-05`).
+        for f in 1..=20u64 {
+            assert!(!t.note_upload_at(1, false, f * 20, 0, 8));
+        }
+        assert_eq!(t.resets, 0);
+        // Once steady state begins (>= frame 600) with 0 CPU uploads, Mode 1 promotes after warmup.
+        let start_f = GPU_ONLY_BOOT_GRACE_FRAME + 10;
+        let pieces: Vec<usize> = (0..GPU_ONLY_MIN_FETCHED_PIECES as usize).collect();
+        assert_eq!(t.note_fetched(1, start_f, &pieces), (false, false));
+        assert_eq!(t.note_fetched(1, start_f + GPU_ONLY_WARMUP_FRAMES, &[0]), (true, false));
+        // Even during boot frames, an already-promoted buffer demotes immediately on CPU upload.
+        assert!(t.note_upload_at(1, true, 100, 0, 1));
+        // Mode-1 unpromoted uploads past boot/world-load restart observation without sticky ban,
+        // while Mode-2 overlapping uploads still sticky-demote past `GPU_ONLY_MAX_RESETS`.
+        let mut late_world = GpuOnlyTracker::default();
+        for f in 0..20u64 {
+            assert!(!late_world.note_upload_at(1, false, 6000 + f, 0, 1));
+        }
+        assert_eq!(late_world.note_fetched(1, 6100, &pieces), (false, false));
+        assert_eq!(late_world.note_fetched(1, 6100 + GPU_ONLY_WARMUP_FRAMES, &[0]), (true, false));
+        let mut noisy_m2 = GpuOnlyTracker::default();
+        for _ in 0..GPU_ONLY_MAX_RESETS {
+            assert_eq!(noisy_m2.note_fetched(2, GPU_ONLY_BOOT_GRACE_FRAME + 5, &[0]), (false, false));
+            assert!(!noisy_m2.note_upload_at(2, false, GPU_ONLY_BOOT_GRACE_FRAME + 5, 0, 1));
+        }
+        assert_eq!(noisy_m2.note_fetched(2, GPU_ONLY_BOOT_GRACE_FRAME + 5, &[0]), (false, false));
+        assert!(noisy_m2.note_upload_at(2, false, GPU_ONLY_BOOT_GRACE_FRAME + 5, 0, 1));
+    }
+
+    #[test]
+    fn bar_tier_budget_and_promotion_policy() {
+        assert_eq!(super::resolve_window_bar_mb(None), 640);
+        assert_eq!(super::resolve_window_bar_mb(Some("0")), 0);
+        assert_eq!(super::resolve_window_bar_mb(Some("768")), 768);
+        assert_eq!(super::resolve_window_bar_mb(Some("bad")), 640);
+        // Cold windows (<6 frames or <256 KiB copied) stay in L0; hot ones promote.
+        assert!(!super::bar_should_promote(5, 512 << 10, 512 << 10));
+        assert!(!super::bar_should_promote(6, 128 << 10, 512 << 10));
+        assert!(super::bar_should_promote(6, 256 << 10, 512 << 10));
+        assert!(super::bar_should_promote(6, 256 << 10, 256 << 10));
     }
 
     /// A window holds its ask and is cut on the grid; on the default grid
@@ -8043,14 +9059,14 @@ mod window_tests {
         {
             let mut copied = shadow.copied.lock().unwrap();
             let stale_a = vec![(a.0 / super::PAGE, 0), (a.0 / super::PAGE + 1, 0)];
-            shadow.copy_stale_pages(&mut copied, a.0, a.1, 10, 0, &stale_a);
+            shadow.copy_stale_pages(&mut copied, None, a.0, a.1, 10, 0, &stale_a);
             let stale_b = vec![(b.0 / super::PAGE, 0), (b.0 / super::PAGE + 1, 0)];
-            shadow.copy_stale_pages(&mut copied, b.0, b.1, 20, 0, &stale_b);
+            shadow.copy_stale_pages(&mut copied, None, b.0, b.1, 20, 0, &stale_b);
             // Both equal-sized ranges A and B must remain cached in `copied.1`.
             assert_eq!(copied.1[0], (b.0, b.1, 20));
             assert_eq!(copied.1[1], (a.0, a.1, 10));
             // Refreshing A again updates slot 1 without evicting B in slot 0.
-            shadow.copy_stale_pages(&mut copied, a.0, a.1, 30, 10, &[]);
+            shadow.copy_stale_pages(&mut copied, None, a.0, a.1, 30, 10, &[]);
             assert_eq!(copied.1[0], (b.0, b.1, 20));
             assert_eq!(copied.1[1], (a.0, a.1, 30));
         }
@@ -8066,6 +9082,46 @@ mod window_tests {
         assert_eq!(super::card_room_kept_for(2048 * MIB, 0, 0), 800 * MIB);
         assert_eq!(super::card_room_kept_for(2048 * MIB, 738 * MIB, 0), 62 * MIB);
         assert_eq!(super::card_room_kept_for(2048 * MIB, 738 * MIB, 100 * MIB), 0);
+        // Post-settle decay holds full reserve before buffers exist or <=5s, decays over 5..10s, hits 0 at 10s.
+        assert_eq!(super::card_room_kept_decayed(2048 * MIB, 0, 0, 20_000), 800 * MIB);
+        assert_eq!(super::card_room_kept_decayed(2048 * MIB, 600 * MIB, 0, 5_000), 200 * MIB);
+        assert_eq!(super::card_room_kept_decayed(2048 * MIB, 600 * MIB, 0, 7_500), 100 * MIB);
+        assert_eq!(super::card_room_kept_decayed(2048 * MIB, 600 * MIB, 0, 10_000), 0);
+    }
+
+    #[test]
+    fn card_merge_notes_landing_and_avoids_self_echo_dirty_upload() {
+        assert!(crate::safecopy::on());
+        let len = 4096usize;
+        let mut title = vec![0x11u8; len];
+        let mut held = vec![0x11u8; len];
+        let mut gpu = vec![0x11u8; len];
+        gpu[64..128].fill(0x22);
+        let shadow = super::Shadow::unbacked(title.as_mut_ptr() as u64, held.as_mut_ptr(), len as u64, true);
+        let mut scratch = Vec::new();
+        let written = shadow.card_merge(0, &gpu, &mut scratch);
+        assert!(written > 0);
+        assert_eq!(&title[64..128], &[0x22u8; 64]);
+        assert_eq!(&held[64..128], &[0x22u8; 64]);
+        // Pure GPU write (no concurrent title diff): must NOT mark `card.dirty` (no 2x self-echo!),
+        // and MUST mark `self.landing` so `take_landed` skips echoing landed bytes back up.
+        assert!(shadow.take_dirty().is_empty());
+        assert!(shadow.landing.load(std::sync::atomic::Ordering::Acquire));
+
+        // Now simulate a concurrent title write beside a GPU write: `card_differs != 0` MUST mark dirty.
+        title[16..20].fill(0x33);
+        gpu[64..128].fill(0x44);
+        let written2 = shadow.card_merge(0, &gpu, &mut scratch);
+        assert!(written2 > 0);
+        assert_eq!(&title[16..20], &[0x33u8; 4]);
+        assert_eq!(&title[64..128], &[0x44u8; 64]);
+        // Only bytes 64..128 differed between `gpu` and `old`, so `at..at+n` is 64..128;
+        // if title concurrently wrote INSIDE 64..128 on an unchanged byte, card_dirty triggers.
+        title[70] = 0x77;
+        gpu[64] = 0x55;
+        gpu[127] = 0x55;
+        let _ = shadow.card_merge(0, &gpu, &mut scratch);
+        assert!(!shadow.take_dirty().is_empty());
     }
 
     /// Helper that creates an unbacked `Shadow` (with optional fake `InPlace`)

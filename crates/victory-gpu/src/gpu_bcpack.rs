@@ -19,10 +19,12 @@
 //!    BC1/BC3/BC4/BC5/BC6H/BC7 bit-packing. **100% embarrassingly block-parallel**:
 //!    one thread per BC block across every block in the batch.
 
-use std::sync::{Mutex, OnceLock};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use victory_formats::bcpack::TABLES_SIZE;
-use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
@@ -1617,8 +1619,62 @@ void bcpack_pack_bc7(uint3 dtid : SV_DispatchThreadID) {
 "#;
 
 // ============================================================================
-// D3D12 Compute Runtime
+// D3D12 Compute Runtime (Double-Buffered Async Slots + Scoped Barriers + Coalescing)
 // ============================================================================
+
+/// Number of overlapping GPU flight slots so consecutive batches pipeline on
+/// the compute queue instead of stalling per stream.
+const FLIGHT_SLOTS: usize = 2;
+/// Maximum streams coalesced into one GPU batch from concurrent callers.
+const MAX_COALESCED_STREAMS: usize = 64;
+/// Maximum total compressed input bytes coalesced into one GPU batch.
+const MAX_COALESCED_INPUT_BYTES: usize = 16 << 20;
+/// Maximum retained per-slot scratch capacity (outlier batches release on fence).
+const MAX_RETAINED_SCRATCH: u64 = 16 << 20;
+
+/// Telemetry counters: `[0]` GPU batches, `[1]` total streams decoded,
+/// `[2]` coalesced multi-stream batches, `[3]` total output bytes decoded.
+static BCPACK_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+fn enhanced_barriers_opt_in() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("VICTORY_GPU_BCPACK_ENHANCED")
+            .ok()
+            .is_none_or(|v| v.trim() != "0")
+    })
+}
+
+fn device_enhanced_barriers(device: &ID3D12Device) -> bool {
+    if !enhanced_barriers_opt_in() {
+        return false;
+    }
+    let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS12::default();
+    // SAFETY: plain feature query into a struct of its own size.
+    let known = unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS12,
+            (&raw mut o).cast(),
+            size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS12>() as u32,
+        )
+    };
+    known.is_ok() && o.EnhancedBarriersSupported.as_bool()
+}
+
+/// Barrier mode selected for a `FlightSlot` command list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BarrierKind {
+    Enhanced,
+    LegacyScoped,
+}
+
+fn choose_barrier_kind(device_enhanced: bool, has_list7: bool) -> BarrierKind {
+    if device_enhanced && has_list7 {
+        BarrierKind::Enhanced
+    } else {
+        BarrierKind::LegacyScoped
+    }
+}
 
 struct ScratchBuffer {
     res: Option<ID3D12Resource>,
@@ -1646,6 +1702,13 @@ impl ScratchBuffer {
         }
         self.res.as_ref().ok_or_else(|| "missing scratch buffer".to_string())
     }
+
+    fn trim_oversized(&mut self) {
+        if self.capacity > MAX_RETAINED_SCRATCH {
+            self.res = None;
+            self.capacity = 0;
+        }
+    }
 }
 
 struct CachedVramTables {
@@ -1653,14 +1716,127 @@ struct CachedVramTables {
     resource: ID3D12Resource,
 }
 
+struct TablesUploader {
+    allocator: ID3D12CommandAllocator,
+    list: ID3D12GraphicsCommandList,
+    event: HANDLE,
+    cache: Option<CachedVramTables>,
+}
+
+// SAFETY: D3D12 objects are free-threaded; event & allocator are serialized behind `tables_lock`.
+unsafe impl Send for TablesUploader {}
+
+impl Drop for TablesUploader {
+    fn drop(&mut self) {
+        if !self.event.is_invalid() {
+            // SAFETY: owned Win32 event created by `CreateEventW`.
+            unsafe {
+                let _ = CloseHandle(self.event);
+            }
+        }
+    }
+}
+
+struct FlightSlot {
+    allocator: ID3D12CommandAllocator,
+    list: ID3D12GraphicsCommandList,
+    list7: Option<ID3D12GraphicsCommandList7>,
+    event: HANDLE,
+    fence_val: u64,
+    input_upload: ScratchBuffer,
+    input_default: ScratchBuffer,
+    work_uav: ScratchBuffer,
+    out_uav: ScratchBuffer,
+    out_readback: ScratchBuffer,
+}
+
+// SAFETY: D3D12 objects are free-threaded; each slot is leased exclusively to one batch at a time.
+unsafe impl Send for FlightSlot {}
+
+impl Drop for FlightSlot {
+    fn drop(&mut self) {
+        if !self.event.is_invalid() {
+            // SAFETY: owned Win32 event created by `CreateEventW`.
+            unsafe {
+                let _ = CloseHandle(self.event);
+            }
+        }
+    }
+}
+
+impl FlightSlot {
+    fn new(device: &ID3D12Device, enhanced: bool) -> Result<Self, String> {
+        // SAFETY: plain D3D12 compute allocator, list, and Win32 event creation.
+        unsafe {
+            let allocator: ID3D12CommandAllocator = device
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE)
+                .map_err(|e| format!("CreateCommandAllocator failed: {e}"))?;
+            let list: ID3D12GraphicsCommandList = device
+                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &allocator, None)
+                .map_err(|e| format!("CreateCommandList failed: {e}"))?;
+            list.Close().map_err(|e| format!("initial list Close failed: {e}"))?;
+            let list7 = enhanced.then(|| list.cast::<ID3D12GraphicsCommandList7>().ok()).flatten();
+            let event = CreateEventW(None, false, false, None)
+                .map_err(|e| format!("CreateEventW failed: {e}"))?;
+            Ok(Self {
+                allocator,
+                list,
+                list7,
+                event,
+                fence_val: 0,
+                input_upload: ScratchBuffer::new(),
+                input_default: ScratchBuffer::new(),
+                work_uav: ScratchBuffer::new(),
+                out_uav: ScratchBuffer::new(),
+                out_readback: ScratchBuffer::new(),
+            })
+        }
+    }
+
+    fn trim_oversized(&mut self) {
+        self.input_upload.trim_oversized();
+        self.input_default.trim_oversized();
+        self.work_uav.trim_oversized();
+        self.out_uav.trim_oversized();
+        self.out_readback.trim_oversized();
+    }
+}
+
+struct PreparedBatch {
+    n_streams: usize,
+    n_plain: u32,
+    n_bc6: u32,
+    n_bc7: u32,
+    plain_blocks: u32,
+    bc6_blocks: u32,
+    bc7_blocks: u32,
+    input_host: Vec<u8>,
+    work_total: u64,
+    status_offset: u32,
+    out_total: u64,
+    orig_out_ranges: Vec<(usize, usize)>,
+}
+
+struct CoalescedItem {
+    bc: u8,
+    src: Vec<u8>,
+    blocks: usize,
+    tables_hash: blake3::Hash,
+    result: Mutex<Option<Result<Vec<u8>, String>>>,
+    done: Condvar,
+}
+
+struct PoolState {
+    free_slots: VecDeque<usize>,
+    pending: VecDeque<Arc<CoalescedItem>>,
+}
+
 struct GpuBcpack {
     device: ID3D12Device,
     queue: ID3D12CommandQueue,
-    allocator: ID3D12CommandAllocator,
-    list: ID3D12GraphicsCommandList,
     fence: ID3D12Fence,
-    event: HANDLE,
-    fence_val: u64,
+    next_fence: AtomicU64,
+    enhanced: bool,
     root_sig: ID3D12RootSignature,
     pso_lanes: ID3D12PipelineState,
     pso_resolve_plain: ID3D12PipelineState,
@@ -1669,17 +1845,15 @@ struct GpuBcpack {
     pso_pack_plain: ID3D12PipelineState,
     pso_pack_bc6: ID3D12PipelineState,
     pso_pack_bc7: ID3D12PipelineState,
-    input_upload: ScratchBuffer,
-    input_default: ScratchBuffer,
-    work_uav: ScratchBuffer,
-    out_uav: ScratchBuffer,
-    out_readback: ScratchBuffer,
-    tables_cache: Option<CachedVramTables>,
+    tables_lock: Mutex<TablesUploader>,
+    slots: [Mutex<FlightSlot>; FLIGHT_SLOTS],
+    pool: (Mutex<PoolState>, Condvar),
 }
 
-// SAFETY: D3D12 objects are free-threaded; all command list recording and event
-// waits are serialized behind the outer Mutex.
+// SAFETY: D3D12 device/queue/fence/PSOs are free-threaded; mutable state is guarded by mutexes.
 unsafe impl Send for GpuBcpack {}
+// SAFETY: as above.
+unsafe impl Sync for GpuBcpack {}
 
 fn create_buffer(
     device: &ID3D12Device,
@@ -1771,10 +1945,304 @@ fn transition(
     }
 }
 
-fn uav_barrier(list: &ID3D12GraphicsCommandList) {
-    let barrier = D3D12_RESOURCE_BARRIER { Type: D3D12_RESOURCE_BARRIER_TYPE_UAV, ..Default::default() };
-    // SAFETY: open command list; null UAV barrier orders all UAV accesses.
-    unsafe { list.ResourceBarrier(&[barrier]) };
+#[inline]
+fn enhanced_buf_barrier(
+    resource: &ID3D12Resource,
+    sync_before: D3D12_BARRIER_SYNC,
+    sync_after: D3D12_BARRIER_SYNC,
+    access_before: D3D12_BARRIER_ACCESS,
+    access_after: D3D12_BARRIER_ACCESS,
+) -> D3D12_BUFFER_BARRIER {
+    D3D12_BUFFER_BARRIER {
+        SyncBefore: sync_before,
+        SyncAfter: sync_after,
+        AccessBefore: access_before,
+        AccessAfter: access_after,
+        // SAFETY: borrowed COM pointer; never released by the barrier struct.
+        pResource: unsafe { std::mem::transmute_copy(resource) },
+        Offset: 0,
+        Size: u64::MAX,
+    }
+}
+
+#[inline]
+fn emit_enhanced_buf_barriers(list7: &ID3D12GraphicsCommandList7, barriers: &[D3D12_BUFFER_BARRIER]) {
+    if barriers.is_empty() {
+        return;
+    }
+    let group = [D3D12_BARRIER_GROUP {
+        Type: D3D12_BARRIER_TYPE_BUFFER,
+        NumBarriers: barriers.len() as u32,
+        Anonymous: D3D12_BARRIER_GROUP_0 {
+            pBufferBarriers: barriers.as_ptr(),
+        },
+    }];
+    // SAFETY: open command list and live buffer resources.
+    unsafe { list7.Barrier(&group) };
+}
+
+/// Emits resource-scoped UAV barriers for `work_uav` and `out_uav`, replacing
+/// global `UAV(NULL)` pipeline flushes: Enhanced `D3D12_BUFFER_BARRIER` when
+/// available, or resource-specific `D3D12_RESOURCE_BARRIER_TYPE_UAV` otherwise.
+fn emit_scoped_uav_barriers(
+    list: &ID3D12GraphicsCommandList,
+    list7: Option<&ID3D12GraphicsCommandList7>,
+    enhanced: bool,
+    work_uav: &ID3D12Resource,
+    out_uav: &ID3D12Resource,
+) {
+    if choose_barrier_kind(enhanced, list7.is_some()) == BarrierKind::Enhanced
+        && let Some(l7) = list7
+    {
+        emit_enhanced_buf_barriers(
+            l7,
+            &[
+                enhanced_buf_barrier(
+                    work_uav,
+                    D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+                    D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+                    D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+                    D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+                ),
+                enhanced_buf_barrier(
+                    out_uav,
+                    D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+                    D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+                    D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+                    D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+                ),
+            ],
+        );
+        return;
+    }
+    let mut barriers = [
+        D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                    pResource: std::mem::ManuallyDrop::new(Some(work_uav.clone())),
+                }),
+            },
+        },
+        D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                    pResource: std::mem::ManuallyDrop::new(Some(out_uav.clone())),
+                }),
+            },
+        },
+    ];
+    // SAFETY: open command list; each UAV barrier owns a cloned COM ref dropped right after.
+    unsafe {
+        list.ResourceBarrier(&barriers);
+        for b in &mut barriers {
+            let u = std::mem::ManuallyDrop::take(&mut b.Anonymous.UAV);
+            let _ = std::mem::ManuallyDrop::into_inner(u.pResource);
+        }
+    }
+}
+
+fn prepare_batch(jobs: &[StreamJob<'_>]) -> Result<PreparedBatch, String> {
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    enum Family {
+        Plain = 0,
+        Bc6 = 1,
+        Bc7 = 2,
+    }
+
+    struct JobMeta {
+        orig_idx: usize,
+        family: Family,
+        bc: u8,
+        blocks: u32,
+        rec_stride: u32,
+        inter_stride: u32,
+        out_stride: u32,
+    }
+
+    let mut metas = Vec::with_capacity(jobs.len());
+    for (orig_idx, job) in jobs.iter().enumerate() {
+        let (family, rec_stride, inter_stride, out_stride) = match job.bc {
+            1 | 4 => (Family::Plain, 12u32, PLAIN_BYTES as u32, 8u32),
+            3 | 5 => (Family::Plain, 24u32, PLAIN_BYTES as u32, 16u32),
+            6 => (Family::Bc6, 32u32, BC6_BYTES as u32, 16u32),
+            7 => (Family::Bc7, 32u32, BC7_BYTES as u32, 16u32),
+            _ => return Err("BCPack: unsupported BC format".to_string()),
+        };
+        if job.blocks == 0 {
+            return Err("BCPack: destination is not a whole number of blocks".to_string());
+        }
+        let blocks = u32::try_from(job.blocks)
+            .map_err(|_| "BCPack: block count exceeds GPU 32-bit limit".to_string())?;
+        metas.push(JobMeta {
+            orig_idx,
+            family,
+            bc: job.bc,
+            blocks,
+            rec_stride,
+            inter_stride,
+            out_stride,
+        });
+    }
+
+    // Group streams by format family so each family occupies one contiguous range.
+    metas.sort_by_key(|m| m.family);
+
+    let n_streams = metas.len();
+    let desc_bytes = n_streams
+        .checked_mul(STREAM_DESC_BYTES)
+        .ok_or_else(|| "BCPack: stream descriptor overflow".to_string())?;
+
+    let mut total_input = desc_bytes;
+    for m in &metas {
+        let padded = jobs[m.orig_idx].src.len().next_multiple_of(4);
+        total_input = total_input
+            .checked_add(padded)
+            .ok_or_else(|| "BCPack: input buffer overflow".to_string())?;
+    }
+    // Extra 4 bytes so ByteAddressBuffer.Load on trailing bytes stays in-bounds.
+    let input_buf_len = total_input + 4;
+    let _ = u32::try_from(input_buf_len)
+        .map_err(|_| "BCPack: input batch exceeds 4 GiB".to_string())?;
+
+    let mut input_host = vec![0u8; input_buf_len];
+    let mut src_cursor = desc_bytes;
+
+    let mut rec_total = 0u64;
+    for m in &metas {
+        rec_total = rec_total
+            .checked_add(u64::from(m.blocks) * u64::from(m.rec_stride))
+            .ok_or_else(|| "BCPack: records buffer overflow".to_string())?;
+    }
+    let inter_start = rec_total.next_multiple_of(16);
+
+    let mut rec_cursor = 0u64;
+    let mut inter_cursor = inter_start;
+    let mut out_cursor = 0u64;
+
+    let mut n_plain = 0u32;
+    let mut n_bc6 = 0u32;
+    let mut n_bc7 = 0u32;
+    let mut plain_blocks = 0u32;
+    let mut bc6_blocks = 0u32;
+    let mut bc7_blocks = 0u32;
+
+    let mut orig_out_ranges = vec![(0usize, 0usize); n_streams];
+
+    for (sidx, m) in metas.iter().enumerate() {
+        let src = jobs[m.orig_idx].src;
+        let src_off = src_cursor as u32;
+        let src_len = src.len() as u32;
+        input_host[src_cursor..src_cursor + src.len()].copy_from_slice(src);
+        src_cursor += src.len().next_multiple_of(4);
+
+        let rec_off = u32::try_from(rec_cursor)
+            .map_err(|_| "BCPack: work buffer exceeds 4 GiB".to_string())?;
+        let inter_off = u32::try_from(inter_cursor)
+            .map_err(|_| "BCPack: work buffer exceeds 4 GiB".to_string())?;
+        let out_off = u32::try_from(out_cursor)
+            .map_err(|_| "BCPack: output buffer exceeds 4 GiB".to_string())?;
+
+        let family_block_start = match m.family {
+            Family::Plain => {
+                let s = plain_blocks;
+                plain_blocks = plain_blocks
+                    .checked_add(m.blocks)
+                    .ok_or_else(|| "BCPack: block count overflow".to_string())?;
+                n_plain += 1;
+                s
+            }
+            Family::Bc6 => {
+                let s = bc6_blocks;
+                bc6_blocks = bc6_blocks
+                    .checked_add(m.blocks)
+                    .ok_or_else(|| "BCPack: block count overflow".to_string())?;
+                n_bc6 += 1;
+                s
+            }
+            Family::Bc7 => {
+                let s = bc7_blocks;
+                bc7_blocks = bc7_blocks
+                    .checked_add(m.blocks)
+                    .ok_or_else(|| "BCPack: block count overflow".to_string())?;
+                n_bc7 += 1;
+                s
+            }
+        };
+
+        let d = sidx * STREAM_DESC_BYTES;
+        write_u32_le(&mut input_host, d, u32::from(m.bc));
+        write_u32_le(&mut input_host, d + 4, m.blocks);
+        write_u32_le(&mut input_host, d + 8, src_off);
+        write_u32_le(&mut input_host, d + 12, src_len);
+        write_u32_le(&mut input_host, d + 16, rec_off);
+        write_u32_le(&mut input_host, d + 20, inter_off);
+        write_u32_le(&mut input_host, d + 24, out_off);
+        write_u32_le(&mut input_host, d + 28, family_block_start);
+
+        let out_bytes = (u64::from(m.blocks) * u64::from(m.out_stride)) as usize;
+        orig_out_ranges[m.orig_idx] = (out_off as usize, out_bytes);
+
+        rec_cursor += u64::from(m.blocks) * u64::from(m.rec_stride);
+        inter_cursor += u64::from(m.blocks) * u64::from(m.inter_stride);
+        out_cursor += out_bytes as u64;
+    }
+
+    const MAX_D3D12_DISPATCH_GROUPS: u32 = 65_535;
+    if n_streams > MAX_D3D12_DISPATCH_GROUPS as usize
+        || plain_blocks.div_ceil(64) > MAX_D3D12_DISPATCH_GROUPS
+        || bc6_blocks.div_ceil(64) > MAX_D3D12_DISPATCH_GROUPS
+        || bc7_blocks.div_ceil(64) > MAX_D3D12_DISPATCH_GROUPS
+    {
+        return Err(format!(
+            "gpu_bcpack: dispatch exceeds D3D12 65535 thread-group limit \
+             (streams={n_streams}, plain={plain_blocks}, bc6={bc6_blocks}, bc7={bc7_blocks})"
+        ));
+    }
+
+    let work_total = inter_cursor.max(256);
+    let status_offset = u32::try_from(out_cursor.next_multiple_of(4))
+        .map_err(|_| "BCPack: output buffer exceeds 4 GiB".to_string())?;
+    let out_total = u64::from(status_offset) + (n_streams as u64) * 4;
+
+    Ok(PreparedBatch {
+        n_streams,
+        n_plain,
+        n_bc6,
+        n_bc7,
+        plain_blocks,
+        bc6_blocks,
+        bc7_blocks,
+        input_host,
+        work_total,
+        status_offset,
+        out_total,
+        orig_out_ranges,
+    })
+}
+
+fn record_bcpack_telemetry(streams: u64, out_bytes: u64) {
+    let batches = BCPACK_STATS[0].fetch_add(1, Ordering::Relaxed) + 1;
+    let total_streams = BCPACK_STATS[1].fetch_add(streams, Ordering::Relaxed) + streams;
+    let coalesced = if streams > 1 {
+        BCPACK_STATS[2].fetch_add(1, Ordering::Relaxed) + 1
+    } else {
+        BCPACK_STATS[2].load(Ordering::Relaxed)
+    };
+    let total_bytes = BCPACK_STATS[3].fetch_add(out_bytes, Ordering::Relaxed) + out_bytes;
+    if batches == 1 || batches.is_multiple_of(500) {
+        tracing::info!(
+            batches,
+            coalesced_batches = coalesced,
+            streams = total_streams,
+            avg_streams_per_batch = format_args!("{:.2}", total_streams as f64 / batches.max(1) as f64),
+            mib = total_bytes >> 20,
+            "gpu_bcpack telemetry"
+        );
+    }
 }
 
 impl GpuBcpack {
@@ -1815,38 +2283,66 @@ impl GpuBcpack {
         let pso_pack_bc6 = make_pso("PASS_PACK_BC6", s!("bcpack_pack_bc6"))?;
         let pso_pack_bc7 = make_pso("PASS_PACK_BC7", s!("bcpack_pack_bc7"))?;
         let root_sig = root_sig.ok_or_else(|| "missing root signature".to_string())?;
+        let enhanced = device_enhanced_barriers(&device);
 
-        // SAFETY: plain D3D12 compute queue, allocator, list, fence and Win32 event creation.
-        let (queue, allocator, list, fence, event) = unsafe {
+        // SAFETY: plain D3D12 compute queue, fence, and table uploader objects.
+        let (queue, fence, tables_uploader) = unsafe {
             let queue: ID3D12CommandQueue = device
                 .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
                     Type: D3D12_COMMAND_LIST_TYPE_COMPUTE,
                     ..Default::default()
                 })
                 .map_err(|e| format!("CreateCommandQueue failed: {e}"))?;
-            let allocator: ID3D12CommandAllocator = device
-                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE)
-                .map_err(|e| format!("CreateCommandAllocator failed: {e}"))?;
-            let list: ID3D12GraphicsCommandList = device
-                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &allocator, None)
-                .map_err(|e| format!("CreateCommandList failed: {e}"))?;
-            list.Close().map_err(|e| format!("initial list Close failed: {e}"))?;
             let fence: ID3D12Fence = device
                 .CreateFence(0, D3D12_FENCE_FLAG_NONE)
                 .map_err(|e| format!("CreateFence failed: {e}"))?;
-            let event = CreateEventW(None, false, false, None)
-                .map_err(|e| format!("CreateEventW failed: {e}"))?;
-            (queue, allocator, list, fence, event)
+            let tbl_alloc: ID3D12CommandAllocator = device
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE)
+                .map_err(|e| format!("CreateCommandAllocator (tables) failed: {e}"))?;
+            let tbl_list: ID3D12GraphicsCommandList = device
+                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &tbl_alloc, None)
+                .map_err(|e| format!("CreateCommandList (tables) failed: {e}"))?;
+            tbl_list
+                .Close()
+                .map_err(|e| format!("initial tables list Close failed: {e}"))?;
+            let tbl_event = CreateEventW(None, false, false, None)
+                .map_err(|e| format!("CreateEventW (tables) failed: {e}"))?;
+            (
+                queue,
+                fence,
+                TablesUploader {
+                    allocator: tbl_alloc,
+                    list: tbl_list,
+                    event: tbl_event,
+                    cache: None,
+                },
+            )
         };
+
+        let slot0 = FlightSlot::new(&device, enhanced)?;
+        let slot1 = FlightSlot::new(&device, enhanced)?;
+        let barriers_label = if choose_barrier_kind(enhanced, slot0.list7.is_some()) == BarrierKind::Enhanced {
+            "enhanced"
+        } else {
+            "legacy-scoped"
+        };
+        tracing::info!(
+            slots = FLIGHT_SLOTS,
+            barriers = barriers_label,
+            "gpu_bcpack compute runtime initialized"
+        );
+
+        let mut free_slots = VecDeque::with_capacity(FLIGHT_SLOTS);
+        for i in 0..FLIGHT_SLOTS {
+            free_slots.push_back(i);
+        }
 
         Ok(Self {
             device,
             queue,
-            allocator,
-            list,
             fence,
-            event,
-            fence_val: 0,
+            next_fence: AtomicU64::new(0),
+            enhanced,
             root_sig,
             pso_lanes,
             pso_resolve_plain,
@@ -1855,38 +2351,38 @@ impl GpuBcpack {
             pso_pack_plain,
             pso_pack_bc6,
             pso_pack_bc7,
-            input_upload: ScratchBuffer::new(),
-            input_default: ScratchBuffer::new(),
-            work_uav: ScratchBuffer::new(),
-            out_uav: ScratchBuffer::new(),
-            out_readback: ScratchBuffer::new(),
-            tables_cache: None,
+            tables_lock: Mutex::new(tables_uploader),
+            slots: [Mutex::new(slot0), Mutex::new(slot1)],
+            pool: (
+                Mutex::new(PoolState {
+                    free_slots,
+                    pending: VecDeque::new(),
+                }),
+                Condvar::new(),
+            ),
         })
     }
 
-    fn execute_and_wait(&mut self) -> Result<(), String> {
-        // SAFETY: command list was recorded on `self.allocator` and closed; fence wait is serialized.
+    fn wait_fence_with_event(&self, fence_val: u64, event: HANDLE) -> Result<(), String> {
+        if fence_val == 0 {
+            return Ok(());
+        }
+        // SAFETY: live fence and event.
         unsafe {
-            self.list.Close().map_err(|e| format!("list Close failed: {e}"))?;
-            let cmd_list: ID3D12CommandList = self.list.cast().map_err(|e| format!("list cast failed: {e}"))?;
-            self.queue.ExecuteCommandLists(&[Some(cmd_list)]);
-            self.fence_val += 1;
-            self.queue
-                .Signal(&self.fence, self.fence_val)
-                .map_err(|e| format!("queue Signal failed: {e}"))?;
-            if self.fence.GetCompletedValue() < self.fence_val {
+            if self.fence.GetCompletedValue() < fence_val {
                 self.fence
-                    .SetEventOnCompletion(self.fence_val, self.event)
+                    .SetEventOnCompletion(fence_val, event)
                     .map_err(|e| format!("SetEventOnCompletion failed: {e}"))?;
-                WaitForSingleObject(self.event, INFINITE);
+                WaitForSingleObject(event, INFINITE);
             }
         }
         Ok(())
     }
 
-    fn ensure_tables_vram(&mut self, tables_bytes: &[u8]) -> Result<u64, String> {
+    fn ensure_tables_vram(&self, tables_bytes: &[u8]) -> Result<u64, String> {
         let hash = blake3::hash(tables_bytes);
-        if let Some(cached) = &self.tables_cache
+        let mut uploader = self.tables_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(cached) = &uploader.cache
             && cached.hash == hash
         {
             // SAFETY: resource is valid and resident in NON_PIXEL_SHADER_RESOURCE state.
@@ -1902,259 +2398,188 @@ impl GpuBcpack {
             D3D12_RESOURCE_STATE_COPY_DEST,
         )?;
 
-        // SAFETY: allocator/list are idle; we upload tables and wait before dropping staging.
+        let fence_val = self.next_fence.fetch_add(1, Ordering::AcqRel) + 1;
+        // SAFETY: tables uploader allocator/list are serialized behind `tables_lock`;
+        // we wait for `fence_val` before dropping `staging`.
         unsafe {
-            self.allocator.Reset().map_err(|e| format!("allocator Reset failed: {e}"))?;
-            self.list
-                .Reset(&self.allocator, None)
-                .map_err(|e| format!("list Reset failed: {e}"))?;
-            self.list
+            uploader
+                .allocator
+                .Reset()
+                .map_err(|e| format!("tables allocator Reset failed: {e}"))?;
+            uploader
+                .list
+                .Reset(&uploader.allocator, None)
+                .map_err(|e| format!("tables list Reset failed: {e}"))?;
+            uploader
+                .list
                 .CopyBufferRegion(&vram, 0, &staging.resource, 0, staging.packed.len() as u64);
             transition(
-                &self.list,
+                &uploader.list,
                 &[(
                     &vram,
                     D3D12_RESOURCE_STATE_COPY_DEST,
                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                 )],
             );
+            uploader
+                .list
+                .Close()
+                .map_err(|e| format!("tables list Close failed: {e}"))?;
+            let cmd_list: ID3D12CommandList = uploader
+                .list
+                .cast()
+                .map_err(|e| format!("tables list cast failed: {e}"))?;
+            self.queue.ExecuteCommandLists(&[Some(cmd_list)]);
+            self.queue
+                .Signal(&self.fence, fence_val)
+                .map_err(|e| format!("tables queue Signal failed: {e}"))?;
         }
-        self.execute_and_wait()?;
+        self.wait_fence_with_event(fence_val, uploader.event)?;
 
         // SAFETY: resource is valid.
         let gpu_va = unsafe { vram.GetGPUVirtualAddress() };
-        self.tables_cache = Some(CachedVramTables { hash, resource: vram });
+        uploader.cache = Some(CachedVramTables { hash, resource: vram });
         Ok(gpu_va)
     }
 
-    fn decode_batch(&mut self, jobs: &[StreamJob<'_>], tables_bytes: &[u8]) -> Result<Vec<Vec<u8>>, String> {
-        if jobs.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-        enum Family {
-            Plain = 0,
-            Bc6 = 1,
-            Bc7 = 2,
-        }
-
-        struct JobMeta {
-            orig_idx: usize,
-            family: Family,
-            bc: u8,
-            blocks: u32,
-            rec_stride: u32,
-            inter_stride: u32,
-            out_stride: u32,
-        }
-
-        let mut metas = Vec::with_capacity(jobs.len());
-        for (orig_idx, job) in jobs.iter().enumerate() {
-            let (family, rec_stride, inter_stride, out_stride) = match job.bc {
-                1 | 4 => (Family::Plain, 12u32, PLAIN_BYTES as u32, 8u32),
-                3 | 5 => (Family::Plain, 24u32, PLAIN_BYTES as u32, 16u32),
-                6 => (Family::Bc6, 32u32, BC6_BYTES as u32, 16u32),
-                7 => (Family::Bc7, 32u32, BC7_BYTES as u32, 16u32),
-                _ => return Err("BCPack: unsupported BC format".to_string()),
-            };
-            if job.blocks == 0 {
-                return Err("BCPack: destination is not a whole number of blocks".to_string());
+    fn acquire_slot(&self) -> usize {
+        let mut pool = self.pool.0.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(slot_idx) = pool.free_slots.pop_front() {
+                return slot_idx;
             }
-            let blocks = u32::try_from(job.blocks)
-                .map_err(|_| "BCPack: block count exceeds GPU 32-bit limit".to_string())?;
-            metas.push(JobMeta {
-                orig_idx,
-                family,
-                bc: job.bc,
-                blocks,
-                rec_stride,
-                inter_stride,
-                out_stride,
-            });
+            pool = self.pool.1.wait(pool).unwrap_or_else(|e| e.into_inner());
         }
+    }
 
-        // Group streams by format family so each family occupies one contiguous range.
-        metas.sort_by_key(|m| m.family);
+    fn release_slot(&self, slot_idx: usize) {
+        let mut pool = self.pool.0.lock().unwrap_or_else(|e| e.into_inner());
+        pool.free_slots.push_back(slot_idx);
+        self.pool.1.notify_all();
+    }
 
-        let n_streams = metas.len();
-        let desc_bytes = n_streams
-            .checked_mul(STREAM_DESC_BYTES)
-            .ok_or_else(|| "BCPack: stream descriptor overflow".to_string())?;
+    /// Encodes and submits `batch` onto `slot_idx` without waiting on the GPU fence,
+    /// returning the signaled fence value so another batch can overlap on the other slot.
+    fn submit_on_slot(
+        &self,
+        slot_idx: usize,
+        batch: &PreparedBatch,
+        tables_va: u64,
+    ) -> Result<u64, String> {
+        let mut slot = self.slots[slot_idx].lock().unwrap_or_else(|e| e.into_inner());
+        // Ensure prior submission on this slot has completed before resetting its allocator.
+        self.wait_fence_with_event(slot.fence_val, slot.event)?;
 
-        // Build input buffer: StreamDesc[N] + padded compressed stream payloads.
-        let mut total_input = desc_bytes;
-        for m in &metas {
-            let padded = jobs[m.orig_idx].src.len().next_multiple_of(4);
-            total_input = total_input
-                .checked_add(padded)
-                .ok_or_else(|| "BCPack: input buffer overflow".to_string())?;
-        }
-        // Extra 4 bytes so ByteAddressBuffer.Load on trailing bytes stays in-bounds.
-        let input_buf_len = total_input + 4;
-        let _ = u32::try_from(input_buf_len)
-            .map_err(|_| "BCPack: input batch exceeds 4 GiB".to_string())?;
+        let use_enhanced =
+            choose_barrier_kind(self.enhanced, slot.list7.is_some()) == BarrierKind::Enhanced;
+        let default_init = if use_enhanced {
+            D3D12_RESOURCE_STATE_COMMON
+        } else {
+            D3D12_RESOURCE_STATE_COPY_DEST
+        };
+        let uav_init = if use_enhanced {
+            D3D12_RESOURCE_STATE_COMMON
+        } else {
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+        };
 
-        let mut input_host = vec![0u8; input_buf_len];
-        let mut src_cursor = desc_bytes;
+        let input_upload = slot
+            .input_upload
+            .ensure(
+                &self.device,
+                batch.input_host.len() as u64,
+                D3D12_HEAP_TYPE_UPLOAD,
+                D3D12_RESOURCE_FLAG_NONE,
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+            )?
+            .clone();
+        upload_bytes(&input_upload, &batch.input_host)?;
 
-        // First compute work_buf layout: all records, then all resolved intermediate blocks.
-        let mut rec_total = 0u64;
-        for m in &metas {
-            rec_total = rec_total
-                .checked_add(u64::from(m.blocks) * u64::from(m.rec_stride))
-                .ok_or_else(|| "BCPack: records buffer overflow".to_string())?;
-        }
-        let inter_start = rec_total.next_multiple_of(16);
-
-        let mut rec_cursor = 0u64;
-        let mut inter_cursor = inter_start;
-        let mut out_cursor = 0u64;
-
-        let mut n_plain = 0u32;
-        let mut n_bc6 = 0u32;
-        let mut n_bc7 = 0u32;
-        let mut plain_blocks = 0u32;
-        let mut bc6_blocks = 0u32;
-        let mut bc7_blocks = 0u32;
-
-        // Track output slice per original job index.
-        let mut orig_out_ranges = vec![(0usize, 0usize); n_streams];
-
-        for (sidx, m) in metas.iter().enumerate() {
-            let src = jobs[m.orig_idx].src;
-            let src_off = src_cursor as u32;
-            let src_len = src.len() as u32;
-            input_host[src_cursor..src_cursor + src.len()].copy_from_slice(src);
-            src_cursor += src.len().next_multiple_of(4);
-
-            let rec_off = u32::try_from(rec_cursor)
-                .map_err(|_| "BCPack: work buffer exceeds 4 GiB".to_string())?;
-            let inter_off = u32::try_from(inter_cursor)
-                .map_err(|_| "BCPack: work buffer exceeds 4 GiB".to_string())?;
-            let out_off = u32::try_from(out_cursor)
-                .map_err(|_| "BCPack: output buffer exceeds 4 GiB".to_string())?;
-
-            let family_block_start = match m.family {
-                Family::Plain => {
-                    let s = plain_blocks;
-                    plain_blocks = plain_blocks
-                        .checked_add(m.blocks)
-                        .ok_or_else(|| "BCPack: block count overflow".to_string())?;
-                    n_plain += 1;
-                    s
-                }
-                Family::Bc6 => {
-                    let s = bc6_blocks;
-                    bc6_blocks = bc6_blocks
-                        .checked_add(m.blocks)
-                        .ok_or_else(|| "BCPack: block count overflow".to_string())?;
-                    n_bc6 += 1;
-                    s
-                }
-                Family::Bc7 => {
-                    let s = bc7_blocks;
-                    bc7_blocks = bc7_blocks
-                        .checked_add(m.blocks)
-                        .ok_or_else(|| "BCPack: block count overflow".to_string())?;
-                    n_bc7 += 1;
-                    s
-                }
-            };
-
-            let d = sidx * STREAM_DESC_BYTES;
-            write_u32_le(&mut input_host, d, u32::from(m.bc));
-            write_u32_le(&mut input_host, d + 4, m.blocks);
-            write_u32_le(&mut input_host, d + 8, src_off);
-            write_u32_le(&mut input_host, d + 12, src_len);
-            write_u32_le(&mut input_host, d + 16, rec_off);
-            write_u32_le(&mut input_host, d + 20, inter_off);
-            write_u32_le(&mut input_host, d + 24, out_off);
-            write_u32_le(&mut input_host, d + 28, family_block_start);
-
-            let out_bytes = (u64::from(m.blocks) * u64::from(m.out_stride)) as usize;
-            orig_out_ranges[m.orig_idx] = (out_off as usize, out_bytes);
-
-            rec_cursor += u64::from(m.blocks) * u64::from(m.rec_stride);
-            inter_cursor += u64::from(m.blocks) * u64::from(m.inter_stride);
-            out_cursor += out_bytes as u64;
-        }
-
-        let work_total = inter_cursor.max(256);
-        let status_offset = u32::try_from(out_cursor.next_multiple_of(4))
-            .map_err(|_| "BCPack: output buffer exceeds 4 GiB".to_string())?;
-        let out_total = u64::from(status_offset) + (n_streams as u64) * 4;
-
-        let tables_va = self.ensure_tables_vram(tables_bytes)?;
-
-        let input_upload = self.input_upload.ensure(
-            &self.device,
-            input_host.len() as u64,
-            D3D12_HEAP_TYPE_UPLOAD,
-            D3D12_RESOURCE_FLAG_NONE,
-            D3D12_RESOURCE_STATE_GENERIC_READ,
-        )?;
-        upload_bytes(input_upload, &input_host)?;
-        let input_upload = input_upload.clone();
-
-        let input_default = self
+        let input_default = slot
             .input_default
             .ensure(
                 &self.device,
-                input_host.len() as u64,
+                batch.input_host.len() as u64,
                 D3D12_HEAP_TYPE_DEFAULT,
                 D3D12_RESOURCE_FLAG_NONE,
-                D3D12_RESOURCE_STATE_COPY_DEST,
+                default_init,
             )?
             .clone();
-        let work_uav = self
+        let work_uav = slot
             .work_uav
             .ensure(
                 &self.device,
-                work_total,
+                batch.work_total,
                 D3D12_HEAP_TYPE_DEFAULT,
                 D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                uav_init,
             )?
             .clone();
-        let out_uav = self
+        let out_uav = slot
             .out_uav
             .ensure(
                 &self.device,
-                out_total,
+                batch.out_total,
                 D3D12_HEAP_TYPE_DEFAULT,
                 D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                uav_init,
             )?
             .clone();
-        let out_readback = self
+        let out_readback = slot
             .out_readback
             .ensure(
                 &self.device,
-                out_total,
+                batch.out_total,
                 D3D12_HEAP_TYPE_READBACK,
                 D3D12_RESOURCE_FLAG_NONE,
                 D3D12_RESOURCE_STATE_COPY_DEST,
             )?
             .clone();
 
-        // SAFETY: all buffers live through `execute_and_wait`; resource states match transitions.
+        let fence_val = self.next_fence.fetch_add(1, Ordering::AcqRel) + 1;
+
+        // SAFETY: slot allocator/list are idle; all buffers live until `finish_on_slot`
+        // waits for `fence_val`; barriers strictly order all phases without `UAV(NULL)`.
         unsafe {
-            self.allocator.Reset().map_err(|e| format!("allocator Reset failed: {e}"))?;
-            self.list
-                .Reset(&self.allocator, None)
+            slot.allocator
+                .Reset()
+                .map_err(|e| format!("allocator Reset failed: {e}"))?;
+            slot.list
+                .Reset(&slot.allocator, None)
                 .map_err(|e| format!("list Reset failed: {e}"))?;
 
-            let l = &self.list;
-            l.CopyBufferRegion(&input_default, 0, &input_upload, 0, input_host.len() as u64);
-            transition(
-                l,
-                &[(
-                    &input_default,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                )],
+            let l = &slot.list;
+            let l7 = slot.list7.as_ref();
+
+            l.CopyBufferRegion(
+                &input_default,
+                0,
+                &input_upload,
+                0,
+                batch.input_host.len() as u64,
             );
+
+            if use_enhanced && let Some(l7) = l7 {
+                emit_enhanced_buf_barriers(
+                    l7,
+                    &[enhanced_buf_barrier(
+                        &input_default,
+                        D3D12_BARRIER_SYNC_COPY,
+                        D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+                        D3D12_BARRIER_ACCESS_COPY_DEST,
+                        D3D12_BARRIER_ACCESS_SHADER_RESOURCE,
+                    )],
+                );
+            } else {
+                transition(
+                    l,
+                    &[(
+                        &input_default,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    )],
+                );
+            }
 
             l.SetComputeRootSignature(&self.root_sig);
             l.SetComputeRootShaderResourceView(1, tables_va);
@@ -2162,18 +2587,7 @@ impl GpuBcpack {
             l.SetComputeRootUnorderedAccessView(3, work_uav.GetGPUVirtualAddress());
             l.SetComputeRootUnorderedAccessView(4, out_uav.GetGPUVirtualAddress());
 
-            const MAX_D3D12_DISPATCH_GROUPS: u32 = 65_535;
-            if n_streams > MAX_D3D12_DISPATCH_GROUPS as usize
-                || plain_blocks.div_ceil(64) > MAX_D3D12_DISPATCH_GROUPS
-                || bc6_blocks.div_ceil(64) > MAX_D3D12_DISPATCH_GROUPS
-                || bc7_blocks.div_ceil(64) > MAX_D3D12_DISPATCH_GROUPS
-            {
-                return Err(format!(
-                    "gpu_bcpack: dispatch exceeds D3D12 65535 thread-group limit \
-                     (streams={n_streams}, plain={plain_blocks}, bc6={bc6_blocks}, bc7={bc7_blocks})"
-                ));
-            }
-
+            let status_offset = batch.status_offset;
             let dispatch = |pso: &ID3D12PipelineState, sbase: u32, scount: u32, tblks: u32, groups: u32| {
                 let consts = [sbase, scount, tblks, status_offset, 0u32, 0, 0, 0];
                 l.SetComputeRoot32BitConstants(0, 8, consts.as_ptr().cast(), 0);
@@ -2182,103 +2596,157 @@ impl GpuBcpack {
             };
 
             // Pass 1: stream-parallel 12/16-lane rANS decode across all streams.
-            dispatch(&self.pso_lanes, 0, n_streams as u32, 0, n_streams as u32);
-            uav_barrier(l);
+            dispatch(
+                &self.pso_lanes,
+                0,
+                batch.n_streams as u32,
+                0,
+                batch.n_streams as u32,
+            );
+            emit_scoped_uav_barriers(l, l7, self.enhanced, &work_uav, &out_uav);
 
             // Pass 2a: stream-parallel ring-buffer history & dictionary resolution.
-            if n_plain > 0 {
-                dispatch(&self.pso_resolve_plain, 0, n_plain, plain_blocks, n_plain);
+            if batch.n_plain > 0 {
+                dispatch(
+                    &self.pso_resolve_plain,
+                    0,
+                    batch.n_plain,
+                    batch.plain_blocks,
+                    batch.n_plain,
+                );
             }
-            if n_bc6 > 0 {
-                dispatch(&self.pso_resolve_bc6, n_plain, n_bc6, bc6_blocks, n_bc6);
+            if batch.n_bc6 > 0 {
+                dispatch(
+                    &self.pso_resolve_bc6,
+                    batch.n_plain,
+                    batch.n_bc6,
+                    batch.bc6_blocks,
+                    batch.n_bc6,
+                );
             }
-            if n_bc7 > 0 {
-                dispatch(&self.pso_resolve_bc7, n_plain + n_bc6, n_bc7, bc7_blocks, n_bc7);
+            if batch.n_bc7 > 0 {
+                dispatch(
+                    &self.pso_resolve_bc7,
+                    batch.n_plain + batch.n_bc6,
+                    batch.n_bc7,
+                    batch.bc7_blocks,
+                    batch.n_bc7,
+                );
             }
-            uav_barrier(l);
+            emit_scoped_uav_barriers(l, l7, self.enhanced, &work_uav, &out_uav);
 
             // Pass 2b: 100% block-parallel BC block bit-packing.
-            if plain_blocks > 0 {
+            if batch.plain_blocks > 0 {
                 dispatch(
                     &self.pso_pack_plain,
                     0,
-                    n_plain,
-                    plain_blocks,
-                    plain_blocks.div_ceil(64),
+                    batch.n_plain,
+                    batch.plain_blocks,
+                    batch.plain_blocks.div_ceil(64),
                 );
             }
-            if bc6_blocks > 0 {
+            if batch.bc6_blocks > 0 {
                 dispatch(
                     &self.pso_pack_bc6,
-                    n_plain,
-                    n_bc6,
-                    bc6_blocks,
-                    bc6_blocks.div_ceil(64),
+                    batch.n_plain,
+                    batch.n_bc6,
+                    batch.bc6_blocks,
+                    batch.bc6_blocks.div_ceil(64),
                 );
             }
-            if bc7_blocks > 0 {
+            if batch.bc7_blocks > 0 {
                 dispatch(
                     &self.pso_pack_bc7,
-                    n_plain + n_bc6,
-                    n_bc7,
-                    bc7_blocks,
-                    bc7_blocks.div_ceil(64),
+                    batch.n_plain + batch.n_bc6,
+                    batch.n_bc7,
+                    batch.bc7_blocks,
+                    batch.bc7_blocks.div_ceil(64),
                 );
             }
 
-            transition(
-                l,
-                &[(
-                    &out_uav,
-                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                    D3D12_RESOURCE_STATE_COPY_SOURCE,
-                )],
-            );
-
-            l.CopyBufferRegion(&out_readback, 0, &out_uav, 0, out_total);
-
-            // Restore persistent buffer states for the next call.
-            transition(
-                l,
-                &[
-                    (
+            if use_enhanced && let Some(l7) = l7 {
+                emit_enhanced_buf_barriers(
+                    l7,
+                    &[enhanced_buf_barrier(
                         &out_uav,
-                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+                        D3D12_BARRIER_SYNC_COPY,
+                        D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+                        D3D12_BARRIER_ACCESS_COPY_SOURCE,
+                    )],
+                );
+            } else {
+                transition(
+                    l,
+                    &[(
+                        &out_uav,
                         D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                    ),
-                    (
-                        &input_default,
-                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                        D3D12_RESOURCE_STATE_COPY_DEST,
-                    ),
-                ],
-            );
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    )],
+                );
+            }
+
+            l.CopyBufferRegion(&out_readback, 0, &out_uav, 0, batch.out_total);
+
+            if !use_enhanced {
+                // Restore persistent legacy buffer states for the next call.
+                transition(
+                    l,
+                    &[
+                        (
+                            &out_uav,
+                            D3D12_RESOURCE_STATE_COPY_SOURCE,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        ),
+                        (
+                            &input_default,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        ),
+                    ],
+                );
+            }
+
+            l.Close().map_err(|e| format!("list Close failed: {e}"))?;
+            let cmd_list: ID3D12CommandList =
+                l.cast().map_err(|e| format!("list cast failed: {e}"))?;
+            self.queue.ExecuteCommandLists(&[Some(cmd_list)]);
+            self.queue
+                .Signal(&self.fence, fence_val)
+                .map_err(|e| format!("queue Signal failed: {e}"))?;
         }
 
-        self.execute_and_wait()?;
+        slot.fence_val = fence_val;
+        Ok(fence_val)
+    }
 
-        let mut readback = vec![0u8; out_total as usize];
+    /// Waits for `slot_idx`'s submission to land, reads back decoded streams,
+    /// checks per-stream status codes, and trims oversized scratch buffers.
+    fn finish_on_slot(
+        &self,
+        slot_idx: usize,
+        fence_val: u64,
+        batch: &PreparedBatch,
+    ) -> Result<Vec<Vec<u8>>, String> {
+        let mut slot = self.slots[slot_idx].lock().unwrap_or_else(|e| e.into_inner());
+        self.wait_fence_with_event(fence_val, slot.event)?;
+
+        let out_readback = slot
+            .out_readback
+            .res
+            .as_ref()
+            .ok_or_else(|| "missing readback buffer".to_string())?
+            .clone();
+        let mut readback = vec![0u8; batch.out_total as usize];
         readback_bytes(&out_readback, &mut readback)?;
 
-        // Drop oversized outlier scratch buffers (> 16 MiB) once the synchronous
-        // fence has landed so transient large batches never permanently pin VRAM.
-        const MAX_RETAINED_SCRATCH: u64 = 16 << 20;
-        for sb in [
-            &mut self.input_upload,
-            &mut self.input_default,
-            &mut self.work_uav,
-            &mut self.out_uav,
-            &mut self.out_readback,
-        ] {
-            if sb.capacity > MAX_RETAINED_SCRATCH {
-                sb.res = None;
-                sb.capacity = 0;
-            }
-        }
+        // Drop oversized outlier scratch buffers (> 16 MiB) once the fence has
+        // landed so transient large batches never permanently pin VRAM.
+        slot.trim_oversized();
+        drop(slot);
 
-        // Check per-stream status flags written by Pass 1 and Pass 2a.
-        let st_base = status_offset as usize;
-        for sidx in 0..n_streams {
+        let st_base = batch.status_offset as usize;
+        for sidx in 0..batch.n_streams {
             let code = u32::from_le_bytes(
                 readback[st_base + sidx * 4..st_base + sidx * 4 + 4]
                     .try_into()
@@ -2293,27 +2761,222 @@ impl GpuBcpack {
             }
         }
 
-        let mut results = Vec::with_capacity(n_streams);
-        for (off, len) in orig_out_ranges {
+        let mut results = Vec::with_capacity(batch.n_streams);
+        for &(off, len) in &batch.orig_out_ranges {
             results.push(readback[off..off + len].to_vec());
         }
+        record_bcpack_telemetry(batch.n_streams as u64, batch.out_total);
         Ok(results)
+    }
+
+    /// Coalesces single-stream callers that arrive while both flight slots are
+    /// busy into one batched GPU dispatch as soon as either slot frees up.
+    fn decode_single_coalesced(
+        &self,
+        bc: u8,
+        src: &[u8],
+        blocks: usize,
+        tables_bytes: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        let tables_hash = blake3::hash(tables_bytes);
+        let tables_va = self.ensure_tables_vram(tables_bytes)?;
+
+        // Fast path: grab a free slot immediately (plus any compatible queued items).
+        let (slot_idx, followers) = {
+            let mut pool = self.pool.0.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(slot_idx) = pool.free_slots.pop_front() {
+                let followers = drain_compatible(&mut pool.pending, tables_hash, src.len());
+                (slot_idx, followers)
+            } else {
+                // Both double-buffered slots are in flight on the GPU: queue this
+                // request so the next thread that acquires a slot batches us together.
+                let item = Arc::new(CoalescedItem {
+                    bc,
+                    src: src.to_vec(),
+                    blocks,
+                    tables_hash,
+                    result: Mutex::new(None),
+                    done: Condvar::new(),
+                });
+                pool.pending.push_back(item.clone());
+                loop {
+                    if let Some(res) = item.result.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                        return res;
+                    }
+                    if let Some(slot_idx) = pool.free_slots.pop_front() {
+                        // We acquired a slot; check if another leader already claimed our item.
+                        if let Some(pos) = pool.pending.iter().position(|p| Arc::ptr_eq(p, &item)) {
+                            pool.pending.remove(pos);
+                            let followers = drain_compatible(&mut pool.pending, tables_hash, src.len());
+                            break (slot_idx, followers);
+                        }
+                        // Another leader already popped our item; return slot and wait on item.done.
+                        pool.free_slots.push_back(slot_idx);
+                        self.pool.1.notify_one();
+                        drop(pool);
+                        let mut res_guard = item.result.lock().unwrap_or_else(|e| e.into_inner());
+                        while res_guard.is_none() {
+                            res_guard = item.done.wait(res_guard).unwrap_or_else(|e| e.into_inner());
+                        }
+                        return res_guard.take().unwrap_or_else(|| Err("BCPack: missing result".into()));
+                    }
+                    pool = self.pool.1.wait(pool).unwrap_or_else(|e| e.into_inner());
+                }
+            }
+        };
+
+        let mut jobs = Vec::with_capacity(1 + followers.len());
+        jobs.push(StreamJob { bc, src, blocks });
+        for f in &followers {
+            jobs.push(StreamJob {
+                bc: f.bc,
+                src: &f.src,
+                blocks: f.blocks,
+            });
+        }
+
+        let batch_res = prepare_batch(&jobs).and_then(|batch| {
+            let fence_val = self.submit_on_slot(slot_idx, &batch, tables_va)?;
+            self.finish_on_slot(slot_idx, fence_val, &batch)
+        });
+        self.release_slot(slot_idx);
+
+        match batch_res {
+            Ok(mut outs) => {
+                let mine = outs.remove(0);
+                for (f, out) in followers.into_iter().zip(outs) {
+                    *f.result.lock().unwrap_or_else(|e| e.into_inner()) = Some(Ok(out));
+                    f.done.notify_one();
+                }
+                self.pool.1.notify_all();
+                Ok(mine)
+            }
+            Err(err) => {
+                // If a coalesced batch failed (e.g., one corrupt stream), fall back to
+                // decoding each stream individually so a bad stream never poisons healthy siblings.
+                if !followers.is_empty() {
+                    for f in followers {
+                        let single = self.decode_batch_sync(
+                            &[StreamJob {
+                                bc: f.bc,
+                                src: &f.src,
+                                blocks: f.blocks,
+                            }],
+                            tables_bytes,
+                        );
+                        let mapped = single.map(|mut v| v.pop().unwrap_or_default());
+                        *f.result.lock().unwrap_or_else(|e| e.into_inner()) = Some(mapped);
+                        f.done.notify_one();
+                    }
+                    self.pool.1.notify_all();
+                    let mine = self.decode_batch_sync(
+                        &[StreamJob { bc, src, blocks }],
+                        tables_bytes,
+                    )?;
+                    return Ok(mine.into_iter().next().unwrap_or_default());
+                }
+                Err(err)
+            }
+        }
+    }
+
+    fn decode_batch_sync(
+        &self,
+        jobs: &[StreamJob<'_>],
+        tables_bytes: &[u8],
+    ) -> Result<Vec<Vec<u8>>, String> {
+        if jobs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let batch = prepare_batch(jobs)?;
+        let tables_va = self.ensure_tables_vram(tables_bytes)?;
+        let slot_idx = self.acquire_slot();
+        let res = self
+            .submit_on_slot(slot_idx, &batch, tables_va)
+            .and_then(|fence_val| self.finish_on_slot(slot_idx, fence_val, &batch));
+        self.release_slot(slot_idx);
+        res
     }
 }
 
-fn runtime() -> Result<&'static Mutex<GpuBcpack>, String> {
-    static RUNTIME: OnceLock<Result<Mutex<GpuBcpack>, String>> = OnceLock::new();
+fn drain_compatible(
+    pending: &mut VecDeque<Arc<CoalescedItem>>,
+    tables_hash: blake3::Hash,
+    initial_bytes: usize,
+) -> Vec<Arc<CoalescedItem>> {
+    let mut out = Vec::new();
+    let mut bytes = initial_bytes;
+    let mut i = 0usize;
+    while i < pending.len() && out.len() + 1 < MAX_COALESCED_STREAMS {
+        let compat = pending[i].tables_hash == tables_hash
+            && bytes.saturating_add(pending[i].src.len()) <= MAX_COALESCED_INPUT_BYTES;
+        if compat {
+            if let Some(item) = pending.remove(i) {
+                bytes = bytes.saturating_add(item.src.len());
+                out.push(item);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Handle to an asynchronously submitted GPU BCPack batch occupying one of the
+/// double-buffered [`FlightSlot`]s. Calling [`Self::wait`] blocks until the
+/// compute queue fence completes and returns the decoded BC block buffers.
+#[allow(dead_code)]
+pub struct PendingBatch {
+    rt: &'static GpuBcpack,
+    slot_idx: Option<usize>,
+    fence_val: u64,
+    batch: PreparedBatch,
+}
+
+#[allow(dead_code)]
+impl PendingBatch {
+    /// Which double-buffered flight slot (`0` or `1`) this batch runs on.
+    pub fn slot(&self) -> usize {
+        self.slot_idx.unwrap_or(0)
+    }
+
+    /// Waits for the GPU compute batch to finish and reads back all decoded streams.
+    pub fn wait(mut self) -> Result<Vec<Vec<u8>>, String> {
+        let Some(slot_idx) = self.slot_idx.take() else {
+            return Ok(Vec::new());
+        };
+        let res = self.rt.finish_on_slot(slot_idx, self.fence_val, &self.batch);
+        self.rt.release_slot(slot_idx);
+        res
+    }
+}
+
+impl Drop for PendingBatch {
+    fn drop(&mut self) {
+        if let Some(slot_idx) = self.slot_idx.take() {
+            let slot = self.rt.slots[slot_idx].lock().unwrap_or_else(|e| e.into_inner());
+            let _ = self.rt.wait_fence_with_event(self.fence_val, slot.event);
+            drop(slot);
+            self.rt.release_slot(slot_idx);
+        }
+    }
+}
+
+fn runtime() -> Result<&'static GpuBcpack, String> {
+    static RUNTIME: OnceLock<Result<GpuBcpack, String>> = OnceLock::new();
     match RUNTIME.get_or_init(|| {
         let host = crate::host::host()
             .ok_or_else(|| "no host D3D12 device available for GPU BCPack".to_string())?;
-        GpuBcpack::new(host.device.clone()).map(Mutex::new)
+        GpuBcpack::new(host.device.clone())
     }) {
-        Ok(m) => Ok(m),
+        Ok(rt) => Ok(rt),
         Err(e) => Err(e.clone()),
     }
 }
 
 /// Decodes a single BCPack stream on the GPU using the shipped `bcpack-tables.bin`.
+/// Automatically overlaps across double-buffered flight slots and coalesces
+/// concurrent callers into batched compute submissions.
 #[allow(dead_code)]
 pub fn decode_gpu(bc: u8, src: &[u8], dst: &mut [u8]) -> Result<(), String> {
     decode_gpu_with_tables(bc, src, dst, BUILTIN_TABLES)
@@ -2336,9 +2999,56 @@ pub fn decode_gpu_with_tables(
         return Err("BCPack: destination is not a whole number of blocks".to_string());
     }
     let blocks = dst.len() / block_bytes;
-    let mut out = decode_gpu_batch(&[StreamJob { bc, src, blocks }], tables_bytes)?;
-    dst.copy_from_slice(&out.pop().unwrap_or_default());
+    let rt = runtime()?;
+    let out = rt.decode_single_coalesced(bc, src, blocks, tables_bytes)?;
+    dst.copy_from_slice(&out);
     Ok(())
+}
+
+/// Submits a batch of BCPack streams asynchronously onto one of the double-buffered
+/// compute flight slots so consecutive batches overlap on the GPU.
+#[allow(dead_code)]
+pub fn submit_gpu_batch_async(
+    jobs: &[StreamJob<'_>],
+    tables_bytes: &[u8],
+) -> Result<PendingBatch, String> {
+    let rt = runtime()?;
+    if jobs.is_empty() {
+        return Ok(PendingBatch {
+            rt,
+            slot_idx: None,
+            fence_val: 0,
+            batch: PreparedBatch {
+                n_streams: 0,
+                n_plain: 0,
+                n_bc6: 0,
+                n_bc7: 0,
+                plain_blocks: 0,
+                bc6_blocks: 0,
+                bc7_blocks: 0,
+                input_host: Vec::new(),
+                work_total: 0,
+                status_offset: 0,
+                out_total: 0,
+                orig_out_ranges: Vec::new(),
+            },
+        });
+    }
+    let batch = prepare_batch(jobs)?;
+    let tables_va = rt.ensure_tables_vram(tables_bytes)?;
+    let slot_idx = rt.acquire_slot();
+    match rt.submit_on_slot(slot_idx, &batch, tables_va) {
+        Ok(fence_val) => Ok(PendingBatch {
+            rt,
+            slot_idx: Some(slot_idx),
+            fence_val,
+            batch,
+        }),
+        Err(e) => {
+            rt.release_slot(slot_idx);
+            Err(e)
+        }
+    }
 }
 
 /// Decodes a batch of BCPack streams (potentially mixed BC formats and sizes) on the GPU.
@@ -2347,9 +3057,10 @@ pub fn decode_gpu_batch(
     jobs: &[StreamJob<'_>],
     tables_bytes: &[u8],
 ) -> Result<Vec<Vec<u8>>, String> {
-    let mutex = runtime()?;
-    let mut gpu = mutex.lock().unwrap_or_else(|e| e.into_inner());
-    gpu.decode_batch(jobs, tables_bytes)
+    if jobs.is_empty() {
+        return Ok(Vec::new());
+    }
+    submit_gpu_batch_async(jobs, tables_bytes)?.wait()
 }
 
 #[cfg(test)]
@@ -2975,5 +3686,119 @@ mod tests {
                 gpu_mbs / cpu_mbs,
             );
         }
+    }
+
+    #[test]
+    fn barrier_scoping_selects_enhanced_or_legacy_scoped() {
+        assert_eq!(choose_barrier_kind(true, true), BarrierKind::Enhanced);
+        assert_eq!(choose_barrier_kind(true, false), BarrierKind::LegacyScoped);
+        assert_eq!(choose_barrier_kind(false, true), BarrierKind::LegacyScoped);
+        assert_eq!(choose_barrier_kind(false, false), BarrierKind::LegacyScoped);
+    }
+
+    #[test]
+    fn double_buffered_async_batches_overlap_across_both_slots() {
+        let cpu_tables = Tables::builtin().unwrap();
+        let ctrl_codes = valid_ctrl7_codes(BUILTIN_TABLES);
+
+        let make_stream = |bc: u8, blocks: usize, seed: u64| {
+            let (_, _, block_bytes) = widths_and_per(bc);
+            let recs = make_records(bc, blocks, seed, &ctrl_codes);
+            let src = encode_stream(BUILTIN_TABLES, bc, &recs, true);
+            let mut cpu_out = vec![0u8; blocks * block_bytes];
+            bcpack::decode(bc, &src, &mut cpu_out, &cpu_tables).unwrap();
+            (bc, blocks, src, cpu_out)
+        };
+
+        let a0 = make_stream(7, 96, 0x1111_2222);
+        let a1 = make_stream(1, 128, 0x3333_4444);
+        let b0 = make_stream(6, 70, 0x5555_6666);
+        let b1 = make_stream(5, 80, 0x7777_8888);
+
+        let jobs_a = [
+            StreamJob { bc: a0.0, src: &a0.2, blocks: a0.1 },
+            StreamJob { bc: a1.0, src: &a1.2, blocks: a1.1 },
+        ];
+        let jobs_b = [
+            StreamJob { bc: b0.0, src: &b0.2, blocks: b0.1 },
+            StreamJob { bc: b1.0, src: &b1.2, blocks: b1.1 },
+        ];
+
+        // Submit BOTH batches before waiting on either -> proves double-buffered overlap.
+        let pending_a = submit_gpu_batch_async(&jobs_a, BUILTIN_TABLES).unwrap();
+        let pending_b = submit_gpu_batch_async(&jobs_b, BUILTIN_TABLES).unwrap();
+        assert_ne!(
+            pending_a.slot(),
+            pending_b.slot(),
+            "consecutive async batches must occupy distinct double-buffered flight slots"
+        );
+
+        let out_a = pending_a.wait().unwrap();
+        let out_b = pending_b.wait().unwrap();
+        assert_eq!(out_a[0], a0.3);
+        assert_eq!(out_a[1], a1.3);
+        assert_eq!(out_b[0], b0.3);
+        assert_eq!(out_b[1], b1.3);
+    }
+
+    #[test]
+    fn concurrent_single_stream_callers_coalesce_and_isolate_errors() {
+        let cpu_tables = Tables::builtin().unwrap();
+        let ctrl_codes = valid_ctrl7_codes(BUILTIN_TABLES);
+
+        let specs: &[(u8, usize, bool)] = &[
+            (1, 120, false),
+            (3, 96, false),
+            (4, 150, false),
+            (5, 84, false),
+            (6, 56, false),
+            (7, 110, false),
+            (4, 64, true), // intentionally truncated -> must Err without poisoning siblings
+            (7, 90, false),
+        ];
+
+        let payloads: Vec<(u8, usize, Vec<u8>, Option<Vec<u8>>)> = specs
+            .iter()
+            .enumerate()
+            .map(|(i, &(bc, blocks, corrupt))| {
+                let (_, _, block_bytes) = widths_and_per(bc);
+                let recs = make_records(bc, blocks, 0xaaaa_0001 * (i as u64 + 1), &ctrl_codes);
+                let mut src = encode_stream(BUILTIN_TABLES, bc, &recs, i % 2 == 0);
+                if corrupt {
+                    src.truncate(src.len() / 3);
+                    (bc, blocks * block_bytes, src, None)
+                } else {
+                    let mut cpu = vec![0u8; blocks * block_bytes];
+                    bcpack::decode(bc, &src, &mut cpu, &cpu_tables).unwrap();
+                    (bc, blocks * block_bytes, src, Some(cpu))
+                }
+            })
+            .collect();
+
+        std::thread::scope(|s| {
+            let handles: Vec<_> = payloads
+                .iter()
+                .map(|(bc, out_len, src, expected)| {
+                    let bc = *bc;
+                    let out_len = *out_len;
+                    s.spawn(move || {
+                        let mut dst = vec![0u8; out_len];
+                        let res = decode_gpu(bc, src, &mut dst);
+                        match expected {
+                            Some(exp) => {
+                                res.expect("valid concurrent stream must succeed");
+                                assert_eq!(&dst, exp, "BC{bc} concurrent decode mismatch");
+                            }
+                            None => {
+                                assert!(res.is_err(), "corrupt stream must fail cleanly");
+                            }
+                        }
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap();
+            }
+        });
     }
 }

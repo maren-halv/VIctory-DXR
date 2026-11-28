@@ -9,26 +9,44 @@
 //! must be added to `encode` and `decode` too (entries of older builds
 //! are ignored anyway).
 
-use std::path::PathBuf;
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use victory_pipeline::{Cache, Converter};
+use victory_pipeline::{Cache, CacheKey, Converter};
 use victory_shader::emit::{HostShader, StaticSampler, UserData};
 use victory_shader::resource::RootIndexedView;
 use victory_shader::{HwStage, RootType};
 
 static CACHE: OnceLock<Cache> = OnceLock::new();
+static CACHE_DIR: OnceLock<PathBuf> = OnceLock::new();
+static WORKER_EXE: OnceLock<PathBuf> = OnceLock::new();
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
 
 /// Keeps translated shaders in `dir` from now on.
 pub fn use_shader_cache(dir: PathBuf) {
+    let _ = CACHE_DIR.set(dir.clone());
     match Cache::open(dir) {
         Ok(cache) => {
             let _ = CACHE.set(cache);
         }
         Err(e) => tracing::warn!(error = %e, "no shader cache"),
+    }
+}
+
+/// The configured shader cache directory, if any.
+pub(crate) fn dir() -> Option<&'static Path> {
+    CACHE_DIR.get().map(PathBuf::as_path)
+}
+
+/// Enables out-of-process `--compile-worker` spawning using the current
+/// `victory.exe` binary for cold shader translation misses.
+pub(crate) fn enable_compile_worker() {
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = WORKER_EXE.set(exe);
     }
 }
 
@@ -134,17 +152,65 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
 }
 
 /// The translation of a console shader container, from the cache when
-/// there is one.
+/// there is one. Warm cache hits stay 100% in-process; cold translation misses
+/// route through the out-of-process `--compile-worker` pool when enabled so
+/// LLVM / structurizer NT-heap fragmentation stays out of the main process.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| {
-        let hash = blake3::hash(c).to_hex()[..16].to_owned();
-        victory_shader::emit::with_shader_id(&hash, || victory_shader::emit::translate(c))
-            .map_err(|e| e.to_string())
-    };
+    host_shader_with_path(container).map(|(shader, _)| shader)
+}
+
+/// As [`host_shader`], also returning the content-addressed cache file path
+/// when backed by disk so transient DXIL bytes can be reloaded on demand
+/// without retaining `.dxil` in RAM.
+pub(crate) fn host_shader_with_path(container: &[u8]) -> Result<(HostShader, Option<PathBuf>), String> {
+    let translate = |c: &[u8]| translate_cold(c);
     match CACHE.get() {
-        Some(cache) => cached(cache, &build(), container, translate),
-        None => translate(container),
+        Some(cache) => cached_with_path(cache, &build(), container, translate),
+        None => translate(container).map(|s| (s, None)),
     }
+}
+
+/// Loads only the `dxil` byte slice from a previously written `VSH3` cache
+/// entry on disk without decoding the metadata lists.
+pub(crate) fn load_dxil_only(path: &Path) -> Option<Vec<u8>> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut head = [0u8; 12];
+    file.read_exact(&mut head).ok()?;
+    if &head[0..4] != MAGIC {
+        return None;
+    }
+    let dxil_len = u32::from_le_bytes([head[8], head[9], head[10], head[11]]) as usize;
+    let file_len = file.metadata().ok()?.len() as usize;
+    if 12usize.checked_add(dxil_len)? > file_len {
+        return None;
+    }
+    let mut dxil = vec![0u8; dxil_len];
+    file.read_exact(&mut dxil).ok()?;
+    Some(dxil)
+}
+
+fn translate_in_process(container: &[u8]) -> Result<HostShader, String> {
+    let hash = blake3::hash(container).to_hex()[..16].to_owned();
+    victory_shader::emit::with_shader_id(&hash, || victory_shader::emit::translate(container))
+        .map_err(|e| e.to_string())
+}
+
+fn translate_cold(container: &[u8]) -> Result<HostShader, String> {
+    if let Some(pool) = worker_pool() {
+        let hash = blake3::hash(container).to_hex()[..16].to_owned();
+        let hs = victory_shader::emit::host_settings();
+        let settings = [hs[0], hs[1], hs[2], hs[3]];
+        match pool.translate(settings, &hash, container) {
+            Ok(res) => return res,
+            Err(ipc_err) => {
+                static LOGGED: AtomicBool = AtomicBool::new(false);
+                if !LOGGED.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(error = %ipc_err, "compile-worker IPC failed; falling back to in-process shader translation");
+                }
+            }
+        }
+    }
+    translate_in_process(container)
 }
 
 /// The cache entry's converter: the build and the container in, the
@@ -169,18 +235,37 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
     }
 }
 
+#[cfg(test)]
 fn cached(
     cache: &Cache,
     build: &[u8; 32],
     container: &[u8],
     translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
 ) -> Result<HostShader, String> {
+    cached_with_path(cache, build, container, translate).map(|(s, _)| s)
+}
+
+fn cached_with_path(
+    cache: &Cache,
+    build: &[u8; 32],
+    container: &[u8],
+    translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
+) -> Result<(HostShader, Option<PathBuf>), String> {
     let input = [&build[..], container].concat();
     let converter = Translate {
         translate,
         ran: AtomicBool::new(false),
     };
     for _ in 0..2 {
+        let key = CacheKey::new(&converter, &input);
+        let existing = cache.path_for(&key);
+        if existing.is_file()
+            && let Some(shader) = std::fs::read(&existing).ok().and_then(|b| decode(&b))
+        {
+            HITS.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(path = %existing.display(), "shader from the cache");
+            return Ok((shader, Some(existing)));
+        }
         let path = cache
             .get_or_convert(&converter, &input)
             .map_err(|e| format!("{e:#}"))?;
@@ -192,13 +277,437 @@ fn cached(
             };
             counter.fetch_add(1, Ordering::Relaxed);
             tracing::debug!(path = %path.display(), "shader {what}");
-            return Ok(shader);
+            return Ok((shader, Some(path)));
         }
         tracing::debug!(path = %path.display(), "unreadable shader cache entry; translating again");
         let _ = std::fs::remove_file(&path);
     }
     MISSES.fetch_add(1, Ordering::Relaxed);
-    (converter.translate)(container)
+    (converter.translate)(container).map(|s| (s, None))
+}
+
+// ---------------------------------------------------------------------------
+// Out-of-process `--compile-worker` sidecar pool (cold misses only)
+// ---------------------------------------------------------------------------
+
+const IPC_MAGIC: [u8; 4] = *b"VCW1";
+const IPC_MAX_FRAME: usize = 64 << 20;
+const OP_SHUTDOWN: u8 = 0;
+const OP_TRANSLATE: u8 = 1;
+const STATUS_OK: u8 = 0;
+const STATUS_ERR: u8 = 1;
+const IN_WORKER_ENV: &str = "VICTORY_IN_COMPILE_WORKER";
+
+fn write_frame(w: &mut impl Write, payload: &[u8]) -> io::Result<()> {
+    let len = u32::try_from(payload.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "IPC frame exceeds u32"))?;
+    if payload.len() > IPC_MAX_FRAME {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "IPC frame too large"));
+    }
+    let mut header = [0u8; 8];
+    header[..4].copy_from_slice(&IPC_MAGIC);
+    header[4..8].copy_from_slice(&len.to_le_bytes());
+    w.write_all(&header)?;
+    w.write_all(payload)?;
+    w.flush()
+}
+
+fn read_frame(r: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
+    let mut header = [0u8; 8];
+    match r.read_exact(&mut header) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e),
+    }
+    if header[..4] != IPC_MAGIC {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "bad compile-worker IPC magic"));
+    }
+    let len = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
+    if len > IPC_MAX_FRAME {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "compile-worker IPC frame too large"));
+    }
+    let mut payload = vec![0u8; len];
+    r.read_exact(&mut payload)?;
+    Ok(Some(payload))
+}
+
+fn encode_translate_request(settings: [u32; 4], hash: &str, container: &[u8]) -> Vec<u8> {
+    let hash_bytes = hash.as_bytes();
+    let hash_len = hash_bytes.len().min(u16::MAX as usize) as u16;
+    let mut buf = Vec::with_capacity(1 + 16 + 2 + usize::from(hash_len) + 4 + container.len());
+    buf.push(OP_TRANSLATE);
+    for w in settings {
+        buf.extend_from_slice(&w.to_le_bytes());
+    }
+    buf.extend_from_slice(&hash_len.to_le_bytes());
+    buf.extend_from_slice(&hash_bytes[..usize::from(hash_len)]);
+    buf.extend_from_slice(&(container.len() as u32).to_le_bytes());
+    buf.extend_from_slice(container);
+    buf
+}
+
+fn decode_translate_request(payload: &[u8]) -> Option<([u32; 4], &str, &[u8])> {
+    let (&op, mut rest) = payload.split_first()?;
+    if op != OP_TRANSLATE {
+        return None;
+    }
+    let mut settings = [0u32; 4];
+    for slot in &mut settings {
+        let (head, after) = rest.split_first_chunk::<4>()?;
+        *slot = u32::from_le_bytes(*head);
+        rest = after;
+    }
+    let (hlen_bytes, after) = rest.split_first_chunk::<2>()?;
+    let hlen = u16::from_le_bytes(*hlen_bytes) as usize;
+    let (hash_bytes, after) = after.split_at_checked(hlen)?;
+    let hash = std::str::from_utf8(hash_bytes).ok()?;
+    let (clen_bytes, after) = after.split_first_chunk::<4>()?;
+    let clen = u32::from_le_bytes(*clen_bytes) as usize;
+    let (container, tail) = after.split_at_checked(clen)?;
+    tail.is_empty().then_some((settings, hash, container))
+}
+
+fn encode_translate_response(result: &Result<HostShader, String>) -> Vec<u8> {
+    match result {
+        Ok(shader) => {
+            let encoded = encode(shader);
+            let mut buf = Vec::with_capacity(1 + encoded.len());
+            buf.push(STATUS_OK);
+            buf.extend_from_slice(&encoded);
+            buf
+        }
+        Err(msg) => {
+            let mut buf = Vec::with_capacity(1 + msg.len());
+            buf.push(STATUS_ERR);
+            buf.extend_from_slice(msg.as_bytes());
+            buf
+        }
+    }
+}
+
+fn decode_translate_response(payload: &[u8]) -> io::Result<Result<HostShader, String>> {
+    let (&status, rest) = payload
+        .split_first()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "empty IPC response"))?;
+    match status {
+        STATUS_OK => decode(rest)
+            .map(Ok)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "corrupt VSH3 in IPC response")),
+        STATUS_ERR => Ok(Err(String::from_utf8_lossy(rest).into_owned())),
+        _ => Err(io::Error::new(io::ErrorKind::InvalidData, "unknown IPC status")),
+    }
+}
+
+/// Serves compile requests on `reader`/`writer` until EOF or `OP_SHUTDOWN`.
+fn serve_compile_worker_with(
+    reader: &mut impl Read,
+    writer: &mut impl Write,
+    mut translate_fn: impl FnMut([u32; 4], &str, &[u8]) -> Result<HostShader, String>,
+) -> io::Result<()> {
+    while let Some(frame) = read_frame(reader)? {
+        if frame.first() == Some(&OP_SHUTDOWN) {
+            break;
+        }
+        let Some((settings, hash, container)) = decode_translate_request(&frame) else {
+            let resp = encode_translate_response(&Err("malformed compile-worker request".into()));
+            write_frame(writer, &resp)?;
+            continue;
+        };
+        let result = translate_fn(settings, hash, container);
+        let resp = encode_translate_response(&result);
+        write_frame(writer, &resp)?;
+    }
+    Ok(())
+}
+
+/// Entry point for `victory.exe --compile-worker`. Reads length-prefixed
+/// `VCW1` translation requests on stdin and writes `VCW1` responses to stdout.
+pub fn run_compile_worker() -> io::Result<()> {
+    let mut stdin = io::BufReader::new(io::stdin().lock());
+    let mut stdout = io::BufWriter::new(io::stdout().lock());
+    serve_compile_worker_with(&mut stdin, &mut stdout, |settings, hash, container| {
+        if settings[0] > 0 {
+            victory_shader::emit::set_host_max_wave(settings[0]);
+        }
+        if settings[1] > 0 {
+            victory_shader::emit::set_view_heap_limit(settings[1]);
+        }
+        if settings[2] > 0 {
+            victory_shader::emit::set_raw_views(settings[2]);
+        }
+        victory_shader::emit::set_host_rdna(settings[3] != 0);
+        victory_shader::emit::with_shader_id(hash, || victory_shader::emit::translate(container))
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// Windows Job Object configured with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` so
+/// every `--compile-worker` child is terminated immediately if the parent exits
+/// or crashes, leaving zero orphan worker processes.
+mod job {
+    use std::ffi::c_void;
+    use std::os::windows::io::AsRawHandle;
+    use std::process::Child;
+
+    type Handle = *mut c_void;
+
+    const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS: u32 = 9;
+    const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct JobObjectBasicLimitInformation {
+        per_process_user_time_limit: i64,
+        per_job_user_time_limit: i64,
+        limit_flags: u32,
+        _pad0: u32,
+        minimum_working_set_size: usize,
+        maximum_working_set_size: usize,
+        active_process_limit: u32,
+        _pad1: u32,
+        affinity: usize,
+        priority_class: u32,
+        scheduling_class: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct IoCounters {
+        read_operation_count: u64,
+        write_operation_count: u64,
+        other_operation_count: u64,
+        read_transfer_count: u64,
+        write_transfer_count: u64,
+        other_transfer_count: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct JobObjectExtendedLimitInformation {
+        basic_limit_information: JobObjectBasicLimitInformation,
+        io_info: IoCounters,
+        process_memory_limit: usize,
+        job_memory_limit: usize,
+        peak_process_memory_used: usize,
+        peak_job_memory_used: usize,
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    const _: () = {
+        assert!(size_of::<JobObjectBasicLimitInformation>() == 64);
+        assert!(size_of::<JobObjectExtendedLimitInformation>() == 144);
+    };
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateJobObjectW(lp_job_attributes: *const c_void, lp_name: *const u16) -> Handle;
+        fn SetInformationJobObject(
+            h_job: Handle,
+            info_class: u32,
+            info: *const c_void,
+            info_len: u32,
+        ) -> i32;
+        fn AssignProcessToJobObject(h_job: Handle, h_process: Handle) -> i32;
+        fn CloseHandle(h_object: Handle) -> i32;
+    }
+
+    pub(super) struct KillOnCloseJob(Handle);
+
+    // SAFETY: Win32 kernel job handles are process-global and thread-safe.
+    unsafe impl Send for KillOnCloseJob {}
+    unsafe impl Sync for KillOnCloseJob {}
+
+    impl KillOnCloseJob {
+        pub(super) fn new() -> Option<Self> {
+            // SAFETY: unnamed job object with default security attributes.
+            let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+            if handle.is_null() {
+                return None;
+            }
+            let mut info = JobObjectExtendedLimitInformation::default();
+            info.basic_limit_information.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            // SAFETY: `info` matches `JobObjectExtendedLimitInformation` layout and size.
+            let ok = unsafe {
+                SetInformationJobObject(
+                    handle,
+                    JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
+                    (&raw const info).cast(),
+                    size_of::<JobObjectExtendedLimitInformation>() as u32,
+                )
+            };
+            if ok == 0 {
+                // SAFETY: closing the handle we just created.
+                unsafe { CloseHandle(handle) };
+                return None;
+            }
+            Some(Self(handle))
+        }
+
+        pub(super) fn assign(&self, child: &Child) -> bool {
+            // SAFETY: valid job handle and live child process handle.
+            unsafe { AssignProcessToJobObject(self.0, child.as_raw_handle().cast()) != 0 }
+        }
+    }
+
+    impl Drop for KillOnCloseJob {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: owned job handle.
+                unsafe { CloseHandle(self.0) };
+            }
+        }
+    }
+}
+
+struct ChildWorker {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: io::BufReader<ChildStdout>,
+    compiles: u32,
+}
+
+impl ChildWorker {
+    fn spawn(exe: &Path, job: Option<&job::KillOnCloseJob>) -> io::Result<Self> {
+        use std::os::windows::process::CommandExt;
+        const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let mut child = Command::new(exe)
+            .arg("--compile-worker")
+            .env(IN_WORKER_ENV, "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .creation_flags(BELOW_NORMAL_PRIORITY_CLASS | CREATE_NO_WINDOW)
+            .spawn()?;
+        if let Some(job) = job {
+            let _ = job.assign(&child);
+        }
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| io::Error::other("compile-worker missing stdin"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other("compile-worker missing stdout"))?;
+        Ok(Self {
+            child,
+            stdin,
+            stdout: io::BufReader::new(stdout),
+            compiles: 0,
+        })
+    }
+
+    fn shutdown(mut self) {
+        let _ = write_frame(&mut self.stdin, &[OP_SHUTDOWN]);
+        drop(self.stdin);
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+struct WorkerPool {
+    exe: PathBuf,
+    slots: Vec<Mutex<Option<ChildWorker>>>,
+    next: AtomicUsize,
+    recycle_after: u32,
+    job: Option<job::KillOnCloseJob>,
+}
+
+impl WorkerPool {
+    fn new(exe: PathBuf) -> Self {
+        let count = std::env::var("VICTORY_COMPILE_WORKERS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or_else(|| {
+                (std::thread::available_parallelism().map_or(4, |n| n.get()) / 4).clamp(2, 4)
+            })
+            .clamp(1, 8);
+        let recycle_after = std::env::var("VICTORY_COMPILE_WORKER_RECYCLE")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(64)
+            .max(1);
+        let job = job::KillOnCloseJob::new();
+        let slots = (0..count).map(|_| Mutex::new(None)).collect();
+        tracing::info!(
+            workers = count,
+            recycle_after,
+            job_object = job.is_some(),
+            "out-of-process shader compile-worker pool ready (cold misses only)"
+        );
+        Self {
+            exe,
+            slots,
+            next: AtomicUsize::new(0),
+            recycle_after,
+            job,
+        }
+    }
+
+    fn translate(
+        &self,
+        settings: [u32; 4],
+        hash: &str,
+        container: &[u8],
+    ) -> io::Result<Result<HostShader, String>> {
+        let req = encode_translate_request(settings, hash, container);
+        let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.slots.len();
+        let mut guard = self.slots[idx].lock().unwrap_or_else(|e| e.into_inner());
+        for attempt in 0..2 {
+            if guard.is_none() {
+                *guard = Some(ChildWorker::spawn(&self.exe, self.job.as_ref())?);
+            }
+            let worker = guard.as_mut().expect("spawned above");
+            let io_res = write_frame(&mut worker.stdin, &req)
+                .and_then(|()| read_frame(&mut worker.stdout))
+                .and_then(|opt| {
+                    opt.ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "compile-worker exited"))
+                })
+                .and_then(|resp| decode_translate_response(&resp));
+            match io_res {
+                Ok(res) => {
+                    worker.compiles += 1;
+                    if worker.compiles >= self.recycle_after
+                        && let Some(old) = guard.take()
+                    {
+                        old.shutdown();
+                    }
+                    return Ok(res);
+                }
+                Err(e) => {
+                    if let Some(dead) = guard.take() {
+                        dead.shutdown();
+                    }
+                    if attempt == 1 {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        Err(io::Error::other("compile-worker retry exhausted"))
+    }
+}
+
+fn compile_worker_enabled() -> Option<PathBuf> {
+    if std::env::var_os(IN_WORKER_ENV).is_some() {
+        return None;
+    }
+    if std::env::var_os("VICTORY_COMPILE_WORKER").is_some_and(|v| v == "0") {
+        return None;
+    }
+    if let Some(exe) = WORKER_EXE.get() {
+        return Some(exe.clone());
+    }
+    let exe = std::env::current_exe().ok()?;
+    let stem = exe.file_stem()?.to_str()?;
+    stem.eq_ignore_ascii_case("victory").then_some(exe)
+}
+
+fn worker_pool() -> Option<&'static WorkerPool> {
+    static POOL: OnceLock<Option<WorkerPool>> = OnceLock::new();
+    POOL.get_or_init(|| compile_worker_enabled().map(WorkerPool::new))
+        .as_ref()
 }
 
 const MAGIC: &[u8; 4] = b"VSH3";
@@ -473,5 +982,62 @@ mod tests {
         assert_eq!(decode(b"VSH0"), None);
         assert_eq!(decode(b"VSH1"), None);
         assert_eq!(decode(b"VSH2"), None);
+    }
+
+    #[test]
+    fn load_dxil_only_reads_just_dxil_from_vsh3() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("entry.vsh3");
+        let expected = shader();
+        std::fs::write(&path, encode(&expected)).unwrap();
+        assert_eq!(load_dxil_only(&path).as_deref(), Some(expected.dxil.as_slice()));
+        std::fs::write(&path, b"BAD0short").unwrap();
+        assert_eq!(load_dxil_only(&path), None);
+    }
+
+    #[test]
+    fn compile_worker_ipc_round_trip_errors_and_shutdown() {
+        let mut req_stream = Vec::new();
+        let req_ok = encode_translate_request([32, 1_000_000, 500_000, 1], "0123456789abcdef", b"cdxil-ok");
+        let req_err = encode_translate_request([64, 0, 0, 0], "fedcba9876543210", b"cdxil-bad");
+        write_frame(&mut req_stream, &req_ok).unwrap();
+        write_frame(&mut req_stream, &req_err).unwrap();
+        write_frame(&mut req_stream, &[OP_SHUTDOWN]).unwrap();
+        // Trailing request after shutdown must not be processed.
+        write_frame(&mut req_stream, &req_ok).unwrap();
+
+        let mut reader = io::Cursor::new(req_stream);
+        let mut resp_stream = Vec::new();
+        let mut seen = Vec::new();
+        serve_compile_worker_with(&mut reader, &mut resp_stream, |settings, hash, container| {
+            seen.push((settings, hash.to_owned(), container.to_vec()));
+            if container == b"cdxil-ok" {
+                Ok(shader())
+            } else {
+                Err("unsupported op".into())
+            }
+        })
+        .unwrap();
+
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0], ([32, 1_000_000, 500_000, 1], "0123456789abcdef".into(), b"cdxil-ok".to_vec()));
+        assert_eq!(seen[1], ([64, 0, 0, 0], "fedcba9876543210".into(), b"cdxil-bad".to_vec()));
+
+        let mut resp_reader = io::Cursor::new(resp_stream);
+        let f1 = read_frame(&mut resp_reader).unwrap().unwrap();
+        assert_eq!(decode_translate_response(&f1).unwrap(), Ok(shader()));
+        let f2 = read_frame(&mut resp_reader).unwrap().unwrap();
+        assert_eq!(decode_translate_response(&f2).unwrap(), Err("unsupported op".into()));
+        assert!(read_frame(&mut resp_reader).unwrap().is_none());
+
+        // Bad magic is rejected.
+        let mut bad = io::Cursor::new(b"NOPE\x00\x00\x00\x00".to_vec());
+        assert!(read_frame(&mut bad).is_err());
+    }
+
+    #[test]
+    fn kill_on_close_job_object_creates_cleanly() {
+        let job = job::KillOnCloseJob::new();
+        assert!(job.is_some(), "CreateJobObjectW + SetInformationJobObject(KILL_ON_JOB_CLOSE) must succeed");
     }
 }

@@ -78,8 +78,15 @@ use crate::shadow::Shadow;
 
 /// A directory page.
 const PAGE: u64 = 1 << 16;
-/// An arena's bytes.
+/// An arena's bytes for builder (`Use::Builds`) workloads (64 MiB).
 const ARENA: u64 = 64 << 20;
+/// Initial arena size for read-only (`Use::Reads`) workloads (4 MiB = 64 pages),
+/// saving 60 MiB of Local VRAM + CPU RAM in RT-Off when only a few pages are touched.
+const READ_ARENA: u64 = 4 << 20;
+/// Shared null UAV buffer size replacing retired empty arena slots in `copies`.
+const NULL_COPY_BYTES: u64 = 4096;
+/// Frames before unowned, unpinned arena pages are swept when DXR ephemeral release is active.
+const STALE_EXTRACTED_FRAMES: u64 = 120;
 /// What is compared at a time.
 const PIECE: usize = 4096;
 /// Pages held, at most (3 GiB).
@@ -130,6 +137,52 @@ struct Held {
     /// them alone.
     owners: u32,
     theirs: bool,
+    /// In-flight Native DXR `ExtractStaticBlas` submissions currently reading this page.
+    pinned: u32,
+}
+
+/// One backing arena (`4 MiB` for `Use::Reads`, `64 MiB` for `Use::Builds`).
+struct ArenaInfo {
+    /// Index in `Memory::copies`.
+    copy: usize,
+    /// Host CPU virtual address returned by `crate::upload::reserve`.
+    base: usize,
+    /// Arena byte length (`READ_ARENA` or `ARENA`).
+    size: u64,
+    /// Count of pages currently mapped in `Memory::pages` pointing into this arena.
+    live_pages: usize,
+    /// Free page host CPU addresses inside this arena.
+    free: Vec<usize>,
+    /// True once empty and replaced in `Memory::copies` by the shared 4 KiB null UAV.
+    retired: bool,
+}
+
+/// Drops a retired arena's `Shadow` (freeing VRAM + staging) and then releases its
+/// `VirtualAlloc2` CPU backing once all GPU flights and `bury_lag()` have completed.
+struct RetiredArena {
+    shadow: Option<Arc<Shadow>>,
+    cpu_base: usize,
+}
+
+// SAFETY: `Arc<Shadow>` is `Send` and `cpu_base` is owned exclusively by this retirement record.
+unsafe impl Send for RetiredArena {}
+
+impl Drop for RetiredArena {
+    fn drop(&mut self) {
+        if let Some(shadow) = self.shadow.take()
+            && let Ok(owned) = Arc::try_unwrap(shadow)
+        {
+            drop(owned);
+            if self.cpu_base != 0 {
+                use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+                // SAFETY: `cpu_base` came from `crate::upload::reserve` and no `Shadow`
+                // or GPU command list references it anymore.
+                unsafe {
+                    VirtualFree(self.cpu_base as *mut _, 0, MEM_RELEASE);
+                }
+            }
+        }
+    }
 }
 
 /// A packed structure the builder came to.
@@ -145,13 +198,23 @@ struct Memory {
     /// The CPU's entries (number, offset), and the copy shaders read.
     directory: (*mut u32, Arc<Shadow>),
     faults: (ID3D12Resource, *mut u32, u64),
-    /// Copy `n` is `copies[n - 1]`.
+    /// Copy `n` is `copies[n - 1]`. Retired arena slots are replaced with `null_copy`.
     copies: Vec<Arc<Shadow>>,
     /// Shadow IDs are unique for the lifetime of a backing, including after
     /// the guest reuses its address.
     numbers: HashMap<u64, usize>,
-    /// Arenas: place in `copies`, address.
-    arenas: Vec<(usize, usize)>,
+    /// Backing arenas (active and retired).
+    arenas: Vec<ArenaInfo>,
+    /// Indices in `copies` that have been retired to the shared 4 KiB null UAV.
+    retired_copies: std::collections::HashSet<usize>,
+    /// Shared 4 KiB null UAV `Shadow` substituting for retired empty arena slots.
+    null_copy: Option<Arc<Shadow>>,
+    /// Empty arena shadows waiting for `Arc::strong_count == 1` before `host::retire_vram`.
+    draining_arenas: Vec<(Arc<Shadow>, usize, u64)>,
+    /// Total free pages across all non-retired arenas.
+    free_pages: usize,
+    /// Whether any `Use::Builds` dispatch has been seen (switches new arenas from 4 MiB to 64 MiB).
+    saw_builds: bool,
     /// By title page.
     pages: HashMap<u64, Held>,
     /// Their numbers in the order they came, and where the sweep is.
@@ -164,8 +227,6 @@ struct Memory {
     /// Their addresses in the order they came, and where the sweep is.
     packed_order: Vec<u64>,
     packed_sweep: usize,
-    /// Places of pages that are free: the copy, the address in the arena.
-    free: Vec<(usize, usize)>,
     /// Copies of title buffers the builder may store in.
     open: std::collections::HashSet<usize>,
     /// Pages taken from faults.
@@ -239,6 +300,11 @@ impl Memory {
             copies: Vec::new(),
             numbers: HashMap::new(),
             arenas: Vec::new(),
+            retired_copies: Default::default(),
+            null_copy: None,
+            draining_arenas: Vec::new(),
+            free_pages: 0,
+            saw_builds: false,
             pages: HashMap::new(),
             order: Vec::new(),
             sweep: 0,
@@ -246,7 +312,6 @@ impl Memory {
             packed: HashMap::new(),
             packed_order: Vec::new(),
             packed_sweep: 0,
-            free: Vec::new(),
             open: Default::default(),
             faulted: 0,
             frame: u64::MAX,
@@ -374,37 +439,215 @@ impl Memory {
             ONCE.call_once(|| tracing::warn!(MOST, "title memory by address: no more pages are taken; others read zeros"));
             return false;
         }
-        if let Some((copy, at)) = self.free.pop() {
+        if let Some((copy, at)) = self.pop_free_page() {
             self.hold(page, at, copy);
             return true;
         }
-        if !self.another() {
+        let bytes = next_arena_bytes(self.saw_builds);
+        if !self.another(bytes) {
             return false;
         }
-        let Some((copy, at)) = self.free.pop() else {
+        let Some((copy, at)) = self.pop_free_page() else {
             return false;
         };
         self.hold(page, at, copy);
         true
     }
 
-    /// Another arena's pages.
-    fn another(&mut self) -> bool {
-        let Some(at) = crate::upload::reserve(ARENA as usize) else {
+    /// Pops a free page from the lowest-indexed active arena so upper arenas drain
+    /// and can be reclaimed when empty.
+    fn pop_free_page(&mut self) -> Option<(usize, usize)> {
+        for arena in &mut self.arenas {
+            if !arena.retired
+                && let Some(at) = arena.free.pop()
+            {
+                arena.live_pages += 1;
+                self.free_pages = self.free_pages.saturating_sub(1);
+                return Some((arena.copy, at));
+            }
+        }
+        None
+    }
+
+    /// Returns a page to its owning arena and clears its directory entry.
+    fn release_page(&mut self, page: u64) -> bool {
+        let Some(held) = self.pages.remove(&page) else {
             return false;
         };
-        let Some(n) = crate::shadow::by_address(at as u64, ARENA).and_then(|s| self.number(s)) else {
+        if let Some(arena) = self.arenas.iter_mut().find(|a| a.copy == held.copy) {
+            arena.live_pages = arena.live_pages.saturating_sub(1);
+            if !arena.retired {
+                arena.free.push(held.at);
+                self.free_pages += 1;
+            }
+        }
+        // SAFETY: an entry of the directory, under the mutex.
+        unsafe { self.entry(page).write_volatile(0) };
+        crate::watch::wrote(self.entry(page) as usize, 8);
+        true
+    }
+
+    /// Lazily allocates the single shared 4 KiB null UAV shadow used to replace
+    /// retired empty arenas in `copies` so descriptor slots remain valid.
+    fn ensure_null_copy(&mut self) -> Option<Arc<Shadow>> {
+        if let Some(null) = &self.null_copy {
+            return Some(null.clone());
+        }
+        let at = crate::upload::reserve(NULL_COPY_BYTES as usize)?;
+        let Some(shadow) = crate::shadow::by_address(at as u64, NULL_COPY_BYTES) else {
+            use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+            // SAFETY: freshly reserved and unused.
+            unsafe {
+                VirtualFree(at as *mut _, 0, MEM_RELEASE);
+            }
+            return None;
+        };
+        crate::host::name(&shadow.buffer, || "title memory by address: retired arena null uav".into());
+        self.null_copy = Some(shadow.clone());
+        Some(shadow)
+    }
+
+    /// Retires empty arenas (keeping at most `keep_spare` warm empty arenas),
+    /// replacing their `copies[n]` entry with the shared 4 KiB null UAV.
+    fn reclaim_empty_arenas(&mut self, keep_spare: usize) -> usize {
+        let empty_indices: Vec<usize> = self
+            .arenas
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, a)| (!a.retired && a.live_pages == 0).then_some(idx))
+            .collect();
+        if empty_indices.len() <= keep_spare {
+            self.drain_retired_arenas();
+            return 0;
+        }
+        let Some(null_shadow) = self.ensure_null_copy() else {
+            return 0;
+        };
+        let mut retired = 0usize;
+        for &idx in &empty_indices[keep_spare..] {
+            let copy = self.arenas[idx].copy;
+            let base = self.arenas[idx].base;
+            let size = self.arenas[idx].size;
+            let freed_slots = self.arenas[idx].free.len();
+            self.arenas[idx].free.clear();
+            self.arenas[idx].retired = true;
+            self.free_pages = self.free_pages.saturating_sub(freed_slots);
+            self.retired_copies.insert(copy);
+            if let Some(slot) = self.copies.get_mut(copy) {
+                let old = std::mem::replace(slot, null_shadow.clone());
+                self.numbers.remove(&old.id());
+                self.draining_arenas.push((old, base, size));
+            }
+            retired += 1;
+        }
+        self.drain_retired_arenas();
+        retired
+    }
+
+    /// Hands any draining empty arena whose `Arc<Shadow>` is no longer held by any
+    /// command list over to `host::retire_vram` for fence-safe async VRAM + RAM release.
+    fn drain_retired_arenas(&mut self) {
+        let mut i = 0;
+        while i < self.draining_arenas.len() {
+            if Arc::strong_count(&self.draining_arenas[i].0) == 1 {
+                let (shadow, cpu_base, size) = self.draining_arenas.swap_remove(i);
+                crate::host::retire_vram(
+                    RetiredArena {
+                        shadow: Some(shadow),
+                        cpu_base,
+                    },
+                    size,
+                );
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// Releases rehydrated BVH4 arena pages covering `[dest_va, dest_va + size)` and
+    /// reclaims completely empty arenas (keeping at most `usize::from(self.saw_builds)` spare).
+    fn release_extracted_range(&mut self, dest_va: u64, size: u64) -> usize {
+        if dest_va == 0 || size == 0 {
+            return 0;
+        }
+        let mut release_len = size;
+        if let Some(packed) = self.packed.remove(&dest_va) {
+            release_len = release_len.max(packed.len);
+            let p_first = dest_va / PAGE;
+            let p_last = (dest_va.saturating_add(packed.len) - 1) / PAGE;
+            for page in p_first..=p_last {
+                if let Some(held) = self.pages.get_mut(&page) {
+                    held.owners = held.owners.saturating_sub(1);
+                }
+            }
+            self.stats.gone += 1;
+        }
+        let first = dest_va / PAGE;
+        let last = (dest_va.saturating_add(release_len) - 1) / PAGE;
+        let mut released_any = false;
+        for page in first..=last {
+            let can_release = match self.pages.get_mut(&page) {
+                Some(held) => {
+                    held.pinned = held.pinned.saturating_sub(1);
+                    held.owners == 0 && held.pinned == 0
+                }
+                None => false,
+            };
+            if can_release && self.release_page(page) {
+                released_any = true;
+            }
+        }
+        if released_any {
+            self.reclaim_empty_arenas(usize::from(self.saw_builds))
+        } else {
+            self.drain_retired_arenas();
+            0
+        }
+    }
+
+    /// Another arena's pages (`READ_ARENA` = 4 MiB for read-only workloads, `ARENA` = 64 MiB for builds).
+    fn another(&mut self, bytes: u64) -> bool {
+        let Some(at) = crate::upload::reserve(bytes as usize) else {
             return false;
         };
-        self.arenas.push((n, at));
-        // The lowest first.
-        self.free.extend((0..(ARENA / PAGE) as usize).rev().map(|i| (n, at + i * PAGE as usize)));
+        let Some(n) = crate::shadow::by_address(at as u64, bytes).and_then(|s| self.number(s)) else {
+            use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+            // SAFETY: freshly reserved and failed to create shadow.
+            unsafe {
+                VirtualFree(at as *mut _, 0, MEM_RELEASE);
+            }
+            return false;
+        };
+        let page_count = (bytes / PAGE) as usize;
+        // Lowest address popped first.
+        let free: Vec<usize> = (0..page_count).rev().map(|i| at + i * PAGE as usize).collect();
+        self.free_pages += free.len();
+        self.arenas.push(ArenaInfo {
+            copy: n,
+            base: at,
+            size: bytes,
+            live_pages: 0,
+            free,
+            retired: false,
+        });
         true
     }
 
     /// `page` is held at `at` in the arena that is `copy`.
     fn hold(&mut self, page: u64, at: usize, copy: usize) {
-        self.pages.insert(page, Held { at, copy, taken: 0, looked: u64::MAX, born: self.frame, owners: 0, theirs: false });
+        self.pages.insert(
+            page,
+            Held {
+                at,
+                copy,
+                taken: 0,
+                looked: u64::MAX,
+                born: self.frame,
+                owners: 0,
+                theirs: false,
+                pinned: 0,
+            },
+        );
         self.order.push(page);
         fill(self.entry(page), copy, at as u64 - self.copies[copy].span().0);
     }
@@ -414,13 +657,15 @@ impl Memory {
     fn gone(&mut self, address: u64) {
         let Some(packed) = self.packed.remove(&address) else { return };
         for page in address / PAGE..=(address + packed.len - 1) / PAGE {
-            let Some(held) = self.pages.get_mut(&page) else { continue };
-            held.owners = held.owners.saturating_sub(1);
-            if held.owners == 0 && held.theirs {
-                self.free.push((held.copy, held.at));
-                self.pages.remove(&page);
-                // SAFETY: an entry of the directory, under the mutex.
-                unsafe { self.entry(page).write_volatile(0) };
+            let release = match self.pages.get_mut(&page) {
+                Some(held) => {
+                    held.owners = held.owners.saturating_sub(1);
+                    held.owners == 0 && held.theirs && held.pinned == 0
+                }
+                None => false,
+            };
+            if release {
+                self.release_page(page);
             }
         }
         self.stats.gone += 1;
@@ -437,29 +682,47 @@ impl Memory {
 
     /// Looks at some of the pages and packed structures again.
     fn look_again(&mut self) {
+        let ephemeral = ephemeral_release_allowed();
+        let mut released_any = false;
         for _ in 0..self.order.len().div_ceil(SWEEP) {
+            if self.order.is_empty() {
+                break;
+            }
             self.sweep = (self.sweep + 1) % self.order.len();
             let page = self.order[self.sweep];
-            if self.pages.contains_key(&page) {
-                self.bring(page, page + 1);
+            if let Some(held) = self.pages.get(&page) {
+                if ephemeral
+                    && held.owners == 0
+                    && held.pinned == 0
+                    && self.frame.saturating_sub(held.born) > STALE_EXTRACTED_FRAMES
+                {
+                    self.release_page(page);
+                    self.order.swap_remove(self.sweep);
+                    released_any = true;
+                } else {
+                    self.bring(page, page + 1);
+                }
             } else {
                 self.order.swap_remove(self.sweep);
-                if self.order.is_empty() {
-                    break;
-                }
             }
         }
         for _ in 0..self.packed_order.len().div_ceil(SWEEP) {
+            if self.packed_order.is_empty() {
+                break;
+            }
             self.packed_sweep = (self.packed_sweep + 1) % self.packed_order.len();
             let address = self.packed_order[self.packed_sweep];
             if !self.packed.contains_key(&address) {
                 self.packed_order.swap_remove(self.packed_sweep);
-                if self.packed_order.is_empty() {
-                    break;
-                }
             } else if !self.there(address) {
                 self.gone(address);
+                released_any = true;
             }
+        }
+        if released_any && ephemeral {
+            self.reclaim_empty_arenas(usize::from(self.saw_builds));
+        } else {
+            self.drain_retired_arenas();
         }
     }
 
@@ -621,7 +884,7 @@ impl Memory {
         {
             return false;
         }
-        let Some((copy, at)) = self.free.pop() else {
+        let Some((copy, at)) = self.pop_free_page() else {
             return false;
         };
         self.hold(page, at, copy);
@@ -746,7 +1009,10 @@ impl Memory {
     fn bring_up(&self, list: &HostList, count: usize) {
         let (start, len) = self.directory.1.span();
         self.directory.1.refresh(list, start, len);
-        for shadow in &self.copies[..count.min(self.copies.len())] {
+        for (n, shadow) in self.copies[..count.min(self.copies.len())].iter().enumerate() {
+            if self.retired_copies.contains(&n) {
+                continue;
+            }
             let (start, len) = shadow.span();
             shadow.refresh(list, start, len);
         }
@@ -761,6 +1027,7 @@ impl Memory {
         }
         let frames = self.frame.wrapping_sub(frame).max(1) as f64;
         let s = std::mem::take(&mut self.stats);
+        let active_arenas = self.arenas.iter().filter(|a| !a.retired).count();
         tracing::info!(
             "title memory by address: {} pages ({} MB) in {} arenas, {} copies in all; per frame {:.0} dispatches that read, {:.0} that build, \
              {:.1} pages that had no copy, {:.1} pages turned down, {:.1} results brought back; {:.0} pages looked at, {:.1} KB changed, \
@@ -768,7 +1035,7 @@ impl Memory {
              and pages for constants {}, views written {}, others {}, upload memory {}, faults in all {}",
             self.pages.len(),
             (self.pages.len() as u64 * PAGE) >> 20,
-            self.arenas.len(),
+            active_arenas,
             self.copies.len(),
             s.uses[0] as f64 / frames,
             s.uses[1] as f64 / frames,
@@ -923,10 +1190,13 @@ pub(crate) fn ready(
         m.trace.dispatch(frame, list, addresses, written, constants, threads);
     }
     let builds = use_ != Use::Reads;
+    if builds {
+        m.saw_builds = true;
+    }
     if builds && sizes_wait() && asks_size(written, constants, threads) {
         list.first_use(SIZES);
     }
-    while builds && m.free.len() < SPARE && m.pages.len() + m.free.len() < MOST && m.another() {}
+    while builds && m.free_pages < SPARE && m.pages.len() + m.free_pages < MOST && m.another(ARENA) {}
     m.stats.uses[usize::from(builds)] += 1;
     // Once per list and page named: the builder dispatches hundreds of times
     // a frame with the same arguments.
@@ -1054,6 +1324,67 @@ pub(crate) fn ready(
     })
 }
 
+/// Returns the next arena byte size: `4 MiB` for `Use::Reads`-only workloads (RT-Off),
+/// `64 MiB` once `Use::Builds` has been seen (`ARCH-10`).
+fn next_arena_bytes(saw_builds: bool) -> u64 {
+    if saw_builds { ARENA } else { READ_ARENA }
+}
+
+/// Pure gate for ephemeral BVH4 rehydration arena reclamation: ONLY permitted when
+/// Native DXR is active with builder suppression and `VICTORY_BVH_BUILDER` is OFF
+/// (`VICTORY_NATIVE_RT=1 && VICTORY_BVH_BUILDER=0`). NEVER runs when software BVH
+/// traversal shaders may still read arenas (`ARCH-10`).
+fn ephemeral_release_gate(native_rt: bool, suppress_builder: bool, bvh_builder_env: bool) -> bool {
+    native_rt && suppress_builder && !bvh_builder_env
+}
+
+fn bvh_builder_active() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1"))
+}
+
+fn ephemeral_release_allowed() -> bool {
+    ephemeral_release_gate(
+        crate::dxr::enabled(),
+        crate::dxr::suppress_builder(),
+        bvh_builder_active(),
+    )
+}
+
+/// Pins arena pages covering `[dest_va, dest_va + size)` while a Native DXR
+/// `ExtractStaticBlas` submission is in flight so concurrent completions sharing a
+/// 64 KiB boundary page never free it prematurely.
+pub(crate) fn pin_extracted(dest_va: u64, size: u64) {
+    if dest_va == 0 || size == 0 || !ephemeral_release_allowed() {
+        return;
+    }
+    let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(m) = guard.as_mut() else { return };
+    let first = dest_va / PAGE;
+    let last = (dest_va.saturating_add(size) - 1) / PAGE;
+    for page in first..=last {
+        if let Some(held) = m.pages.get_mut(&page) {
+            held.pinned = held.pinned.saturating_add(1);
+        }
+    }
+}
+
+/// Releases rehydrated BVH4 arena pages covering `[dest_va, dest_va + size)` once
+/// Native DXR `ExtractStaticBlas` + node readback has completed on the GPU, and
+/// retires completely empty arenas (substituting a shared 4 KiB null UAV in `copies`)
+/// so DXR rehydration stays bounded to 1–2 arenas (`64–128 MiB` instead of `912 MiB`).
+///
+/// Strictly gated on `crate::dxr::enabled() && !bvh_builder_active` (`VICTORY_NATIVE_RT=1`
+/// and `VICTORY_BVH_BUILDER=0`); never runs when software BVH shaders may read arenas.
+pub(crate) fn release_extracted(dest_va: u64, size: u64) {
+    if dest_va == 0 || size == 0 || !ephemeral_release_allowed() {
+        return;
+    }
+    let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(m) = guard.as_mut() else { return };
+    m.release_extracted_range(dest_va, size);
+}
+
 /// `VICTORY_BVH_TRACE=1`: the sizes the builder is asked for (its program of
 /// one thread that stores a structure's compacted size) and when title memory
 /// has them, and the copies to a place of that size.
@@ -1164,7 +1495,7 @@ mod dump {
         /// and the last frame, how often.
         pub(super) built: std::collections::BTreeMap<u64, (u64, u64, u64)>,
         /// The frame it is written at, and the copies.
-        due: Option<(u64, Vec<(ID3D12Resource, usize)>)>,
+        due: Option<(u64, Vec<(ID3D12Resource, usize, u64)>)>,
         done: bool,
     }
 
@@ -1219,15 +1550,17 @@ mod dump {
                 }
                 text += &format!("frame {}\n", self.frame);
                 for (page, held) in &self.pages {
-                    let arena = self.arenas.iter().position(|a| a.0 == held.copy).unwrap_or(usize::MAX);
-                    let at = held.at - self.arenas[arena].1;
+                    let Some(arena) = self.arenas.iter().position(|a| !a.retired && a.copy == held.copy) else {
+                        continue;
+                    };
+                    let at = held.at - self.arenas[arena].base;
                     text += &format!("{:#x} {arena} {at:#x}\n", page * PAGE);
                 }
                 let _ = std::fs::write(folder.join("pages.txt"), text);
-                for (n, (_, data)) in copies.iter().enumerate() {
+                for (n, (_, data, size)) in copies.iter().enumerate() {
                     // SAFETY: a mapping of an arena's bytes; the copies ran
                     // frames ago.
-                    let bytes = unsafe { std::slice::from_raw_parts(*data as *const u8, ARENA as usize) };
+                    let bytes = unsafe { std::slice::from_raw_parts(*data as *const u8, *size as usize) };
                     let _ = std::fs::write(folder.join(format!("arena-{n}.bin")), bytes);
                 }
                 tracing::info!(arenas = copies.len(), "title memory by address: the arenas are written out");
@@ -1239,18 +1572,21 @@ mod dump {
             self.dump.done = true;
             let Some(host) = host() else { return };
             let mut copies = Vec::new();
-            for &(n, _) in &self.arenas {
-                let buffer = &self.copies[n].buffer;
-                let Some((to, data)) = host.shared_buffer(ARENA) else { break };
+            for arena in &self.arenas {
+                if arena.retired {
+                    continue;
+                }
+                let buffer = &self.copies[arena.copy].buffer;
+                let Some((to, data)) = host.shared_buffer(arena.size) else { break };
                 // SAFETY: an open list; live buffers of those sizes. The list
                 // has not used the arena yet.
                 unsafe {
                     list.list.ResourceBarrier(&[turn(buffer, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
-                    list.list.CopyBufferRegion(&to, 0, buffer, 0, ARENA);
+                    list.list.CopyBufferRegion(&to, 0, buffer, 0, arena.size);
                     list.list.ResourceBarrier(&[turn(buffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON)]);
                 }
                 list.keep(&to);
-                copies.push((to, data as usize));
+                copies.push((to, data as usize, arena.size));
             }
             self.dump.due = Some((self.frame + 12, copies));
         }
@@ -1287,5 +1623,66 @@ mod tests {
         assert_eq!(packed_len(header(0x8102_0007, 5)), None);
         assert_eq!(packed_len(header(0x8102_0006, 0)), None);
         assert_eq!(packed_len(header(0x8102_0006, 1 << 21)), None);
+    }
+
+    #[test]
+    fn ephemeral_release_gate_and_initial_read_arena_size() {
+        // Initial arena for Use::Reads is 4 MiB (saving 60 MiB in RT-Off); Use::Builds is 64 MiB.
+        assert_eq!(next_arena_bytes(false), 4 << 20);
+        assert_eq!(next_arena_bytes(true), 64 << 20);
+
+        // Strictly allowed ONLY when VICTORY_NATIVE_RT=1, suppress_builder=1, VICTORY_BVH_BUILDER=0.
+        assert!(ephemeral_release_gate(true, true, false));
+        assert!(!ephemeral_release_gate(true, true, true));
+        assert!(!ephemeral_release_gate(true, false, false));
+        assert!(!ephemeral_release_gate(false, true, false));
+        assert!(!ephemeral_release_gate(false, false, true));
+    }
+
+    #[test]
+    fn release_extracted_reclaims_empty_arenas_and_substitutes_null_copy() {
+        let Some(mut m) = Memory::new() else {
+            return;
+        };
+        m.saw_builds = true;
+        // Allocate two small test arenas (4 MiB each) so the test stays fast and light.
+        assert!(m.another(READ_ARENA));
+        assert!(m.another(READ_ARENA));
+        assert_eq!(m.arenas.len(), 2);
+        assert_eq!(m.arenas.iter().filter(|a| !a.retired).count(), 2);
+
+        // Map one page in arena 0 and one page in arena 1 directly.
+        let copy0 = m.arenas[0].copy;
+        let at0 = m.arenas[0].free.pop().unwrap();
+        m.arenas[0].live_pages += 1;
+        m.free_pages -= 1;
+        let page0 = 0x2_0000u64;
+        m.hold(page0, at0, copy0);
+
+        let copy1 = m.arenas[1].copy;
+        let at1 = m.arenas[1].free.pop().unwrap();
+        m.arenas[1].live_pages += 1;
+        m.free_pages -= 1;
+        let page1 = 0x2_0001u64;
+        m.hold(page1, at1, copy1);
+
+        // Pin page1 twice, simulate first extract completion: stays pinned & live.
+        m.pages.get_mut(&page1).unwrap().pinned = 2;
+        assert_eq!(m.release_extracted_range(page1 * PAGE, PAGE), 0);
+        assert_eq!(m.arenas[1].live_pages, 1);
+
+        // Release page0 (unpinned) and page1 (last pin drops to 0): both pages free,
+        // directory entries zero out, and arena 1 retires while arena 0 stays as 1 warm spare.
+        assert_eq!(m.release_extracted_range(page0 * PAGE, PAGE), 0);
+        assert_eq!(m.release_extracted_range(page1 * PAGE, PAGE), 1);
+        assert_eq!(unsafe { m.entry(page0).read() }, 0);
+        assert_eq!(unsafe { m.entry(page1).read() }, 0);
+        assert_eq!(m.arenas[0].live_pages, 0);
+        assert_eq!(m.arenas[1].live_pages, 0);
+        assert!(!m.arenas[0].retired);
+        assert!(m.arenas[1].retired);
+        assert!(m.retired_copies.contains(&copy1));
+        // `copies[copy1]` is now replaced with the shared 4 KiB null UAV so descriptors stay valid.
+        assert_eq!(m.copies[copy1].span().1, NULL_COPY_BYTES);
     }
 }

@@ -1230,14 +1230,16 @@ fn batch_clamp() -> Option<&'static Clamp> {
 /// Opens a batch in `list` ([`batch`]): a pass that clamps the records of
 /// the executions recorded after it, of `source` (a host copy's number,
 /// buffer, and whether it is placed in place) and of the `recent` ones after
-/// it. The table to add them to, and the scratch buffer its places are in.
+/// it. Reuses `table` in place (avoiding 4.6 KiB stack zeroing on every batch
+/// open) and returns the scratch buffer its places are in.
 /// Replaces the list's compute root signature and pipeline (callers bind
 /// theirs after). `None` if the clamp is not available.
-pub(crate) fn open_batch(
+pub(crate) fn open_batch_into(
     list: &HostList,
     source: (u64, &ID3D12Resource, bool),
     recent: &[(u64, ID3D12Resource, bool)],
-) -> Option<(batch::Table, ID3D12Resource)> {
+    table: &mut batch::Table,
+) -> Option<ID3D12Resource> {
     let c = batch_clamp()?;
     let budget = if budget_enabled() {
         Some(list.budget_resource()?)
@@ -1315,7 +1317,20 @@ pub(crate) fn open_batch(
     }
     // SAFETY: the list's own upload memory of that many bytes, 256-byte
     // aligned, until it is reset.
-    Some((unsafe { batch::Table::new(at, base, ids) }, dst))
+    unsafe { table.reset(at, base, ids) };
+    Some(dst)
+}
+
+/// [`open_batch_into`] returning a freshly constructed [`batch::Table`].
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn open_batch(
+    list: &HostList,
+    source: (u64, &ID3D12Resource, bool),
+    recent: &[(u64, ID3D12Resource, bool)],
+) -> Option<(batch::Table, ID3D12Resource)> {
+    let mut table = batch::Table::default();
+    let dst = open_batch_into(list, source, recent, &mut table)?;
+    Some((table, dst))
 }
 
 /// The batched clamp's root signature and pipeline on `device`, for the
@@ -6886,5 +6901,37 @@ mod clamp_barrier_tests {
                 marks_uav_clean: false,
             }
         );
+    }
+
+    #[test]
+    fn batch_table_defers_wc_count_write_until_flush_reset_or_drop() {
+        use super::{KIND_DISPATCH, KIND_DRAW, batch};
+        let mut buf1 = vec![0xFFu32; (batch::TABLE / 4) as usize];
+        let mut buf2 = vec![0xFFu32; (batch::TABLE / 4) as usize];
+        let mut ids1 = [0u64; batch::SOURCES];
+        ids1[0] = 10;
+        let mut ids2 = [0u64; batch::SOURCES];
+        ids2[0] = 20;
+
+        {
+            // SAFETY: `buf1` and `buf2` hold `batch::TABLE` 4-byte-aligned bytes.
+            let mut table = unsafe { batch::Table::new(buf1.as_mut_ptr().cast(), 0, ids1) };
+            assert_eq!(buf1[0], 0, "Table::new initializes count word to 0");
+            assert_eq!(table.place_deferred(10, 0, KIND_DRAW), Some(0));
+            assert_eq!(table.place_deferred(10, 16, KIND_DRAW), Some(u64::from(batch::SLOT)));
+            // `place_deferred` must NOT bounce WC memory offset 0 on every job.
+            assert_eq!(buf1[0], 0, "table[0] stays unflushed during place_deferred");
+            // Deduplicating an existing job reuses the same slot.
+            assert_eq!(table.place_deferred(10, 0, KIND_DRAW), Some(0));
+
+            // Reusing `table` via `reset()` flushes `buf1[0]` once and binds `buf2`.
+            // SAFETY: `buf2` lives through `table`'s drop.
+            unsafe { table.reset(buf2.as_mut_ptr().cast(), 64, ids2) };
+            assert_eq!(buf1[0], 2, "reset() must flush prior batch count once");
+            assert_eq!(buf2[0], 0, "new batch starts at 0");
+            assert_eq!(table.place_deferred(20, 32, KIND_DISPATCH), Some(64));
+            assert_eq!(buf2[0], 0, "table[0] stays unflushed until drop/finish");
+        }
+        assert_eq!(buf2[0], 1, "Drop for Table flushes final batch count once");
     }
 }

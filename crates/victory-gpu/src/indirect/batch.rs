@@ -359,6 +359,8 @@ pub(crate) struct Table {
     sources: [u64; SOURCES],
     /// Number of active jobs (`0..=JOBS`).
     len: u32,
+    /// Last job count flushed to WC upload memory `table[0]`.
+    flushed_len: u32,
     /// Packed `(source, kind, offset)` key for each active job `0..len`.
     keys: [u64; JOBS as usize],
     /// How many executions each job is charged for so far (`1..=TIMES`).
@@ -372,9 +374,16 @@ impl Default for Table {
             base: 0,
             sources: [0; SOURCES],
             len: 0,
+            flushed_len: 0,
             keys: [0; JOBS as usize],
             times: [0; JOBS as usize],
         }
+    }
+}
+
+impl Drop for Table {
+    fn drop(&mut self) {
+        self.flush();
     }
 }
 
@@ -385,27 +394,69 @@ impl Table {
     /// `at` is [`TABLE`] bytes of mapped upload memory, 4-byte aligned, that
     /// live until the list that reads them is recorded and is not run
     /// before.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) unsafe fn new(at: *mut u8, base: u32, sources: [u64; SOURCES]) -> Table {
         // SAFETY: the caller's.
         unsafe { at.cast::<u32>().write_volatile(0) };
         Table { at: at as usize, base, sources, ..Table::default() }
     }
 
-    /// The place in the scratch buffer of the record of `kind` at `offset`
-    /// of the host copy `id`, once the pass has run: a job of it is added if
-    /// there is none. `None` if the pass cannot read that copy or has no
-    /// room for another job.
-    pub(crate) fn place(&mut self, id: u64, offset: u64, kind: u32) -> Option<u64> {
+    /// Flushes any prior batch count and rebinds this `Table` in place to a new
+    /// upload-memory slot without re-zeroing the 4.6 KiB `keys`/`times` arrays.
+    ///
+    /// # Safety
+    /// Same safety contract as [`Table::new`].
+    pub(crate) unsafe fn reset(&mut self, at: *mut u8, base: u32, sources: [u64; SOURCES]) {
+        self.flush();
+        // SAFETY: the caller's.
+        unsafe { at.cast::<u32>().write_volatile(0) };
+        self.at = at as usize;
+        self.base = base;
+        self.sources = sources;
+        self.len = 0;
+        self.flushed_len = 0;
+    }
+
+    /// Flushes the final job count to WC upload memory `table[0]` once.
+    #[inline]
+    pub(crate) fn flush(&mut self) {
+        if self.at != 0 && self.len != self.flushed_len {
+            // SAFETY: `self.at` is mapped upload memory alive until the list executes.
+            unsafe { (self.at as *mut u32).write_volatile(self.len) };
+            self.flushed_len = self.len;
+        }
+    }
+
+    /// Detaches this table from its current upload-memory backing after
+    /// flushing the final job count (so the struct can be kept idle for reuse).
+    #[inline]
+    pub(crate) fn finish(&mut self) {
+        self.flush();
+        self.at = 0;
+        self.len = 0;
+        self.flushed_len = 0;
+    }
+
+    /// Appends or deduplicates a job without flushing WC `table[0]` on every
+    /// call (`CPU-29`); callers MUST call [`Table::flush`], [`Table::finish`],
+    /// or drop the table before the command list executes on the GPU.
+    pub(crate) fn place_deferred(&mut self, id: u64, offset: u64, kind: u32) -> Option<u64> {
         let source = self.sources.iter().position(|&s| s == id)? as u32;
         let offset = u32::try_from(offset).ok().filter(|o| o.is_multiple_of(4))?;
         offset.checked_add(words(kind)? * 4)?;
         let key = pack_key(source, offset, kind);
         let table = self.at as *mut u32;
         let place = |i: u32| u64::from(self.base + i * SLOT);
+        let track_budget = super::budget_enabled();
         // Reverse scan hits the most recently allocated job for `key` first so
         // once a slot reaches `TIMES`, subsequent calls find the overflow slot.
         for i in (0..self.len as usize).rev() {
             if self.keys[i] == key {
+                if !track_budget {
+                    // Release shader (`!BUDGET_TRACK`) ignores `times`, so
+                    // duplicate jobs need zero WC memory writes.
+                    return Some(place(i as u32));
+                }
                 if u32::from(self.times[i]) < TIMES {
                     self.times[i] += 1;
                     // SAFETY: the job's own word of the table ([`Table::new`]).
@@ -433,9 +484,20 @@ impl Table {
             to.add(1).write_volatile(offset);
             to.add(2).write_volatile(self.base + i * SLOT);
             to.add(3).write_volatile(0);
-            table.write_volatile(i + 1);
         }
         Some(place(i))
+    }
+
+    /// The place in the scratch buffer of the record of `kind` at `offset`
+    /// of the host copy `id`, once the pass has run: a job of it is added if
+    /// there is none. `None` if the pass cannot read that copy or has no
+    /// room for another job. Immediately flushes `table[0]` for callers that
+    /// submit before dropping `Table`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn place(&mut self, id: u64, offset: u64, kind: u32) -> Option<u64> {
+        let res = self.place_deferred(id, offset, kind)?;
+        self.flush();
+        Some(res)
     }
 }
 

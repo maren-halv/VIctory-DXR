@@ -548,6 +548,7 @@ fn emit_front_back_track_two_pass_cs() -> Vec<u8> {
             },
         ],
         committed_meta_loads: vec![],
+        direct_normals: vec![],
     };
 
     assert!(is_front_back_two_pass_shape(&rl));
@@ -561,7 +562,6 @@ fn emit_front_back_track_two_pass_cs() -> Vec<u8> {
 
     let inputs = ResolvedRayInputs {
         rq,
-        rq_opaque: None,
         two_pass_early_fields: None,
         tlas,
         active_ray: None,
@@ -572,8 +572,8 @@ fn emit_front_back_track_two_pass_cs() -> Vec<u8> {
         instance_mask: None,
         ray_flags: None,
         group_const_flags: alloc_flags,
-        group_opaque_const_flags: 0,
         fbt_split_mask: 0,
+        fbt_mirror_tlas: false,
         init_min_front_t: Some(init_min_front_t),
         anyhit_inits: vec![],
         anyhit_entry_dxil: None,
@@ -1462,7 +1462,7 @@ fn emit_fno_speculative_cs() -> Vec<u8> {
     use super::rayquery_lift::{
         AnyHitInfo, CandidateInput, RayInput, RayLoop, RayLoopKind, RayMetaKind, RayOutput,
         RayOutputBinding, RayTemplate, ResolvedRayInputs, emit_ray_loop, emit_ray_meta_load,
-        ray_flag,
+        finish_fno_spec_pass1, ray_flag,
     };
     use crate::ir::Value;
     use std::collections::HashMap;
@@ -1550,6 +1550,7 @@ fn emit_fno_speculative_cs() -> Vec<u8> {
             },
         ],
         committed_meta_loads: vec![],
+        direct_normals: vec![],
     };
 
     let rq = s.allocate_ray_query(entry, alloc_flags);
@@ -1558,7 +1559,6 @@ fn emit_fno_speculative_cs() -> Vec<u8> {
     fallbacks.insert(Value(4), t_max_i);
     let inputs = ResolvedRayInputs {
         rq,
-        rq_opaque: None,
         two_pass_early_fields: None,
         tlas,
         active_ray: None,
@@ -1569,8 +1569,8 @@ fn emit_fno_speculative_cs() -> Vec<u8> {
         instance_mask: None,
         ray_flags: None,
         group_const_flags: alloc_flags,
-        group_opaque_const_flags: 0,
         fbt_split_mask: 0,
+        fbt_mirror_tlas: false,
         init_min_front_t: None,
         anyhit_inits: vec![],
         anyhit_entry_dxil: Some(anyhit_body),
@@ -1580,34 +1580,43 @@ fn emit_fno_speculative_cs() -> Vec<u8> {
     let emitted = emit_ray_loop(&mut s, entry, done, &rl, &inputs);
     let pending = emitted.pending_anyhit.expect("pending anyhit");
     let spec = pending.spec.expect("speculative FNO metadata");
-
-    // AnyHit body: read GeometryIndexShl8 guarded by `spec_phi`, reject geom 1 (`1 << 8 = 256`).
-    let b_comm = s.m.new_block();
-    let b_cand = s.m.new_block();
-    let b_join = s.m.new_block();
-    s.m.terminate(anyhit_body, Term::CondBr(spec.spec_phi, b_comm, b_cand));
-    let g_comm =
-        emit_ray_meta_load(&mut s, b_comm, rq, false, RayMetaKind::GeometryIndexShl8, 1, None)[0];
-    s.m.terminate(b_comm, Term::Br(b_join));
-    let g_cand =
-        emit_ray_meta_load(&mut s, b_cand, rq, true, RayMetaKind::GeometryIndexShl8, 1, None)[0];
-    s.m.terminate(b_cand, Term::Br(b_join));
-    let g_phi = s.m.phi(b_join, i32t);
-    s.m.set_phi(g_phi, vec![(g_comm, b_comm), (g_cand, b_cand)]);
     let reject_val = s.m.i32(1 << 8);
-    let accept = s.m.cmp(b_join, pred::NE, g_phi, reject_val);
-    s.m.terminate(
-        b_join,
-        Term::CondBr(spec.spec_phi, spec.spec_decide_blk, spec.non_spec_decide_blk),
+
+    // Pass 1 (out of loop): read Committed GeometryIndexShl8, reject geom 1 (`1 << 8 = 256`).
+    let (b1, g1_vals) = emit_ray_meta_load(
+        &mut s,
+        spec.p1_bridge_blk,
+        rq,
+        false,
+        RayMetaKind::GeometryIndexShl8,
+        1,
+        None,
     );
-    s.m.terminate(
-        spec.spec_decide_blk,
-        Term::CondBr(accept, spec.after_blk, spec.p2_trace_blk),
+    let accept1 = s.m.cmp(b1, pred::NE, g1_vals[0], reject_val);
+    finish_fno_spec_pass1(&mut s, &spec, b1, accept1);
+
+    // Pass 2 (clean Proceed() loop): read Candidate GeometryIndexShl8, reject geom 1.
+    let (b2, g2_vals) = emit_ray_meta_load(
+        &mut s,
+        anyhit_body,
+        rq,
+        true,
+        RayMetaKind::GeometryIndexShl8,
+        1,
+        None,
     );
+    let accept2 = s.m.cmp(b2, pred::NE, g2_vals[0], reject_val);
     s.m.terminate(
-        spec.non_spec_decide_blk,
-        Term::CondBr(accept, pending.do_commit_blk, pending.latch_blk),
+        b2,
+        Term::CondBr(accept2, pending.do_commit_blk, pending.latch_blk),
     );
+    if let Some((pt_phi, pt_latch, ct)) = spec.p2_t_track {
+        let mut pt_inc = vec![(pt_phi, b2), (ct, pending.do_commit_blk)];
+        if let Some(cb) = pending.cand_check_blk {
+            pt_inc.push((pt_phi, cb));
+        }
+        s.m.set_phi(pt_latch, pt_inc);
+    }
 
     let stride = s.m.i32(PROCEED_LANE_STRIDE_DWORDS * 4);
     let base = s.m.bin(done, Bin::Mul, tid, stride);
@@ -1806,6 +1815,7 @@ fn emit_front_back_track_mask_split_cs() -> Vec<u8> {
             },
         ],
         committed_meta_loads: vec![],
+        direct_normals: vec![],
     };
 
     let rq = s.allocate_ray_query(entry, alloc_flags);
@@ -1814,7 +1824,6 @@ fn emit_front_back_track_mask_split_cs() -> Vec<u8> {
     fallbacks.insert(Value(7), t_max_i);
     let inputs = ResolvedRayInputs {
         rq,
-        rq_opaque: None,
         two_pass_early_fields: Some(collect_early_q1_fields(&rl, &[])),
         tlas,
         active_ray: None,
@@ -1825,8 +1834,8 @@ fn emit_front_back_track_mask_split_cs() -> Vec<u8> {
         instance_mask: None,
         ray_flags: None,
         group_const_flags: alloc_flags,
-        group_opaque_const_flags: 0,
         fbt_split_mask: 0x80,
+        fbt_mirror_tlas: false,
         init_min_front_t: Some(t_max_i),
         anyhit_inits: vec![],
         anyhit_entry_dxil: None,
@@ -1971,8 +1980,8 @@ fn gpu_rayquery_front_back_track_mask_split_exact() {
 fn emit_fno_speculative_state_dyn_cs() -> Vec<u8> {
     use super::rayquery_lift::{
         AnyHitInfo, AnyHitStateVar, CandidateInput, RayInput, RayLoop, RayLoopKind, RayMetaKind,
-        RayOutput, RayOutputBinding, RayTemplate, ResolvedRayInputs, emit_ray_loop,
-        emit_ray_meta_load, ray_flag,
+        RayOutput, RayOutputBinding, RayTemplate, ResolvedRayInputs, emit_cand_input,
+        emit_ray_loop, emit_ray_meta_load, finish_fno_spec_pass1, ray_flag,
     };
     use crate::ir::Value;
     use std::collections::HashMap;
@@ -2075,6 +2084,7 @@ fn emit_fno_speculative_state_dyn_cs() -> Vec<u8> {
             },
         ],
         committed_meta_loads: vec![],
+        direct_normals: vec![],
     };
 
     let rq = s.allocate_ray_query(entry, 0);
@@ -2083,7 +2093,6 @@ fn emit_fno_speculative_state_dyn_cs() -> Vec<u8> {
     fallbacks.insert(Value(4), t_max_i);
     let inputs = ResolvedRayInputs {
         rq,
-        rq_opaque: None,
         two_pass_early_fields: None,
         tlas,
         active_ray: None,
@@ -2094,8 +2103,8 @@ fn emit_fno_speculative_state_dyn_cs() -> Vec<u8> {
         instance_mask: None,
         ray_flags: Some(dyn_flags),
         group_const_flags: 0,
-        group_opaque_const_flags: 0,
         fbt_split_mask: 0,
+        fbt_mirror_tlas: false,
         init_min_front_t: None,
         anyhit_inits: vec![init_portal_t_i],
         anyhit_entry_dxil: Some(anyhit_body),
@@ -2105,74 +2114,96 @@ fn emit_fno_speculative_state_dyn_cs() -> Vec<u8> {
     let emitted = emit_ray_loop(&mut s, entry, done, &rl, &inputs);
     let pending = emitted.pending_anyhit.expect("pending anyhit");
     let spec = pending.spec.as_ref().expect("speculative FNO metadata");
-    let cand_t_i = emitted.outs.iter().find(|&&(id, _)| id == Value(20)).unwrap().1;
     let state_in_i = emitted.outs.iter().find(|&&(id, _)| id == Value(21)).unwrap().1;
-
-    // AnyHit body: reject geom 1 (`1 << 8`), and when rejecting geom 1 update state_var = min(state, cand_t).
-    let b_comm = s.m.new_block();
-    let b_cand = s.m.new_block();
-    let b_join = s.m.new_block();
-    s.m.terminate(anyhit_body, Term::CondBr(spec.spec_phi, b_comm, b_cand));
-    let g_comm =
-        emit_ray_meta_load(&mut s, b_comm, rq, false, RayMetaKind::GeometryIndexShl8, 1, None)[0];
-    s.m.terminate(b_comm, Term::Br(b_join));
-    let g_cand =
-        emit_ray_meta_load(&mut s, b_cand, rq, true, RayMetaKind::GeometryIndexShl8, 1, None)[0];
-    s.m.terminate(b_cand, Term::Br(b_join));
-    let g_phi = s.m.phi(b_join, i32t);
-    s.m.set_phi(g_phi, vec![(g_comm, b_comm), (g_cand, b_cand)]);
+    let p1_cand_t_i = spec
+        .p1_cand_outs
+        .iter()
+        .find(|&&(id, _)| id == Value(20))
+        .unwrap()
+        .1;
 
     let portal_val = s.m.i32(1 << 8);
     let portal3_val = s.m.i32(3 << 8);
-    let is_g1 = s.m.cmp(b_join, pred::EQ, g_phi, portal_val);
-    let is_g3 = s.m.cmp(b_join, pred::EQ, g_phi, portal3_val);
-    let is_portal = s.m.bin(b_join, Bin::Or, is_g1, is_g3);
     let true_b = s.m.bool(true);
-    let accept = s.m.bin(b_join, Bin::Xor, is_portal, true_b);
 
-    let cand_t_f = s.m.cast(b_join, Cast::Bitcast, cand_t_i, f32t);
-    let state_in_f = s.m.cast(b_join, Cast::Bitcast, state_in_i, f32t);
-    let t_lt = s.m.cmp(b_join, pred::OLT, cand_t_f, state_in_f);
-    let min_t_f = s.m.select(b_join, t_lt, cand_t_f, state_in_f);
-    let min_t_i = s.m.cast(b_join, Cast::Bitcast, min_t_f, i32t);
-    let next_state = s.m.select(b_join, is_portal, min_t_i, state_in_i);
+    // Pass 1 (out-of-loop Committed* check): reject geom 1 or 3, update state_var = min(init, t1).
+    let (b1, g1_vals) = emit_ray_meta_load(
+        &mut s,
+        spec.p1_bridge_blk,
+        rq,
+        false,
+        RayMetaKind::GeometryIndexShl8,
+        1,
+        None,
+    );
+    let is_g1_p1 = s.m.cmp(b1, pred::EQ, g1_vals[0], portal_val);
+    let is_g3_p1 = s.m.cmp(b1, pred::EQ, g1_vals[0], portal3_val);
+    let is_portal_p1 = s.m.bin(b1, Bin::Or, is_g1_p1, is_g3_p1);
+    let accept_p1 = s.m.bin(b1, Bin::Xor, is_portal_p1, true_b);
+    let p1_t_f = s.m.cast(b1, Cast::Bitcast, p1_cand_t_i, f32t);
+    let p1_st_f = s.m.cast(b1, Cast::Bitcast, pending.init_vals[0], f32t);
+    let p1_lt = s.m.cmp(b1, pred::OLT, p1_t_f, p1_st_f);
+    let p1_min_f = s.m.select(b1, p1_lt, p1_t_f, p1_st_f);
+    let p1_min_i = s.m.cast(b1, Cast::Bitcast, p1_min_f, i32t);
+    let p1_next_state = s.m.select(b1, is_portal_p1, p1_min_i, pending.init_vals[0]);
+    finish_fno_spec_pass1(&mut s, spec, b1, accept_p1);
+
+    // Pass 2 (clean Proceed() loop): reject geom 1 or 3, update state_var = min(state, cand_t).
+    let (b2, g2_vals) = emit_ray_meta_load(
+        &mut s,
+        anyhit_body,
+        rq,
+        true,
+        RayMetaKind::GeometryIndexShl8,
+        1,
+        None,
+    );
+    let is_g1 = s.m.cmp(b2, pred::EQ, g2_vals[0], portal_val);
+    let is_g3 = s.m.cmp(b2, pred::EQ, g2_vals[0], portal3_val);
+    let is_portal = s.m.bin(b2, Bin::Or, is_g1, is_g3);
+    let accept = s.m.bin(b2, Bin::Xor, is_portal, true_b);
+
+    let cand_t_i = emit_cand_input(&mut s, b2, rq, CandidateInput::RayT);
+    let cand_t_f = s.m.cast(b2, Cast::Bitcast, cand_t_i, f32t);
+    let state_in_f = s.m.cast(b2, Cast::Bitcast, state_in_i, f32t);
+    let t_lt = s.m.cmp(b2, pred::OLT, cand_t_f, state_in_f);
+    let min_t_f = s.m.select(b2, t_lt, cand_t_f, state_in_f);
+    let min_t_i = s.m.cast(b2, Cast::Bitcast, min_t_f, i32t);
+    let next_state = s.m.select(b2, is_portal, min_t_i, state_in_i);
 
     s.m.terminate(
-        b_join,
-        Term::CondBr(spec.spec_phi, spec.spec_decide_blk, spec.non_spec_decide_blk),
-    );
-    s.m.terminate(
-        spec.spec_decide_blk,
-        Term::CondBr(accept, spec.after_blk, spec.p2_trace_blk),
-    );
-    s.m.terminate(
-        spec.non_spec_decide_blk,
+        b2,
         Term::CondBr(accept, pending.do_commit_blk, pending.latch_blk),
     );
     let cb = pending.cand_check_blk.expect("dynamic flags keeps cand_check_blk");
+    if let Some((pt_phi, pt_latch, ct)) = spec.p2_t_track {
+        s.m.set_phi(
+            pt_latch,
+            vec![(pt_phi, b2), (ct, pending.do_commit_blk), (pt_phi, cb)],
+        );
+    }
     s.m.set_phi(
         pending.latch_phis[0],
         vec![
             (pending.state_phis[0], cb),
-            (next_state, spec.non_spec_decide_blk),
+            (next_state, b2),
             (next_state, pending.do_commit_blk),
         ],
     );
-    let mut hdr_inc = vec![
-        (pending.init_vals[0], spec.p1_check_blk),
-        (pending.init_vals[0], spec.spec_decide_blk),
-        (pending.latch_phis[0], pending.latch_blk),
-    ];
-    if let Some(bypass) = spec.dyn_bypass_blk {
-        hdr_inc.push((pending.init_vals[0], bypass));
-    }
-    s.m.set_phi(pending.state_phis[0], hdr_inc);
+    // Guard 3 (State-Var Reset Rule): Pass 2 resets state_phis[0] to init_vals[0].
+    s.m.set_phi(
+        pending.state_phis[0],
+        vec![
+            (pending.init_vals[0], spec.p2_trace_blk),
+            (pending.latch_phis[0], pending.latch_blk),
+        ],
+    );
     s.m.set_phi(
         spec.final_state_phis[0],
         vec![
             (pending.init_vals[0], spec.p1_check_blk),
-            (next_state, spec.spec_decide_blk),
-            (pending.state_phis[0], spec.proceed_blk),
+            (p1_next_state, b1),
+            (pending.state_phis[0], spec.p2_exit_blk),
         ],
     );
 
@@ -2302,7 +2333,9 @@ fn gpu_tri_fetch_basis_octahedral_normals() {
         [-1.0, 2.0, -3.0],
         [1.0, -2.0, -3.0],
         [-1.0, -2.0, -3.0],
-        // Lane 14: fallback (`tlas_meta_base == 0`) must unpack word 0 -> (0, 0, 1).
+        // Lane 14: single-geometry BLAS fast path (`level1 >= DATA_BASE`, skips Region 1 load).
+        [0.6, -0.8, 0.0],
+        // Lane 15: fallback (`tlas_meta_base == 0`) must unpack word 0 -> (0, 0, 1).
         [0.0, 0.0, 1.0],
     ];
     let n_lanes = cases.len() as u32;
@@ -2321,23 +2354,29 @@ fn gpu_tri_fetch_basis_octahedral_normals() {
         &[],
     );
     let last_lane = s.m.i32(n_lanes - 1);
+    let fast_lane = s.m.i32(n_lanes - 2);
     let is_fallback = s.m.cmp(entry, pred::EQ, tid, last_lane);
+    let is_fast = s.m.cmp(entry, pred::EQ, tid, fast_lane);
     let zero_i = s.m.i32(0);
     let one_i = s.m.i32(1);
     let tlas_base = s.m.select(entry, is_fallback, zero_i, one_i);
-    let inst_idx = s.m.i32(5);
+    let inst_3lvl = s.m.i32(5);
+    let inst_2lvl = s.m.i32(6);
+    let inst_idx = s.m.select(entry, is_fast, inst_2lvl, inst_3lvl);
     let geom_idx = s.m.i32(2);
-    let t_vec = emit_tri_fetch_basis(&mut s, entry, tlas_base, inst_idx, geom_idx, tid, false, 3);
-    let b_vec = emit_tri_fetch_basis(&mut s, entry, tlas_base, inst_idx, geom_idx, tid, true, 3);
+    let (blk_t, t_vec) =
+        emit_tri_fetch_basis(&mut s, entry, tlas_base, inst_idx, geom_idx, tid, false, 3);
+    let (blk_b, b_vec) =
+        emit_tri_fetch_basis(&mut s, blk_t, tlas_base, inst_idx, geom_idx, tid, true, 3);
     let stride = s.m.i32(6 * 4);
-    let base = s.m.bin(entry, Bin::Mul, tid, stride);
+    let base = s.m.bin(blk_b, Bin::Mul, tid, stride);
     for k in 0..3 {
-        let off_t = byte_offset(&mut s, entry, base, k as u32);
-        store_i32(&mut s, entry, uav, off_t, t_vec[k]);
-        let off_b = byte_offset(&mut s, entry, base, (k + 3) as u32);
-        store_i32(&mut s, entry, uav, off_b, b_vec[k]);
+        let off_t = byte_offset(&mut s, blk_b, base, k as u32);
+        store_i32(&mut s, blk_b, uav, off_t, t_vec[k]);
+        let off_b = byte_offset(&mut s, blk_b, base, (k + 3) as u32);
+        store_i32(&mut s, blk_b, uav, off_b, b_vec[k]);
     }
-    s.m.terminate(entry, Term::Ret);
+    s.m.terminate(blk_b, Term::Ret);
     let dxil = s.finish();
     validate_dxil("tri_fetch_basis_octahedral", &dxil);
 
@@ -2350,11 +2389,13 @@ fn gpu_tri_fetch_basis_octahedral_normals() {
     let total_words = (DXR_NORMALS_DATA_BASE + n_lanes + 16) as usize;
     let mut table = vec![0u32; total_words];
     table[0] = DXR_NORMALS_FALLBACK;
-    // TLAS slot base = 1, instance_index = 5 -> geom_table_off = GEOM_BASE + 10.
+    // TLAS slot base = 1, instance_index = 5 -> 3-level multi-geom (`GEOM_BASE + 10`).
     let geom_table_off = DXR_NORMALS_GEOM_BASE + 10;
     table[(1 + 5) as usize] = geom_table_off;
     // geom_index = 2 -> prim_data_off = DATA_BASE.
     table[(geom_table_off + 2) as usize] = DXR_NORMALS_DATA_BASE;
+    // TLAS slot base = 1, instance_index = 6 -> 2-level single-geom fast path (`>= DATA_BASE`).
+    table[(1 + 6) as usize] = DXR_NORMALS_DATA_BASE;
     for (i, &[nx, ny, nz]) in cases.iter().enumerate() {
         table[(DXR_NORMALS_DATA_BASE as usize) + i] = pack_oct_normal_u32(nx, ny, nz);
     }
@@ -2531,4 +2572,503 @@ fn gpu_tri_fetch_basis_octahedral_normals() {
             "lane {i}: want={want:?} got cross(T,B)={cross:?} (T={t:?}, B={b:?}) err={err}"
         );
     }
+}
+
+/// `[numthreads(4, 1, 1)]` compute shader verifying all 4 mandatory `ARCH-12` soundness guards
+/// for un-fused speculative `FORCE_NON_OPAQUE` + `nextafter_down(t1)` prefix skip:
+/// - Lane 0: exact coplanar accepted triangle at `t == t1 = 2.0` (must NOT skip coplanar decals).
+/// - Lane 1: `t1 == 0.0` hit (`origin.z = 2.0`, `t_min = 0.0`, rejected tri at `z = 2.0`) -> NaN underflow guard.
+/// - Lane 2: dynamic `ACCEPT_FIRST_HIT_AND_END_SEARCH` -> disables `nextafter_down(t1)` skip.
+/// - Lane 3: non-zero `t_min = 0.5` -> AMD RDNA 4 `2 * tMin` bug guard (`p2_t_phi` exact `t = 5.0`).
+fn emit_fno_speculative_arch12_guards_cs() -> Vec<u8> {
+    use super::rayquery_lift::{
+        AnyHitInfo, CandidateInput, RayInput, RayLoop, RayLoopKind, RayMetaKind, RayOutput,
+        RayOutputBinding, RayTemplate, ResolvedRayInputs, emit_ray_loop, emit_ray_meta_load,
+        finish_fno_spec_pass1, ray_flag,
+    };
+    use crate::ir::Value;
+    use std::collections::HashMap;
+
+    let mut s = Shader::new(false);
+    s.threads = Some([4, 1, 1]);
+    let entry = s.entry;
+    let anyhit_body = s.m.new_block();
+    let done = s.m.new_block();
+
+    let uav = s.root_uav_handle(0);
+    let tlas = s.rtas_root_srv_handle(entry, 0);
+
+    let i32t = s.t.i32;
+    let f32t = s.t.f32;
+    let tid = s.op(
+        entry,
+        "flattenedThreadIdInGroup.i32",
+        Attr::ReadNone,
+        i32t,
+        96,
+        &[],
+    );
+    let zero_i = s.m.i32(0);
+    let ten_f = s.m.f32(10.0f32.to_bits());
+    let tid_f = s.m.cast(entry, Cast::UiToFp, tid, f32t);
+    let ox_f = s.m.bin(entry, Bin::Mul, tid_f, ten_f);
+    let ox = s.m.cast(entry, Cast::Bitcast, ox_f, i32t);
+    let zero_f_i = s.m.i32(0.0f32.to_bits());
+    let one_f_i = s.m.i32(1.0f32.to_bits());
+    let two_f_i = s.m.i32(2.0f32.to_bits());
+    let half_f_i = s.m.i32(0.5f32.to_bits());
+    let t_max_i = s.m.i32(100.0f32.to_bits());
+
+    let c1 = s.m.i32(1);
+    let c2 = s.m.i32(2);
+    let c3 = s.m.i32(3);
+    let is_l1 = s.m.cmp(entry, pred::EQ, tid, c1);
+    let is_l2 = s.m.cmp(entry, pred::EQ, tid, c2);
+    let is_l3 = s.m.cmp(entry, pred::EQ, tid, c3);
+    let oz = s.m.select(entry, is_l1, two_f_i, zero_f_i);
+    let t_min_i = s.m.select(entry, is_l3, half_f_i, zero_f_i);
+    let f_fno = s.m.i32(ray_flag::FORCE_NON_OPAQUE);
+    let f_afh = s
+        .m
+        .i32(ray_flag::FORCE_NON_OPAQUE | ray_flag::ACCEPT_FIRST_HIT_AND_END_SEARCH);
+    let dyn_flags = s.m.select(entry, is_l2, f_afh, f_fno);
+
+    let alloc_flags = ray_flag::SKIP_PROCEDURAL_PRIMITIVES;
+    let rl = RayLoop {
+        rq_group: 0,
+        entry_block: 1,
+        exit_block: 3,
+        exit_pred: 1,
+        skipped_blocks: vec![],
+        template: RayTemplate::Bvh64,
+        kind: RayLoopKind::AnyHit(AnyHitInfo {
+            opacity_block: 1,
+            entry_block: 2,
+            tail_block: 2,
+            body_blocks: vec![2],
+            skipped_tail_insts: vec![],
+            accept_mask: Value(20),
+            accept_invert: false,
+            accept_first_hit: false,
+            inputs: vec![(Value(15), CandidateInput::RayT)],
+            const_lane_atoms: vec![],
+            state_vars: vec![],
+            cand_meta_loads: vec![],
+        }),
+        tlas_load: (0, 0),
+        tlas_root_load: None,
+        active_ray_mask: None,
+        origin: [RayInput::Val(Value(1)); 3],
+        t_min: Some(RayInput::Val(Value(2))),
+        dir: [RayInput::Val(Value(3)); 3],
+        t_max: RayInput::Val(Value(4)),
+        instance_mask: RayInput::Const(0xFF),
+        ray_flags: RayInput::Val(Value(6)),
+        outputs: vec![
+            RayOutputBinding {
+                value: Value(10),
+                output: RayOutput::CommittedStatusTriNode,
+                fallback: Some(Value(0)),
+            },
+            RayOutputBinding {
+                value: Value(11),
+                output: RayOutput::CommittedRayT,
+                fallback: Some(Value(4)),
+            },
+            RayOutputBinding {
+                value: Value(12),
+                output: RayOutput::CommittedGeometryIndex,
+                fallback: None,
+            },
+            RayOutputBinding {
+                value: Value(13),
+                output: RayOutput::CommittedPrimitiveIndex,
+                fallback: None,
+            },
+        ],
+        committed_meta_loads: vec![],
+        direct_normals: vec![],
+    };
+
+    let rq = s.allocate_ray_query(entry, alloc_flags);
+    let mut fallbacks = HashMap::new();
+    fallbacks.insert(Value(0), zero_i);
+    fallbacks.insert(Value(4), t_max_i);
+    let inputs = ResolvedRayInputs {
+        rq,
+        two_pass_early_fields: None,
+        tlas,
+        active_ray: None,
+        origin: [ox, zero_f_i, oz],
+        t_min: Some(t_min_i),
+        dir: [zero_f_i, zero_f_i, one_f_i],
+        t_max: t_max_i,
+        instance_mask: None,
+        ray_flags: Some(dyn_flags),
+        group_const_flags: alloc_flags,
+        fbt_split_mask: 0,
+        fbt_mirror_tlas: false,
+        init_min_front_t: None,
+        anyhit_inits: vec![],
+        anyhit_entry_dxil: Some(anyhit_body),
+        fallbacks,
+    };
+
+    let emitted = emit_ray_loop(&mut s, entry, done, &rl, &inputs);
+    let pending = emitted.pending_anyhit.expect("pending anyhit");
+    let spec = pending.spec.expect("speculative FNO metadata");
+    let reject_val = s.m.i32(1 << 8);
+
+    let (b1, g1_vals) = emit_ray_meta_load(
+        &mut s,
+        spec.p1_bridge_blk,
+        rq,
+        false,
+        RayMetaKind::GeometryIndexShl8,
+        1,
+        None,
+    );
+    let accept1 = s.m.cmp(b1, pred::NE, g1_vals[0], reject_val);
+    finish_fno_spec_pass1(&mut s, &spec, b1, accept1);
+
+    let (b2, g2_vals) = emit_ray_meta_load(
+        &mut s,
+        anyhit_body,
+        rq,
+        true,
+        RayMetaKind::GeometryIndexShl8,
+        1,
+        None,
+    );
+    let accept2 = s.m.cmp(b2, pred::NE, g2_vals[0], reject_val);
+    s.m.terminate(
+        b2,
+        Term::CondBr(accept2, pending.do_commit_blk, pending.latch_blk),
+    );
+    if let Some((pt_phi, pt_latch, ct)) = spec.p2_t_track {
+        let mut pt_inc = vec![(pt_phi, b2), (ct, pending.do_commit_blk)];
+        if let Some(cb) = pending.cand_check_blk {
+            pt_inc.push((pt_phi, cb));
+        }
+        s.m.set_phi(pt_latch, pt_inc);
+    }
+
+    let stride = s.m.i32(PROCEED_LANE_STRIDE_DWORDS * 4);
+    let base = s.m.bin(done, Bin::Mul, tid, stride);
+    for (k, &val_id) in [Value(10), Value(11), Value(12), Value(13)].iter().enumerate() {
+        let v = emitted.outs.iter().find(|&&(id, _)| id == val_id).unwrap().1;
+        let off = byte_offset(&mut s, done, base, k as u32);
+        store_i32(&mut s, done, uav, off, v);
+    }
+    s.m.terminate(done, Term::Ret);
+    s.finish()
+}
+
+#[test]
+fn gpu_rayquery_fno_speculative_arch12_four_guards() {
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let dxil = emit_fno_speculative_arch12_guards_cs();
+    validate_dxil("fno_speculative_arch12_four_guards", &dxil);
+
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; skipped");
+        return;
+    };
+    if !has_raytracing_tier_1_1(&host) {
+        eprintln!("hardware device lacks DXR Tier 1.1; skipped");
+        return;
+    }
+
+    // Geometry 0: dummy off-ray triangle.
+    let g0 = [[-100.0f32, -100.0, 2.0], [-99.0, -100.0, 2.0], [-100.0, -99.0, 2.0]];
+    // Geometry 1 (REJECTED by AnyHit):
+    //   tri 0: lane 0 at z=2.0 (coplanar with geom 2 tri 0!)
+    //   tri 1: lane 1 at z=2.0 (exact origin.z=2.0 -> t1 == 0.0!)
+    //   tri 2: lane 2 at z=5.0 (further than geom 2 tri 2 at z=2.0!)
+    //   tri 3: lane 3 at z=2.0 (t_min=0.5, before geom 2 tri 3 at z=5.0!)
+    let g1 = [
+        [-2.0f32, -2.0, 2.0], [2.0, -2.0, 2.0], [0.0, 2.0, 2.0],
+        [8.0, -2.0, 2.0], [12.0, -2.0, 2.0], [10.0, 2.0, 2.0],
+        [18.0, -2.0, 5.0], [22.0, -2.0, 5.0], [20.0, 2.0, 5.0],
+        [28.0, -2.0, 2.0], [32.0, -2.0, 2.0], [30.0, 2.0, 2.0],
+    ];
+    // Geometry 2 (ACCEPTED by AnyHit):
+    //   tri 0: lane 0 at EXACT coplanar z=2.0
+    //   tri 1: lane 1 at z=5.0 (t = 5.0 - 2.0 = 3.0)
+    //   tri 2: lane 2 at z=2.0
+    //   tri 3: lane 3 at z=5.0
+    let g2 = [
+        [-2.0f32, -2.0, 2.0], [2.0, -2.0, 2.0], [0.0, 2.0, 2.0],
+        [8.0, -2.0, 5.0], [12.0, -2.0, 5.0], [10.0, 2.0, 5.0],
+        [18.0, -2.0, 2.0], [22.0, -2.0, 2.0], [20.0, 2.0, 2.0],
+        [28.0, -2.0, 5.0], [32.0, -2.0, 5.0], [30.0, 2.0, 5.0],
+    ];
+    let geoms = [
+        TriangleGeom { vertices: &g0, flags: D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE },
+        TriangleGeom { vertices: &g1, flags: D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE },
+        TriangleGeom { vertices: &g2, flags: D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE },
+    ];
+    let inst = InstanceSpec {
+        transform: [
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+        ],
+        instance_id: 0,
+        instance_mask: 0xFF,
+        contrib: 0,
+        flags: 0,
+    };
+
+    let out = run_rayquery_gpu(
+        &host,
+        &dxil,
+        false,
+        &geoms,
+        &inst,
+        4 * PROCEED_LANE_STRIDE_DWORDS,
+    )
+    .unwrap_or_else(|e| panic!("fno arch12 four guards run_rayquery_gpu failed: {e}"));
+
+    let stride = PROCEED_LANE_STRIDE_DWORDS as usize;
+    let lane = |k: usize| &out[k * stride..(k + 1) * stride];
+
+    // Lane 0: coplanar accepted triangle at exact t == t1 == 2.0.
+    let l0 = lane(0);
+    assert_eq!(l0[0], 1, "lane 0 coplanar hit must commit");
+    assert_eq!(l0[2], 2, "lane 0 must commit geom 2");
+    assert!((f32::from_bits(l0[1]) - 2.0).abs() < 1e-4, "lane 0 coplanar t got {}", f32::from_bits(l0[1]));
+
+    // Lane 1: t1 == 0.0 NaN underflow guard -> Pass 2 still commits geom 2 at t = 3.0.
+    let l1 = lane(1);
+    assert_eq!(l1[0], 1, "lane 1 t1==0.0 must not underflow to NaN");
+    assert_eq!(l1[2], 2, "lane 1 must commit geom 2");
+    assert!((f32::from_bits(l1[1]) - 3.0).abs() < 1e-4, "lane 1 t got {}, want 3.0", f32::from_bits(l1[1]));
+
+    // Lane 2: ACCEPT_FIRST_HIT ban -> Pass 2 commits geom 2 at t = 2.0.
+    let l2 = lane(2);
+    assert_eq!(l2[0], 1, "lane 2 ACCEPT_FIRST_HIT must commit");
+    assert_eq!(l2[2], 2, "lane 2 must commit geom 2");
+    assert!((f32::from_bits(l2[1]) - 2.0).abs() < 1e-4, "lane 2 t got {}, want 2.0", f32::from_bits(l2[1]));
+
+    // Lane 3: non-zero tMin=0.5 RDNA 4 2*tMin guard -> exact t = 5.0 (not 5.0 + tMin_p2!).
+    let l3 = lane(3);
+    assert_eq!(l3[0], 1, "lane 3 non-zero tMin must commit");
+    assert_eq!(l3[2], 2, "lane 3 must commit geom 2");
+    assert!((f32::from_bits(l3[1]) - 5.0).abs() < 1e-4, "lane 3 t got {}, want 5.0", f32::from_bits(l3[1]));
+}
+
+#[test]
+fn gpu_rayquery_front_back_track_mirror_tlas_arch13() {
+    use super::rayquery_lift::{
+        RayInput, RayLoop, RayLoopKind, RayOutput, RayOutputBinding, RayTemplate,
+        ResolvedRayInputs, collect_early_q1_fields, effective_const_ray_flags, emit_ray_loop,
+        is_front_back_mirror_tlas_eligible, ray_flag,
+    };
+    use crate::ir::Value;
+    use std::collections::HashMap;
+
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let mut s = Shader::new(false);
+    s.threads = Some([4, 1, 1]);
+    let entry = s.entry;
+    let done = s.m.new_block();
+    let uav = s.root_uav_handle(0);
+    let tlas = s.rtas_root_srv_handle(entry, 0);
+
+    let i32t = s.t.i32;
+    let tid = s.op(
+        entry,
+        "flattenedThreadIdInGroup.i32",
+        Attr::ReadNone,
+        i32t,
+        96,
+        &[],
+    );
+    let zero_i = s.m.i32(0);
+    let ten_f = s.m.f32(10.0f32.to_bits());
+    let tid_f = s.m.cast(entry, Cast::UiToFp, tid, s.t.f32);
+    let ox_f = s.m.bin(entry, Bin::Mul, tid_f, ten_f);
+    let ox = s.m.cast(entry, Cast::Bitcast, ox_f, i32t);
+    let zero_f_i = s.m.i32(0.0f32.to_bits());
+    let one_f_i = s.m.i32(1.0f32.to_bits());
+    let t_min_i = s.m.i32(0.5f32.to_bits());
+    let t_max_i = s.m.i32(100.0f32.to_bits());
+
+    let rl = RayLoop {
+        rq_group: 0,
+        entry_block: 1,
+        exit_block: 2,
+        exit_pred: 1,
+        skipped_blocks: vec![],
+        template: RayTemplate::Bvh64,
+        kind: RayLoopKind::FrontBackTrack {
+            init_min_front_t: RayInput::Val(Value(8)),
+        },
+        tlas_load: (0, 0),
+        tlas_root_load: None,
+        active_ray_mask: None,
+        origin: [RayInput::Val(Value(1)); 3],
+        t_min: Some(RayInput::Val(Value(2))),
+        dir: [RayInput::Val(Value(3)); 3],
+        t_max: RayInput::Val(Value(4)),
+        instance_mask: RayInput::Const(0xFF),
+        ray_flags: RayInput::Const(
+            ray_flag::FORCE_NON_OPAQUE | ray_flag::SKIP_PROCEDURAL_PRIMITIVES,
+        ),
+        outputs: vec![
+            RayOutputBinding {
+                value: Value(10),
+                output: RayOutput::CommittedStatusTriNode,
+                fallback: Some(Value(0)),
+            },
+            RayOutputBinding {
+                value: Value(11),
+                output: RayOutput::CommittedRayT,
+                fallback: Some(Value(7)),
+            },
+            RayOutputBinding {
+                value: Value(12),
+                output: RayOutput::FrontBackMinFrontT,
+                fallback: None,
+            },
+            RayOutputBinding {
+                value: Value(13),
+                output: RayOutput::CommittedPrimitiveIndex,
+                fallback: None,
+            },
+        ],
+        committed_meta_loads: vec![],
+        direct_normals: vec![],
+    };
+
+    // Verify ARCH-13 eligibility & constRayFlags=512 (not 513) & host_settings() bit 20
+    // using thread-local overrides so we never race process-global `raw_views`.
+    let prev_mt = super::lower::TEST_NATIVE_RT_MIRROR_TLAS.replace(Some(true));
+    let prev_rv = super::rayquery_lift::TEST_RAW_VIEWS_NONZERO.replace(Some(true));
+    let hs_on = super::lower::host_settings();
+    let elig_on = is_front_back_mirror_tlas_eligible(&rl);
+    let eff_flags = effective_const_ray_flags(&rl);
+    super::lower::TEST_NATIVE_RT_MIRROR_TLAS.set(Some(false));
+    let hs_off = super::lower::host_settings();
+    let elig_off = is_front_back_mirror_tlas_eligible(&rl);
+    super::rayquery_lift::TEST_RAW_VIEWS_NONZERO.set(prev_rv);
+    super::lower::TEST_NATIVE_RT_MIRROR_TLAS.set(prev_mt);
+    assert!(elig_on, "mirror-TLAS FBT must be eligible when raw_views != 0 and toggle ON");
+    assert_eq!(
+        eff_flags,
+        Some(ray_flag::SKIP_PROCEDURAL_PRIMITIVES),
+        "mirror-TLAS FBT must keep constRayFlags=512 so it coalesces with fno_spec"
+    );
+    assert!(!elig_off, "mirror-TLAS FBT must disable when VICTORY_NATIVE_RT_MIRROR_TLAS=0");
+    assert_ne!(
+        hs_on[4] & (1 << 20),
+        hs_off[4] & (1 << 20),
+        "VICTORY_NATIVE_RT_MIRROR_TLAS must key host_settings()[4] bit 20"
+    );
+
+    let alloc_flags = ray_flag::SKIP_PROCEDURAL_PRIMITIVES;
+    let rq = s.allocate_ray_query(entry, alloc_flags);
+    let mut fallbacks = HashMap::new();
+    fallbacks.insert(Value(0), zero_i);
+    fallbacks.insert(Value(7), t_max_i);
+    let inputs = ResolvedRayInputs {
+        rq,
+        two_pass_early_fields: Some(collect_early_q1_fields(&rl, &[])),
+        tlas,
+        active_ray: None,
+        origin: [ox, zero_f_i, zero_f_i],
+        t_min: Some(t_min_i),
+        dir: [zero_f_i, zero_f_i, one_f_i],
+        t_max: t_max_i,
+        instance_mask: None,
+        ray_flags: None,
+        group_const_flags: alloc_flags,
+        fbt_split_mask: 0,
+        fbt_mirror_tlas: true,
+        init_min_front_t: Some(t_max_i),
+        anyhit_inits: vec![],
+        anyhit_entry_dxil: None,
+        fallbacks,
+    };
+
+    let emitted = emit_ray_loop(&mut s, entry, done, &rl, &inputs);
+    let stride = s.m.i32(4 * 4);
+    let base = s.m.bin(done, Bin::Mul, tid, stride);
+    for (k, &(_, val)) in emitted.outs.iter().enumerate() {
+        let off = byte_offset(&mut s, done, base, k as u32);
+        store_i32(&mut s, done, uav, off, val);
+    }
+    assert!(emitted.pending_anyhit.is_none(), "2-pass mirror-TLAS FBT has no AnyHit Proceed() loop");
+    s.m.terminate(done, Term::Ret);
+    let dxil = s.finish();
+    validate_dxil("front_back_track_mirror_tlas_arch13", &dxil);
+
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; skipped");
+        return;
+    };
+    if !has_raytracing_tier_1_1(&host) {
+        eprintln!("hardware device lacks DXR Tier 1.1; skipped");
+        return;
+    }
+
+    // DXR front face for ray +Z (CW from -Z): (-2,-2,z), (0,2,z), (2,-2,z); back face (CCW): (-2,-2,z), (2,-2,z), (0,2,z).
+    let front_tri = |cx: f32, z: f32| [[cx - 2.0, -2.0, z], [cx, 2.0, z], [cx + 2.0, -2.0, z]];
+    let back_tri = |cx: f32, z: f32| [[cx - 2.0, -2.0, z], [cx + 2.0, -2.0, z], [cx, 2.0, z]];
+    let mut verts = Vec::new();
+    // Lane 0 (x=0): front at z=3.0 only -> miss back, minFrontFaceT=3.0.
+    verts.extend_from_slice(&front_tri(0.0, 3.0));
+    // Lane 1 (x=10): back at z=4.0 only -> commit back at 4.0, minFrontFaceT=100.0.
+    verts.extend_from_slice(&back_tri(10.0, 4.0));
+    // Lane 2 (x=20): front at z=2.0, back at z=6.0 -> commit back at 6.0, minFrontFaceT=2.0.
+    verts.extend_from_slice(&front_tri(20.0, 2.0));
+    verts.extend_from_slice(&back_tri(20.0, 6.0));
+    // Lane 3 (x=30): back at z=2.0, front at z=6.0 -> commit back at 2.0, minFrontFaceT=100.0 (pre-shrunk by back t=2.0!).
+    verts.extend_from_slice(&back_tri(30.0, 2.0));
+    verts.extend_from_slice(&front_tri(30.0, 6.0));
+    let geoms = [TriangleGeom {
+        vertices: &verts,
+        flags: D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE,
+    }];
+    // Mirror TLAS clears TRIANGLE_CULL_DISABLE (flags=0).
+    let inst = InstanceSpec {
+        transform: [
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+        ],
+        instance_id: 0,
+        instance_mask: 0xFF,
+        contrib: 0,
+        flags: 0,
+    };
+
+    let out = run_rayquery_gpu(&host, &dxil, false, &geoms, &inst, 16)
+        .unwrap_or_else(|e| panic!("mirror TLAS FBT run_rayquery_gpu failed: {e}"));
+    let lane = |k: usize| &out[k * 4..(k + 1) * 4];
+
+    assert_eq!(lane(0)[0], 0, "lane 0 front-only: no back hit");
+    assert!((f32::from_bits(lane(0)[2]) - 3.0).abs() < 1e-4, "lane 0 minFrontFaceT=3.0");
+
+    assert_eq!(lane(1)[0], 1, "lane 1 back-only: committed");
+    assert!((f32::from_bits(lane(1)[1]) - 4.0).abs() < 1e-4, "lane 1 backT=4.0");
+    assert!((f32::from_bits(lane(1)[2]) - 100.0).abs() < 1e-3, "lane 1 minFrontFaceT=init");
+
+    assert_eq!(lane(2)[0], 1, "lane 2 front-before-back: committed");
+    assert!((f32::from_bits(lane(2)[1]) - 6.0).abs() < 1e-4, "lane 2 backT=6.0");
+    assert!((f32::from_bits(lane(2)[2]) - 2.0).abs() < 1e-4, "lane 2 minFrontFaceT=2.0");
+
+    assert_eq!(lane(3)[0], 1, "lane 3 back-before-front: committed");
+    assert!((f32::from_bits(lane(3)[1]) - 2.0).abs() < 1e-4, "lane 3 backT=2.0");
+    assert!(
+        (f32::from_bits(lane(3)[2]) - 6.0).abs() < 1e-4,
+        "lane 3 Pass A front face at z=6.0 (> backT=2.0), got {}",
+        f32::from_bits(lane(3)[2])
+    );
 }

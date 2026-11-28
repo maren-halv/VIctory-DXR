@@ -95,17 +95,17 @@ pub(crate) fn limited_host_ram() -> bool {
     *LIMITED.get_or_init(|| memory_status().is_some_and(|s| s.ullTotalPhys <= 32 * GIB))
 }
 
-const AMPLE_COMMIT: u64 = 12 * GIB;
+const AMPLE_COMMIT: u64 = 6 * GIB;
 
 fn next_pressure(was: bool, physical: u64, commit: u64) -> bool {
     let commit_tight = if was { commit < 6 * GIB } else { commit <= 4 * GIB };
     if commit_tight {
         return true;
     }
-    // On 32 GiB hosts with ample pagefile commit headroom (>= 12 GiB), Windows
-    // routinely keeps `ullAvailPhys` around 2-4 GiB; only engage physical
-    // pressure when free physical RAM drops dangerously low (<= 1.5 GiB) and
-    // allow recovering once it eases back to >= 2.5 GiB.
+    // On 32 GiB hosts with ample pagefile commit headroom (>= 6 GiB), Windows
+    // Standby cache routinely holds `ullAvailPhys` around 2-4 GiB; only engage
+    // physical pressure when free physical RAM drops dangerously low (<= 1.5 GiB)
+    // and allow recovering once it eases back to >= 2.5 GiB.
     if commit >= AMPLE_COMMIT {
         if was {
             physical < 2560 * MIB
@@ -200,24 +200,23 @@ mod tests {
         assert!(next_pressure(true, 12 * GIB, 5 * GIB));
         assert!(!next_pressure(true, 4 * GIB, 6 * GIB));
 
-        // Moderate commit (< 12 GiB): enters at <= 3 GiB physical, clears at >= 4 GiB.
-        assert!(next_pressure(false, 3 * GIB, 8 * GIB));
-        assert!(next_pressure(true, 3584 * MIB, 8 * GIB));
-        assert!(!next_pressure(true, 4 * GIB, 8 * GIB));
+        // Moderate commit (4 GiB < commit < 6 GiB): enters at <= 3 GiB physical, clears at >= 4 GiB.
+        assert!(next_pressure(false, 3 * GIB, 5 * GIB));
         assert!(!next_pressure(false, 4 * GIB, 5 * GIB));
     }
 
     #[test]
     fn ample_commit_avoids_latching_and_recovers_on_physical_ease() {
-        // With >= 12 GiB commit headroom, 2-3 GiB free physical RAM does NOT latch 64 MiB/f throttle.
-        assert!(!next_pressure(false, 3 * GIB, 12 * GIB));
+        // With >= 6 GiB commit headroom, Standby cache holding 2-3.5 GiB free physical RAM does NOT latch.
+        assert!(!next_pressure(false, 2700 * MIB, 6 * GIB));
+        assert!(!next_pressure(false, 3 * GIB, 8 * GIB));
         assert!(!next_pressure(false, 2 * GIB, 16 * GIB));
         // Critically low physical RAM (<= 1.5 GiB) still engages pressure with 1 GiB hysteresis.
-        assert!(next_pressure(false, 1536 * MIB, 16 * GIB));
-        assert!(next_pressure(true, 2 * GIB, 16 * GIB));
+        assert!(next_pressure(false, 1536 * MIB, 6 * GIB));
+        assert!(next_pressure(true, 2 * GIB, 8 * GIB));
         // Recovers cleanly once physical pressure eases to >= 2.5 GiB.
-        assert!(!next_pressure(true, 2560 * MIB, 16 * GIB));
-        assert!(!next_pressure(true, 3 * GIB, 12 * GIB));
+        assert!(!next_pressure(true, 2560 * MIB, 6 * GIB));
+        assert!(!next_pressure(true, 3 * GIB, 8 * GIB));
     }
 
     #[test]

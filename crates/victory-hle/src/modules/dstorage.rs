@@ -175,7 +175,11 @@ extern "system" fn create_status_array(
     let written = (0..capacity).map(|_| AtomicU64::new(0)).collect();
     let array = Instance::create(
         Object::new("dstorage status array", &STATUS_VTABLE),
-        StatusArray { entries, written },
+        StatusArray {
+            entries,
+            written,
+            waiters: AtomicU32::new(0),
+        },
     );
     put(out, array)
 }
@@ -309,7 +313,17 @@ impl Io {
         })
     }
 
-    const DEFAULT: Io = Io::Handles;
+    const DEFAULT: Io = Io::Direct;
+}
+
+fn io_worker_count() -> usize {
+    static IO_WORKERS: OnceLock<usize> = OnceLock::new();
+    *IO_WORKERS.get_or_init(|| {
+        std::env::var("VICTORY_DSTORAGE_IO_WORKERS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map_or(2, |n| n.clamp(0, 8))
+    })
 }
 
 /// A file as the workers read it: the handle the title opened, and those
@@ -539,6 +553,8 @@ struct StatusArray {
     /// For the log: when each entry was written ([`stream_log::now`]); 0
     /// once the title has seen it.
     written: Box<[AtomicU64]>,
+    /// Active `WaitOnAddress` waiters (0 during normal title polling -> zero wake overhead).
+    waiters: AtomicU32,
 }
 
 type Array = *mut Instance<StatusArray>;
@@ -597,6 +613,100 @@ struct Scheduler {
     work: Condvar,
     /// A request finished (for full queues and `close`).
     finished: Condvar,
+    /// Decoupled decompression queue fed by `dstorage-io` reader threads.
+    decode: DecodeQueue,
+    /// Reusable compressed-source buffers transferred from I/O threads to decode workers.
+    io_bufs: IoBufPool,
+}
+
+enum DecodePayload {
+    Prefetched { buf: Vec<u8>, len: usize },
+    Memory,
+}
+
+struct DecodeItem {
+    job: Job,
+    payload: DecodePayload,
+    started: std::time::Instant,
+    traced: Option<Traced>,
+}
+
+struct DecodeQueue {
+    items: Mutex<VecDeque<DecodeItem>>,
+    max_items: usize,
+    work: Condvar,
+    space: Condvar,
+}
+
+impl DecodeQueue {
+    fn new(max_items: usize) -> DecodeQueue {
+        DecodeQueue {
+            items: Mutex::new(VecDeque::with_capacity(max_items)),
+            max_items: max_items.max(4),
+            work: Condvar::new(),
+            space: Condvar::new(),
+        }
+    }
+
+    fn push(&self, item: DecodeItem) {
+        let mut items = self.items.lock().unwrap_or_else(|e| e.into_inner());
+        while items.len() >= self.max_items {
+            items = self.space.wait(items).unwrap_or_else(|e| e.into_inner());
+        }
+        items.push_back(item);
+        drop(items);
+        self.work.notify_one();
+    }
+
+    fn pop(&self) -> DecodeItem {
+        let mut items = self.items.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(item) = items.pop_front() {
+                let notify_space = items.len() + 1 >= self.max_items;
+                drop(items);
+                if notify_space {
+                    self.space.notify_one();
+                }
+                return item;
+            }
+            items = self.work.wait(items).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+struct IoBufPool {
+    bufs: Mutex<Vec<Vec<u8>>>,
+    max_bufs: usize,
+}
+
+impl IoBufPool {
+    fn new(max_bufs: usize) -> IoBufPool {
+        IoBufPool {
+            bufs: Mutex::new(Vec::with_capacity(max_bufs)),
+            max_bufs,
+        }
+    }
+
+    fn take(&self, len: usize) -> Vec<u8> {
+        let mut buf = self
+            .bufs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop()
+            .unwrap_or_default();
+        if buf.len() < len {
+            buf.resize(len, 0);
+        }
+        buf
+    }
+
+    fn give(&self, mut buf: Vec<u8>) {
+        trim_pooled_bytes(&mut buf);
+        let mut bufs = self.bufs.lock().unwrap_or_else(|e| e.into_inner());
+        if bufs.len() < self.max_bufs {
+            bufs.push(buf);
+        }
+    }
 }
 
 /// Priority weights per class (low, normal, high and real-time), as the
@@ -680,6 +790,7 @@ fn scheduler() -> Option<&'static Scheduler> {
     static STARTED: std::sync::Once = std::sync::Once::new();
     let scheduler = SCHEDULER
         .get_or_init(|| {
+            let decode_workers = worker_count();
             Some(Scheduler {
                 lanes: Mutex::new(Lanes {
                     lanes: HashMap::new(),
@@ -702,20 +813,47 @@ fn scheduler() -> Option<&'static Scheduler> {
                 }),
                 work: Condvar::new(),
                 finished: Condvar::new(),
+                decode: DecodeQueue::new((decode_workers * 4).max(16)),
+                io_bufs: IoBufPool::new(decode_workers * 2 + 4),
             })
         })
         .as_ref()?;
     STARTED.call_once(|| {
-        let workers = worker_count();
-        let started = (0..workers)
-            .filter(|i| {
-                std::thread::Builder::new()
-                    .name(format!("dstorage {i}"))
-                    .spawn(|| work(scheduler))
-                    .is_ok()
-            })
-            .count();
-        tracing::info!(workers = started, "dstorage: workers");
+        let decode_workers = worker_count();
+        let io_workers = io_worker_count();
+        if io_workers > 0 {
+            let io_started = (0..io_workers)
+                .filter(|i| {
+                    std::thread::Builder::new()
+                        .name(format!("dstorage-io {i}"))
+                        .spawn(|| work_io(scheduler))
+                        .is_ok()
+                })
+                .count();
+            let decode_started = (0..decode_workers)
+                .filter(|i| {
+                    std::thread::Builder::new()
+                        .name(format!("dstorage {i}"))
+                        .spawn(|| work_decode(scheduler))
+                        .is_ok()
+                })
+                .count();
+            tracing::info!(
+                io_workers = io_started,
+                decode_workers = decode_started,
+                "dstorage: decoupled I/O and decompression workers"
+            );
+        } else {
+            let started = (0..decode_workers)
+                .filter(|i| {
+                    std::thread::Builder::new()
+                        .name(format!("dstorage {i}"))
+                        .spawn(|| work(scheduler))
+                        .is_ok()
+                })
+                .count();
+            tracing::info!(workers = started, "dstorage: workers");
+        }
     });
     Some(scheduler)
 }
@@ -849,8 +987,7 @@ pub(crate) mod stream_log {
     }
 }
 
-/// A worker: runs the next read of the most deserving queue.
-fn work(scheduler: &'static Scheduler) {
+fn lower_worker_priority() {
     #[cfg(windows)]
     // SAFETY: plain priority adjustment on our own worker thread so streaming
     // decompression does not preempt title or submission threads.
@@ -860,34 +997,140 @@ fn work(scheduler: &'static Scheduler) {
         };
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     }
+}
+
+fn finish_job(
+    scheduler: &'static Scheduler,
+    job: &Job,
+    result: Result<(), HRESULT>,
+    started: std::time::Instant,
+    traced: Option<Traced>,
+) {
+    walls_request(&job.request, &result, started);
+    stream_log::request(job, started, &result);
+    if let Some(traced) = traced {
+        traced.end(job, &result);
+    }
     let mut lanes = scheduler.lock();
+    lanes.finish(job, result);
+    lanes.count(job, started);
+    if std::mem::take(&mut lanes.starved) && lanes.idle_workers > 0 {
+        scheduler.work.notify_all();
+    }
+    if lanes.finished_waiters > 0 {
+        scheduler.finished.notify_all();
+    }
+}
+
+/// Stage-1 I/O worker: pulls requests in priority order, reads compressed file
+/// payloads from NVMe and hands them to [`work_decode`], while running raw
+/// uncompressed reads directly into their destinations.
+fn work_io(scheduler: &'static Scheduler) {
+    lower_worker_priority();
     loop {
-        let Some(job) = lanes.start() else {
-            lanes.idle_workers += 1;
-            lanes = scheduler.work.wait(lanes).unwrap_or_else(|e| e.into_inner());
-            lanes.idle_workers -= 1;
-            continue;
+        let job = {
+            let mut lanes = scheduler.lock();
+            loop {
+                if let Some(job) = lanes.start() {
+                    break job;
+                }
+                lanes.idle_workers += 1;
+                lanes = scheduler.work.wait(lanes).unwrap_or_else(|e| e.into_inner());
+                lanes.idle_workers -= 1;
+            }
         };
-        drop(lanes);
+        let started = std::time::Instant::now();
+        let traced = Traced::start(&job);
+        let options = job.request.options;
+        let valid_args = options & !(ZLIB | BCPACK | PAGE_DESTINATION | MEMORY_SOURCE) == 0
+            && !job.request.source.is_null()
+            && !job.request.destination.is_null();
+        if !valid_args || options & (ZLIB | BCPACK) == 0 {
+            let reading = victory_gpu::timeline::span("streaming: a request");
+            let result = execute(&job.request);
+            reading.end();
+            finish_job(scheduler, &job, result, started, traced);
+            continue;
+        }
+        if options & MEMORY_SOURCE != 0 {
+            scheduler.decode.push(DecodeItem {
+                job,
+                payload: DecodePayload::Memory,
+                started,
+                traced,
+            });
+            continue;
+        }
+        let len = job.request.source_size as usize;
+        let mut buf = scheduler.io_bufs.take(len);
+        let read_span = victory_gpu::timeline::span("streaming: nvme read");
+        let read_res = read_into(&job.request, &mut buf[..len]);
+        read_span.end();
+        match read_res {
+            Ok(()) => {
+                scheduler.decode.push(DecodeItem {
+                    job,
+                    payload: DecodePayload::Prefetched { buf, len },
+                    started,
+                    traced,
+                });
+            }
+            Err(hr) => {
+                scheduler.io_bufs.give(buf);
+                let hr = log_request_failure(&job.request, hr, "reading the source");
+                finish_job(scheduler, &job, Err(hr), started, traced);
+            }
+        }
+    }
+}
+
+/// Stage-2 decompression worker: inflates ZLIB / decodes BCPack in parallel
+/// and writes destinations, retiring status entries in exact queue order via
+/// [`Lane::flush`].
+fn work_decode(scheduler: &'static Scheduler) {
+    lower_worker_priority();
+    loop {
+        let DecodeItem {
+            job,
+            payload,
+            started,
+            traced,
+        } = scheduler.decode.pop();
+        let span = victory_gpu::timeline::span("streaming: decompress");
+        let result = match payload {
+            DecodePayload::Prefetched { buf, len } => {
+                let res = execute_prefetched(&job.request, &buf[..len]);
+                scheduler.io_bufs.give(buf);
+                res
+            }
+            DecodePayload::Memory => execute(&job.request),
+        };
+        span.end();
+        finish_job(scheduler, &job, result, started, traced);
+    }
+}
+
+/// Legacy unified worker (used when `VICTORY_DSTORAGE_IO_WORKERS=0`).
+fn work(scheduler: &'static Scheduler) {
+    lower_worker_priority();
+    loop {
+        let job = {
+            let mut lanes = scheduler.lock();
+            loop {
+                if let Some(job) = lanes.start() {
+                    break job;
+                }
+                lanes.idle_workers += 1;
+                lanes = scheduler.work.wait(lanes).unwrap_or_else(|e| e.into_inner());
+                lanes.idle_workers -= 1;
+            }
+        };
         let started = std::time::Instant::now();
         let traced = Traced::start(&job);
         let reading = victory_gpu::timeline::span("streaming: a request");
         let result = execute(&job.request);
         reading.end();
-        walls_request(&job.request, &result, started);
-        stream_log::request(&job, started, &result);
-        if let Some(traced) = traced {
-            traced.end(&job, &result);
-        }
-        lanes = scheduler.lock();
-        lanes.finish(&job, result);
-        lanes.count(&job, started);
-        if std::mem::take(&mut lanes.starved) && lanes.idle_workers > 0 {
-            scheduler.work.notify_all();
-        }
-        if lanes.finished_waiters > 0 {
-            scheduler.finished.notify_all();
-        }
+        finish_job(scheduler, &job, result, started, traced);
     }
 }
 
@@ -1076,9 +1319,16 @@ impl Lane {
                 stream_log::line(format_args!("S\t{:x}\t{seq}\t{}\t{at}", status.array as usize, status.enqueued));
                 status.written().store(at, Ordering::Relaxed);
             }
-            status
-                .entry()
-                .store(first.unwrap_or(S_OK), Ordering::Release);
+            let entry = status.entry();
+            entry.store(first.unwrap_or(S_OK), Ordering::Release);
+            if status.waiters().load(Ordering::Acquire) > 0 {
+                // SAFETY: `entry` is an `AtomicI32` inside a live `StatusArray` we hold a ref to.
+                unsafe {
+                    windows_sys::Win32::System::Threading::WakeByAddressAll(
+                        std::ptr::from_ref(entry).cast(),
+                    );
+                }
+            }
         }
     }
 }
@@ -1386,6 +1636,11 @@ impl Status {
         // SAFETY: as above.
         &unsafe { &*self.array }.state.written[self.index as usize]
     }
+
+    fn waiters(&self) -> &AtomicU32 {
+        // SAFETY: as above.
+        &unsafe { &*self.array }.state.waiters
+    }
 }
 
 extern "system" fn enqueue_request(this: QueueRef, request: *const Request) {
@@ -1559,31 +1814,47 @@ thread_local! {
         std::cell::RefCell::new(WorkerScratch::default());
 }
 
+fn log_request_failure(request: &Request, hr: HRESULT, why: &str) -> HRESULT {
+    tracing::warn!(
+        options = format_args!("{:#x}", request.options),
+        offset = request.offset,
+        source_size = request.source_size,
+        destination_size = request.destination_size,
+        intermediate_size = request.intermediate_size,
+        tag = request.tag,
+        name = text(request.name),
+        hr = format_args!("{:#010x}", hr as u32),
+        "dstorage: request failed: {why}"
+    );
+    hr
+}
+
 /// Reads, inflates and/or unpacks, and writes one request.
 fn execute(request: &Request) -> Result<(), HRESULT> {
     SCRATCH.with_borrow_mut(|scratch| {
-        let result = execute_with_scratch(request, scratch);
+        let result = execute_with_scratch(request, scratch, None);
         scratch.trim();
         result
     })
 }
 
-fn execute_with_scratch(request: &Request, scratch: &mut WorkerScratch) -> Result<(), HRESULT> {
+/// Decompresses and writes one request whose compressed source was prefetched
+/// by a Stage-1 I/O worker.
+fn execute_prefetched(request: &Request, prefetched: &[u8]) -> Result<(), HRESULT> {
+    SCRATCH.with_borrow_mut(|scratch| {
+        let result = execute_with_scratch(request, scratch, Some(prefetched));
+        scratch.trim();
+        result
+    })
+}
+
+fn execute_with_scratch(
+    request: &Request,
+    scratch: &mut WorkerScratch,
+    prefetched: Option<&[u8]>,
+) -> Result<(), HRESULT> {
     let options = request.options;
-    let fail = |hr: HRESULT, why: &str| {
-        tracing::warn!(
-            options = format_args!("{options:#x}"),
-            offset = request.offset,
-            source_size = request.source_size,
-            destination_size = request.destination_size,
-            intermediate_size = request.intermediate_size,
-            tag = request.tag,
-            name = text(request.name),
-            hr = format_args!("{:#010x}", hr as u32),
-            "dstorage: request failed: {why}"
-        );
-        hr
-    };
+    let fail = |hr: HRESULT, why: &str| log_request_failure(request, hr, why);
     if options & !(ZLIB | BCPACK | PAGE_DESTINATION | MEMORY_SOURCE) != 0 {
         return Err(fail(E_NOTIMPL, "unsupported options"));
     }
@@ -1607,8 +1878,11 @@ fn execute_with_scratch(request: &Request, scratch: &mut WorkerScratch) -> Resul
         .map_err(|hr| fail(hr, "copying"));
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
-    let source = read_source(request, &mut scratch.source)
-        .map_err(|hr| fail(hr, "reading the source"))?;
+    let source = match prefetched {
+        Some(bytes) => bytes,
+        None => read_source(request, &mut scratch.source)
+            .map_err(|hr| fail(hr, "reading the source"))?,
+    };
     // The console's order: zlib first, then BCPack.
     let source = if bc != 0 && options & ZLIB != 0 {
         let packed = pooled_slice(&mut scratch.intermediate, request.intermediate_size as usize);
@@ -1905,7 +2179,9 @@ fn into_pages(
     let mut written = super::xmem::write_physical(pages, offset, &data[..n]);
     let mut tries = 0;
     while !written && tries < retries {
-        std::thread::sleep(std::time::Duration::from_millis((2u64 << tries.min(6)).min(128)));
+        let epoch = super::xmem::page_epoch();
+        let backoff = std::time::Duration::from_millis((2u64 << tries.min(6)).min(128));
+        super::xmem::wait_page_epoch(epoch, backoff);
         tries += 1;
         written = super::xmem::write_physical(pages, offset, &data[..n]);
     }
@@ -1982,13 +2258,25 @@ fn page_list_into(list: *const usize, offset: usize, len: usize, pages: &mut Vec
         return;
     }
     // Timed from here: what took long before was the lock on the page table
-    // (which the title's mapping calls hold), not the list.
+    // (which the title's mapping calls hold), not the list. Wait on `xmem`'s
+    // page-registration condvar with a short fallback cap instead of `Sleep(1)`
+    // polling.
     let started = std::time::Instant::now();
+    let deadline = std::time::Duration::from_millis(1500);
     let mut known = false;
-    while !known && started.elapsed().as_millis() < 1500 {
-        std::thread::sleep(std::time::Duration::from_millis(1));
+    while !known {
+        let elapsed = started.elapsed();
+        if elapsed >= deadline {
+            break;
+        }
+        let epoch = super::xmem::page_epoch();
         read_list_into(list, offset, len, pages);
         known = super::xmem::pages_known(pages, offset, len);
+        if known {
+            break;
+        }
+        let wait = (deadline - elapsed).min(std::time::Duration::from_millis(5));
+        super::xmem::wait_page_epoch(epoch, wait);
     }
     tracing::warn!(
         ms = started.elapsed().as_millis() as u64,
@@ -2127,14 +2415,28 @@ mod tests {
         f(array, index)
     }
 
-    /// Polls as the title does, then returns the entry's result.
+    /// Waits on the status entry via `WaitOnAddress` (exercising event-driven
+    /// status wakeup) and returns its result.
     fn wait(array: *mut c_void, index: u32) -> HRESULT {
         let done: extern "system" fn(*mut c_void, u32) -> bool = call(array, 0x18);
+        let state = unsafe { &*array.cast::<Instance<StatusArray>>() };
+        let entry = &state.state.entries[index as usize];
+        state.state.waiters.fetch_add(1, Ordering::AcqRel);
         let start = Instant::now();
         while !done(array, index) {
             assert!(start.elapsed() < Duration::from_secs(10), "never completed");
-            std::thread::sleep(Duration::from_millis(1));
+            let mut expected = E_PENDING;
+            // SAFETY: waiting on `AtomicI32` inside a live `StatusArray`.
+            unsafe {
+                windows_sys::Win32::System::Threading::WaitOnAddress(
+                    std::ptr::from_ref(entry).cast(),
+                    std::ptr::from_mut(&mut expected).cast(),
+                    size_of::<i32>(),
+                    50,
+                );
+            }
         }
+        state.state.waiters.fetch_sub(1, Ordering::AcqRel);
         result(array, index)
     }
 

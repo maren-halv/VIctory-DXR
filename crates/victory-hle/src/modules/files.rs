@@ -740,6 +740,29 @@ pub extern "C" fn _wfsopen(path: *const u16, mode: *const u16, share: i32) -> Fi
 // destinations and retry a failed `ReadFile` forever. So the destination
 // is opened first, and not guarded again before the call is done.
 
+/// Returns `true` if `[addr, addr + len)` lies completely inside the calling
+/// thread's host stack (zero-syscall TEB query), which can never overlap
+/// guarded title view memory.
+#[inline]
+fn in_current_stack(addr: usize, len: usize) -> bool {
+    let Some(end) = addr.checked_add(len) else {
+        return false;
+    };
+    let (mut low, mut high) = (0usize, 0usize);
+    // SAFETY: reads the current thread's TEB stack bounds.
+    unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadStackLimits(&mut low, &mut high) };
+    addr >= low && end <= high
+}
+
+/// Returns `true` when `[buffer, buffer + len)` could plausibly overlap guarded
+/// title memory. Host-only stack buffers, null pointers, and zero-length reads
+/// skip `victory_gpu::kernel_writing` completely.
+#[inline]
+fn may_overlap_title_memory(buffer: *const u8, len: usize) -> bool {
+    let addr = buffer as usize;
+    addr != 0 && len != 0 && !in_current_stack(addr, len)
+}
+
 pub extern "system" fn ReadFile(
     file: *mut c_void,
     buffer: *mut u8,
@@ -747,7 +770,8 @@ pub extern "system" fn ReadFile(
     read: *mut u32,
     overlapped: *mut c_void,
 ) -> i32 {
-    let writing = victory_gpu::kernel_writing(buffer as usize, len as usize);
+    let writing = may_overlap_title_memory(buffer, len as usize)
+        .then(|| victory_gpu::kernel_writing(buffer as usize, len as usize));
     let done = host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
         file, buffer, len, read, overlapped,
     );
@@ -782,7 +806,9 @@ pub extern "system" fn ReadFile(
 /// own writes. Returns the items read, as the CRT does; the bytes of a
 /// partial last item are copied too, as the CRT leaves them.
 pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File) -> usize {
-    let _writing = victory_gpu::kernel_writing(buffer as usize, size.saturating_mul(count));
+    let bytes = size.saturating_mul(count);
+    let _writing = may_overlap_title_memory(buffer, bytes)
+        .then(|| victory_gpu::kernel_writing(buffer as usize, bytes));
     host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize)(
         buffer, size, count, stream,
     )
@@ -992,6 +1018,11 @@ mod tests {
         std::fs::write(&path, b"0123456789").unwrap();
         let file = std::fs::File::open(&path).unwrap();
         let (mut out, mut n) = ([0u8; 10], 0);
+        assert!(!may_overlap_title_memory(out.as_ptr(), out.len()), "stack buffers skip kernel_writing");
+        assert!(!may_overlap_title_memory(std::ptr::null(), 16));
+        assert!(!may_overlap_title_memory(out.as_ptr(), 0));
+        let heap = vec![0u8; 64];
+        assert!(may_overlap_title_memory(heap.as_ptr(), heap.len()), "non-stack buffers remain eligible");
         let handle = file.as_raw_handle().cast();
         assert_ne!(ReadFile(handle, out.as_mut_ptr(), 10, &mut n, std::ptr::null_mut()), 0);
         assert_eq!((&out, n), (b"0123456789", 10));

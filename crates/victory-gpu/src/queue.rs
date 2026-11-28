@@ -475,6 +475,70 @@ pub(crate) fn behind_line(frames: f64) {
     }
 }
 
+/// Probe B (`ARCH-16`): zero-overhead guest queue submission counters by queue `kind`
+/// (`0` = Direct, `2` = Compute, `3` = Copy, other = bucket 3).
+static PROBE_B_SUBS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+static PROBE_B_LISTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+#[cfg(any(windows, test))]
+static PROBE_B_PREV_SUBS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+#[cfg(any(windows, test))]
+static PROBE_B_PREV_LISTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+fn probe_b_bucket(kind: u32) -> usize {
+    match kind {
+        0 => 0,
+        2 => 1,
+        3 => 2,
+        _ => 3,
+    }
+}
+
+fn record_probe_b(kind: u32, lists: u32) {
+    let idx = probe_b_bucket(kind);
+    PROBE_B_SUBS[idx].fetch_add(1, Ordering::Relaxed);
+    PROBE_B_LISTS[idx].fetch_add(u64::from(lists), Ordering::Relaxed);
+}
+
+#[cfg(any(windows, test))]
+fn probe_b_take_delta() -> ([u64; 4], [u64; 4], [u64; 4]) {
+    let mut d_subs = [0u64; 4];
+    let mut d_lists = [0u64; 4];
+    let mut tot_subs = [0u64; 4];
+    for i in 0..4 {
+        let s = PROBE_B_SUBS[i].load(Ordering::Relaxed);
+        let l = PROBE_B_LISTS[i].load(Ordering::Relaxed);
+        d_subs[i] = s.saturating_sub(PROBE_B_PREV_SUBS[i].swap(s, Ordering::Relaxed));
+        d_lists[i] = l.saturating_sub(PROBE_B_PREV_LISTS[i].swap(l, Ordering::Relaxed));
+        tot_subs[i] = s;
+    }
+    (d_subs, d_lists, tot_subs)
+}
+
+/// Logs a compact 1-line Probe B summary of guest command-queue submissions by kind
+/// (called every 5 s off `victory-meter`).
+#[cfg(windows)]
+pub(crate) fn probe_b_line(frames: f64) {
+    let (d_subs, d_lists, tot_subs) = probe_b_take_delta();
+    if tot_subs.iter().all(|&c| c == 0) {
+        return;
+    }
+    let f = frames.max(1.0);
+    tracing::info!(
+        "probe B (guest queues): direct {:.1} subs/f ({:.1} lists/f, total {}), compute {:.1} subs/f ({:.1} lists/f, total {}), copy {:.1} subs/f ({:.1} lists/f, total {}), other {:.1} subs/f (total {})",
+        d_subs[0] as f64 / f,
+        d_lists[0] as f64 / f,
+        tot_subs[0],
+        d_subs[1] as f64 / f,
+        d_lists[1] as f64 / f,
+        tot_subs[1],
+        d_subs[2] as f64 / f,
+        d_lists[2] as f64 / f,
+        tot_subs[2],
+        d_subs[3] as f64 / f,
+        tot_subs[3],
+    );
+}
+
 /// Whether a queue may pass `wait`: memory holds the value, or, with
 /// submissions sent to the card without a wait (`crate::host::late`), it
 /// will once those in the air have run.
@@ -568,6 +632,9 @@ extern "system" fn release(this: This) -> u32 {
 extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if lists.is_null() {
         return;
+    }
+    if !this.is_null() {
+        record_probe_b(queue(this).kind, count);
     }
     let _called = crate::timeline::span("the title's ExecuteCommandLists");
     #[cfg(all(windows, feature = "diagnostics"))]
@@ -1381,5 +1448,26 @@ mod tests {
         assert_eq!(ticks_from_nanos(1_000_000_000, 1_200_000_000), 1_200_000_000);
         assert_eq!(ticks_from_nanos(500_000_000, 27_000_000), 13_500_000);
         assert!(effective_timestamp_frequency() > 0);
+    }
+
+    #[test]
+    fn probe_b_counts_guest_queue_submissions_by_kind() {
+        assert_eq!(probe_b_bucket(0), 0);
+        assert_eq!(probe_b_bucket(2), 1);
+        assert_eq!(probe_b_bucket(3), 2);
+        assert_eq!(probe_b_bucket(1), 3);
+        let _ = probe_b_take_delta();
+        record_probe_b(0, 4);
+        record_probe_b(2, 3);
+        record_probe_b(2, 2);
+        record_probe_b(3, 1);
+        let (subs, lists, totals) = probe_b_take_delta();
+        assert_eq!(subs[0], 1);
+        assert_eq!(lists[0], 4);
+        assert_eq!(subs[1], 2);
+        assert_eq!(lists[1], 5);
+        assert_eq!(subs[2], 1);
+        assert_eq!(lists[2], 1);
+        assert!(totals[0] >= 1 && totals[1] >= 2 && totals[2] >= 1);
     }
 }
